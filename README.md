@@ -8,16 +8,16 @@ This project is also a **hands-on Rust tutorial** — each step introduces new l
 
 Common Crawl provides petabytes of web archive data stored as WARC (Web ARChive) files. This tool downloads those archives, parses them, and extracts any `.onion` (Tor hidden service) addresses found in the crawled content.
 
-## Planned Features
+## Features
 
-The project is built incrementally, one feature per step:
+The project was built incrementally, one feature per step:
 
 1. **Read WARC paths** — Parse an input file listing WARC archive URIs
-2. **HTTP download** — Fetch a single WARC archive from Common Crawl servers
+2. **HTTP download** — Fetch WARC archives from Common Crawl servers
 3. **WARC parsing** — Decompress gzip-compressed archives and parse WARC records
 4. **Onion extraction** — Use regex to find `.onion` addresses in page content
-5. **Deduplication & output** — Deduplicate results and produce clean output
-6. **Concurrent downloads** — Process multiple archives in parallel with async/tokio
+5. **Deduplication & output** — Deduplicate results and produce structured JSON output
+6. **Concurrent processing** — Download and parse multiple archives in parallel with async/tokio
 
 ## Rust Concepts Covered
 
@@ -38,7 +38,11 @@ See `[PROGRESS.md](documentation/PROGRESS.md)` for detailed explanations of each
 Requires Rust 1.91+ (edition 2024).
 
 ```sh
-cargo build              # compile
-cargo run                # run with default warc.paths
-cargo run -- <file>      # run with a custom WARC paths file
+cargo build              # compile (debug)
+cargo build --release    # compile (optimized — ~16s per 1GB archive)
+cargo run                # download & parse 1 archive (default)
+cargo run -- --limit 3   # process up to 3 archives
+cargo run -- --jobs 2    # 2 concurrent downloads (default 4)
+cargo run -- --delete    # delete archive after parsing
+cargo run -- --limit 3 --jobs 2 --delete custom.paths  # combined
 ```

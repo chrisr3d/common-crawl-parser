@@ -281,3 +281,95 @@ Final measured results on a 1GB WARC archive (~30,000 records, ~15,000 responses
 ### What's next
 
 Step 6: Concurrent downloads and processing with async/tokio.
+
+---
+
+## Step 6: Concurrent Downloads & Processing with Tokio
+
+### What we built
+
+A concurrent processing pipeline that downloads and parses multiple WARC archives in
+parallel. The sequential bottleneck (download 1 → parse 1 → download 2 → parse 2) is
+replaced with a pipeline where up to N archives download simultaneously, and parsing
+starts immediately when each download completes. A `--jobs N` flag controls the
+concurrency level (default 4).
+
+Key architectural changes:
+- Replaced `ureq` (blocking HTTP) with `reqwest` (async HTTP with Tokio)
+- `main` is now `async fn main()` driven by the Tokio multi-threaded runtime
+- Downloads use async I/O — threads are released during network waits
+- WARC parsing (CPU-bound) runs on Tokio's blocking thread pool via `spawn_blocking`
+- `futures::stream::buffer_unordered` provides bounded concurrency
+- `Arc<Regex>` shares the compiled regex across concurrent tasks
+
+### Rust concepts introduced
+
+**`async`/`await` — cooperative multitasking**
+Async functions return `Future`s — values that represent incomplete computation. When
+you `.await` a future, the current task *suspends* and yields control back to the
+runtime, which can then run other tasks on the same thread. This is cooperative
+multitasking: tasks voluntarily give up the thread at `.await` points, unlike OS threads
+where the scheduler preempts them. The key benefit: thousands of concurrent I/O operations
+can share just a few OS threads, because most are waiting for network/disk, not using CPU.
+
+**Tokio runtime — the async executor**
+Async code doesn't run by itself — it needs an *executor* to poll futures to completion.
+`#[tokio::main]` sets up a multi-threaded Tokio runtime (one worker thread per CPU core
+by default) and drives our `async fn main()` on it. The runtime manages task scheduling,
+I/O event notification (via `epoll`/`kqueue`), and timer events. It's the engine that
+makes `.await` actually work.
+
+**`spawn_blocking` — bridging sync and async worlds**
+Not everything can (or should) be async. The `warc` crate is synchronous and does
+CPU-heavy work (gzip decompression + parsing). Running this directly on an async worker
+thread would block it, starving other async tasks. `tokio::task::spawn_blocking` moves
+the work to a separate thread pool designed for blocking operations. The async task
+suspends at `.await` until the blocking work completes, keeping the async threads free.
+Rule of thumb: if a function does CPU work or blocking I/O for more than a few
+microseconds, use `spawn_blocking`.
+
+**`reqwest` — async HTTP streaming**
+`reqwest` is Tokio-native: its `.send().await` releases the thread during the entire
+HTTP request/response cycle. The response body is consumed chunk-by-chunk with
+`.chunk().await`, where each `.await` releases the thread during network waits. Compare
+with `ureq` where the thread sits blocked during the entire transfer. For concurrent
+downloads, async means 4 downloads sharing 1 thread vs. 4 downloads needing 4 blocked
+threads.
+
+**`buffer_unordered(N)` — bounded concurrent stream processing**
+`futures::stream::buffer_unordered(N)` is a stream combinator that polls up to N futures
+simultaneously, yielding results as each completes (not in submission order). When one
+finishes, the next pending future starts. This gives us bounded concurrency without
+manual semaphore management. "Unordered" is key: a fast download isn't held up waiting
+for a slow one just because the slow one started first.
+
+**`Arc<T>` — atomic reference counting for shared ownership**
+Each concurrent task needs access to the compiled regex and HTTP client. Normal references
+(`&Regex`) won't work because Tokio tasks require `'static` lifetimes (they could outlive
+the spawning scope). `Arc` (Atomic Reference Count) wraps a value in a thread-safe smart
+pointer: `Arc::clone()` is cheap (just increments an atomic counter), and the inner value
+is dropped when the last `Arc` goes away. `Arc` provides shared *immutable* access — for
+shared mutable state you'd combine it with a `Mutex` (`Arc<Mutex<T>>`), but we avoid that
+by merging results sequentially on the main task.
+
+**`pin_mut!` — pinning streams for polling**
+Async streams must be "pinned" (guaranteed not to move in memory) before they can be
+polled. `futures::pin_mut!` pins a value to the stack. This is a detail of Rust's async
+model: because futures are state machines that contain self-references, moving them after
+creation would invalidate those references. Pinning is the compiler's guarantee that this
+won't happen.
+
+**Concurrent work, sequential merging**
+The pipeline is concurrent for downloads and parsing, but result merging (updating the
+HashMap, writing files) is sequential on the main task. This avoids locks and race
+conditions entirely — the simplest correct approach. This is a common async pattern:
+fan out for independent work, fan in for shared state updates.
+
+### Dependencies changed
+
+- **Removed `ureq`**: blocking HTTP client, replaced by async `reqwest`
+- **Added `reqwest`**: async HTTP client native to Tokio, with streaming body support
+- **Added `tokio`**: the async runtime (multi-threaded executor, async I/O, timers,
+  blocking thread pool). Features: `rt-multi-thread`, `macros`, `fs`, `sync`
+- **Added `futures`**: stream utilities (`StreamExt`, `pin_mut!`, `buffer_unordered`)
+  that complement Tokio's core functionality

@@ -1,26 +1,27 @@
-// onion-crawler — Steps 3–5: WARC Parsing, .onion Extraction, and Deduplication
+// onion-crawler — Step 6: Concurrent downloads & processing with Tokio
 //
-// Building on Step 2's HTTP downloader, the pipeline now:
-//   1. Downloads WARC archives from Common Crawl (using ureq)
-//   2. Decompresses and parses them with the `warc` crate
-//   3. Extracts .onion addresses via regex
-//   4. Deduplicates results and persists them to JSON
+// Building on Step 5, the pipeline now runs concurrently:
+//   - Multiple archives download in parallel (async I/O with reqwest)
+//   - Parsing starts as soon as each download completes (pipeline)
+//   - CPU-bound WARC parsing runs on Tokio's blocking thread pool
 //
-// The program implements a three-state model for each archive:
-//   - Already processed (in output/processed.log) → skip entirely
-//   - Downloaded but not parsed (file exists in download/) → parse it
-//   - Not downloaded → download first, then parse
+// The key insight: I/O-bound work (downloads) benefits from async because the
+// thread is released during network waits. CPU-bound work (parsing) still needs
+// real threads — `spawn_blocking` bridges the two worlds.
 //
-// New concepts: HashMap, HashSet, OpenOptions, warc crate, regex, serde_json.
+// New concepts: async/await, Tokio runtime, reqwest streaming, spawn_blocking,
+// bounded concurrency with buffer_unordered, Arc for shared ownership.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
 use regex::Regex;
 use warc::{RecordType, WarcReader};
 
@@ -29,6 +30,9 @@ const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 
 /// Default number of archives to process per run.
 const DEFAULT_LIMIT: usize = 1;
+
+/// Default number of concurrent downloads.
+const DEFAULT_JOBS: usize = 4;
 
 /// File tracking which archives have been fully processed.
 const PROCESSED_FILE: &str = "output/processed.log";
@@ -41,16 +45,25 @@ const RESULTS_FILE: &str = "output/onions.json";
 // ---------------------------------------------------------------------------
 
 /// Parsed command-line configuration.
+///
+/// The `jobs` field controls download concurrency — how many archives to
+/// download simultaneously. This is important because:
+/// - Too few jobs underutilizes network bandwidth (sequential bottleneck)
+/// - Too many jobs can overwhelm the server or local resources
+/// - Default of 4 is a reasonable balance for Common Crawl
 struct Config {
     paths_file: String,
     limit: usize,
     delete: bool,
+    /// Number of concurrent download+parse tasks.
+    jobs: usize,
 }
 
 /// Parse command-line arguments into a `Config`.
 ///
 /// Supports:
 ///   --limit N / --limit=N  → cap how many archives to process
+///   --jobs N / --jobs=N    → concurrent download tasks (default 4)
 ///   --delete               → remove archive files after parsing
 ///   <positional>           → path to the WARC-paths file
 fn parse_args() -> Config {
@@ -59,6 +72,7 @@ fn parse_args() -> Config {
     let mut paths_file = String::from("warc.paths");
     let mut limit = DEFAULT_LIMIT;
     let mut delete = false;
+    let mut jobs = DEFAULT_JOBS;
 
     let mut i = 0;
     while i < args.len() {
@@ -77,6 +91,21 @@ fn parse_args() -> Config {
                 eprintln!("Error: --limit value '{}' is not a valid number", args[i]);
                 process::exit(1);
             });
+        } else if let Some(value) = args[i].strip_prefix("--jobs=") {
+            jobs = value.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("Error: --jobs value '{}' is not a valid number", value);
+                process::exit(1);
+            });
+        } else if args[i] == "--jobs" {
+            i += 1;
+            if i >= args.len() {
+                eprintln!("Error: --jobs requires a value");
+                process::exit(1);
+            }
+            jobs = args[i].parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("Error: --jobs value '{}' is not a valid number", args[i]);
+                process::exit(1);
+            });
         } else if args[i] == "--delete" {
             delete = true;
         } else if args[i].starts_with('-') {
@@ -88,10 +117,16 @@ fn parse_args() -> Config {
         i += 1;
     }
 
+    // Ensure jobs is at least 1 — zero concurrency would deadlock.
+    if jobs == 0 {
+        jobs = 1;
+    }
+
     Config {
         paths_file,
         limit,
         delete,
+        jobs,
     }
 }
 
@@ -159,14 +194,33 @@ fn filename_from_uri(uri: &str) -> Result<&str, &'static str> {
         .ok_or("URI has no filename component")
 }
 
-/// Download a single WARC archive from Common Crawl using `ureq`.
+/// Download a single WARC archive from Common Crawl using async I/O.
 ///
-/// Streams the response body to disk in 8 KB chunks (via `Read` trait),
-/// so memory usage stays constant regardless of archive size. Prints
-/// progress every 10 MB.
-fn download_warc(uri: &str) -> Result<bool, Box<dyn Error>> {
+/// ## Why `reqwest` instead of `ureq`
+///
+/// `ureq` is a blocking HTTP client — while waiting for network data, the
+/// thread sits idle. This is fine for sequential code but wasteful when we
+/// want concurrency: each concurrent download would need its own OS thread.
+///
+/// `reqwest` is async-native: it uses Tokio's I/O driver so the thread is
+/// released during network waits and can run other tasks. With 4 concurrent
+/// downloads, we use ~1 thread instead of 4 blocked threads. This is the
+/// core benefit of async for I/O-bound work.
+///
+/// ## Streaming download
+///
+/// We use `response.chunk()` to stream the body in pieces rather than
+/// buffering the entire archive (hundreds of MB) in memory. Each chunk is
+/// written to disk immediately. This keeps memory usage constant regardless
+/// of archive size.
+async fn download_warc_async(
+    client: &reqwest::Client,
+    uri: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let url = format!("{}{}", COMMONCRAWL_BASE, uri);
-    let filename = filename_from_uri(uri)?;
+    let filename = filename_from_uri(uri).map_err(|e| -> Box<dyn Error + Send + Sync> {
+        e.into()
+    })?;
     let local_path: PathBuf = Path::new("download").join(filename);
 
     if local_path.exists() {
@@ -174,41 +228,35 @@ fn download_warc(uri: &str) -> Result<bool, Box<dyn Error>> {
         return Ok(false);
     }
 
-    fs::create_dir_all("download")?;
+    // `tokio::fs::create_dir_all` is the async version of `fs::create_dir_all`.
+    // For file system operations, async doesn't help much (disk I/O is fast),
+    // but it avoids blocking the Tokio runtime thread.
+    tokio::fs::create_dir_all("download").await?;
 
     eprintln!("  [{}] Downloading...", filename);
     eprintln!("  [{}] URL: {}", filename, url);
 
-    let response = ureq::get(&url).call()?;
+    let mut response = client.get(&url).send().await?.error_for_status()?;
 
     // Content-Length header tells us the total size (if the server provides it).
-    let total_size: Option<u64> = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok());
-
+    let total_size = response.content_length();
     if let Some(size) = total_size {
         eprintln!("  [{}] Size: {:.1} MB", filename, size as f64 / 1_048_576.0);
     }
 
-    // Stream the response body to a file in 8 KB chunks.
-    // `into_body().into_reader()` gives us a `Read` implementor that
-    // pulls bytes from the HTTP response. We read in fixed-size chunks
-    // to keep memory usage constant.
-    let mut reader = response.into_body().into_reader();
-    let mut file = File::create(&local_path)?;
-    let mut buf = [0u8; 8192];
+    // Stream the response body chunk by chunk to a file.
+    // `response.chunk()` yields `Option<Bytes>` — each call returns the next
+    // piece of the body, or None when complete. At each `.await`, the task
+    // suspends and the thread can run other downloads.
+    let mut file = tokio::fs::File::create(&local_path).await?;
     let mut bytes_written: u64 = 0;
     let mut last_report: u64 = 0;
 
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])?;
-        bytes_written += n as u64;
+    // `bytes_stream()` returns a Stream of Result<Bytes> chunks.
+    // We consume it with `while let` + `.chunk()` for simplicity.
+    while let Some(chunk) = response.chunk().await? {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        bytes_written += chunk.len() as u64;
 
         if bytes_written - last_report >= 10 * 1_048_576 {
             last_report = bytes_written;
@@ -253,14 +301,19 @@ fn download_warc(uri: &str) -> Result<bool, Box<dyn Error>> {
 
 /// Parse a WARC archive and extract unique .onion addresses.
 ///
-/// Uses the `warc` crate for structured parsing: `WarcReader::from_path_gzip`
-/// handles gzip decompression internally and yields typed records. We filter
-/// to `RecordType::Response` (HTTP response bodies) where .onion links appear,
-/// skipping request records, metadata, and binary content.
+/// This function is **synchronous** — the `warc` crate uses blocking I/O
+/// internally (decompressing gzip, reading record boundaries). We don't
+/// rewrite it as async because:
 ///
-/// The regex scans each response body for both v2 (16-char) and v3 (56-char)
-/// .onion addresses using base32 character classes.
-fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<dyn Error>> {
+/// 1. The `warc` crate doesn't support async — we'd need a different library
+/// 2. Parsing is CPU-bound (decompression + regex matching), not I/O-bound
+/// 3. Async shines for I/O waits (network, slow disk); for CPU work it just
+///    adds overhead
+///
+/// Instead, we call this from `spawn_blocking` (see the pipeline in `main`),
+/// which runs it on Tokio's dedicated blocking thread pool. This is the
+/// idiomatic way to mix sync CPU work with async I/O in Tokio.
+fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
     let reader = WarcReader::from_path_gzip(path)?;
     let mut onions = HashSet::new();
     let mut records_scanned: u64 = 0;
@@ -299,16 +352,46 @@ fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<dyn 
 }
 
 // ---------------------------------------------------------------------------
-// Main — sequential processing loop
+// Per-archive task result
 // ---------------------------------------------------------------------------
 
-fn main() {
-    // --- Parse CLI arguments ---
+/// The outcome of processing a single archive — passed back from each
+/// concurrent task to the main task for merging.
+///
+/// We need this struct because each task runs independently and can't
+/// mutate shared state. Instead, each task returns its results and the
+/// main task merges them sequentially — no locks needed.
+struct ArchiveResult {
+    onions: HashSet<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Main — async entry point
+// ---------------------------------------------------------------------------
+
+/// ## `#[tokio::main]` — the async runtime entry point
+///
+/// Rust's `main` must be synchronous, but we need an async runtime to drive
+/// our concurrent downloads. `#[tokio::main]` is a macro that:
+/// 1. Creates a multi-threaded Tokio runtime (default: one thread per CPU core)
+/// 2. Runs our `async fn main()` on that runtime
+/// 3. Shuts down the runtime when `main` completes
+///
+/// This is equivalent to writing:
+/// ```
+/// fn main() {
+///     tokio::runtime::Runtime::new().unwrap().block_on(async { ... })
+/// }
+/// ```
+/// The macro is just more concise.
+#[tokio::main]
+async fn main() {
+    // --- Parse CLI arguments (synchronous — runs before the async work) ---
     let config = parse_args();
 
     eprintln!(
-        "Reading WARC paths from '{}' (limit: {}, delete after: {})",
-        config.paths_file, config.limit, config.delete
+        "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {})",
+        config.paths_file, config.limit, config.jobs, config.delete
     );
 
     // --- Open and read the paths file ---
@@ -342,26 +425,12 @@ fn main() {
         results.len()
     );
 
-    // --- Compile the .onion regex once ---
-    //
-    // `Regex::new()` compiles the pattern string into an efficient automaton.
-    // This compilation is expensive, so we do it once outside the loop.
-    //
-    // Important: we use a case-sensitive pattern (no `(?i)` flag). Combining
-    // `(?i)` with `\b` word boundaries forces the regex crate off its fast
-    // DFA path into a much slower execution mode — over 1000x slower on real
-    // data. Since .onion addresses are base32 (lowercase by convention) and
-    // we already call `.to_lowercase()` on matches, case-insensitive matching
-    // is unnecessary.
-    let onion_re =
-        Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")
-            .expect("Invalid regex");
-
-    // --- Sequential processing loop ---
-    let mut process_count: usize = 0;
+    // --- Filter URIs: skip already-processed, apply limit ---
+    // We do this upfront so we know exactly which archives to process
+    // concurrently. Skipped archives are logged but don't count toward
+    // the limit.
+    let mut work_items: Vec<(usize, String)> = Vec::new();
     let mut skip_count: usize = 0;
-    let mut fail_count: usize = 0;
-    let mut new_onions: usize = 0;
 
     for (i, uri) in uris.iter().enumerate() {
         let filename = match filename_from_uri(uri) {
@@ -372,15 +441,13 @@ fn main() {
             }
         };
 
-        // --- Check if already processed ---
         if processed.contains(filename) {
             eprintln!("[{}] {} — already processed, skipping", i + 1, filename);
             skip_count += 1;
             continue;
         }
 
-        // --- Enforce processing limit ---
-        if process_count >= config.limit {
+        if work_items.len() >= config.limit {
             eprintln!(
                 "Reached processing limit of {}. Stopping.",
                 config.limit
@@ -388,44 +455,186 @@ fn main() {
             break;
         }
 
-        eprintln!("[{}] {}", i + 1, filename);
+        work_items.push((i + 1, uri.clone()));
+    }
 
-        // --- Download if not already on disk ---
-        let local_path: PathBuf = Path::new("download").join(filename);
-        if !local_path.exists() {
-            match download_warc(uri) {
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("  [{}] Download error: {}", filename, err);
-                    fail_count += 1;
-                    eprintln!();
-                    continue;
-                }
-            }
-        } else {
-            eprintln!("  [{}] Already downloaded", filename);
+    if work_items.is_empty() {
+        eprintln!("No archives to process.");
+        // Still save results (safety net) and print summary.
+        match save_results(&results) {
+            Ok(()) => eprintln!("Results saved to {}", RESULTS_FILE),
+            Err(err) => eprintln!("Error saving results: {}", err),
         }
+        eprintln!(
+            "\nSummary: 0 processed, {} skipped, 0 failed, 0 new onion(s)",
+            skip_count
+        );
+        eprintln!(
+            "Total: {} unique .onion address(es) in results",
+            results.len()
+        );
+        return;
+    }
 
-        // --- Parse the WARC archive ---
-        eprintln!("  [{}] Parsing...", filename);
-        match parse_warc(&local_path, &onion_re) {
-            Ok(onions) => {
+    eprintln!("Processing {} archive(s) with {} concurrent job(s)\n", work_items.len(), config.jobs);
+
+    // --- Compile the .onion regex once, wrapped in Arc for sharing ---
+    //
+    // ## `Arc` — atomic reference counting for shared ownership
+    //
+    // Each concurrent task needs access to the compiled regex. We can't
+    // pass a `&Regex` reference because async tasks may outlive the current
+    // scope (Tokio needs `'static` lifetimes for spawned tasks).
+    //
+    // `Arc` (Atomic Reference Count) solves this: it's a thread-safe smart
+    // pointer that keeps the inner value alive as long as any clone exists.
+    // Cloning an `Arc` just increments a counter — the regex itself is
+    // never copied. This is Rust's standard pattern for sharing immutable
+    // data across threads.
+    let onion_re = Arc::new(
+        Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")
+            .expect("Invalid regex"),
+    );
+
+    // --- Create a shared HTTP client ---
+    //
+    // `reqwest::Client` maintains a connection pool internally. Sharing one
+    // client across all tasks lets them reuse TCP connections to the same
+    // server (HTTP keep-alive), which is faster than each task opening its
+    // own connection.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let delete = config.delete;
+
+    // --- Concurrent pipeline with `buffer_unordered` ---
+    //
+    // ## How the pipeline works
+    //
+    // `stream::iter(work_items)` creates a stream of (index, uri) pairs.
+    // `.map(|item| async { ... })` transforms each into a future that
+    // downloads + parses one archive.
+    //
+    // `.buffer_unordered(jobs)` is the concurrency controller:
+    // - It polls up to `jobs` futures simultaneously
+    // - Results are yielded as soon as any future completes (not in order)
+    // - When one completes, the next pending future starts
+    //
+    // This gives us bounded concurrency without manual semaphore management.
+    // "Unordered" means faster archives finish first — we don't block
+    // waiting for a slow download just because it started earlier.
+    let archive_stream = stream::iter(work_items)
+        .map(|(idx, uri)| {
+            // Clone shared resources for this task. `Arc::clone` is cheap
+            // (just increments a reference count).
+            let client = client.clone();
+            let onion_re = Arc::clone(&onion_re);
+
+            async move {
+                let filename = match filename_from_uri(&uri) {
+                    Ok(f) => f.to_string(),
+                    Err(err) => {
+                        eprintln!("[{}] {}: {}", idx, uri, err);
+                        return Err(format!("{}: {}", uri, err));
+                    }
+                };
+
+                eprintln!("[{}] {}", idx, filename);
+
+                // --- Download if not already on disk ---
+                let local_path: PathBuf = Path::new("download").join(&filename);
+                if !local_path.exists() {
+                    match download_warc_async(&client, &uri).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            eprintln!("  [{}] Download error: {}", filename, err);
+                            return Err(format!("{}: download error: {}", filename, err));
+                        }
+                    }
+                } else {
+                    eprintln!("  [{}] Already downloaded", filename);
+                }
+
+                // --- Parse on the blocking thread pool ---
+                //
+                // ## `spawn_blocking` — bridging sync and async
+                //
+                // `parse_warc` is CPU-bound (gzip decompression + regex).
+                // Running it directly on an async task would block the Tokio
+                // worker thread, starving other async tasks (downloads).
+                //
+                // `spawn_blocking` moves the work to Tokio's dedicated
+                // blocking thread pool, which has many more threads and
+                // expects blocking work. The `.await` here suspends the
+                // async task until the blocking work finishes, freeing the
+                // worker thread for other downloads.
+                //
+                // Rule of thumb: if a function does CPU work or calls
+                // blocking I/O for more than a few microseconds, use
+                // `spawn_blocking`.
+                eprintln!("  [{}] Parsing...", filename);
+                let parse_path = local_path.clone();
+                let parse_re = Arc::clone(&onion_re);
+
+                let parse_result = tokio::task::spawn_blocking(move || {
+                    parse_warc(&parse_path, &parse_re)
+                })
+                .await;
+
+                // `spawn_blocking` returns a `JoinHandle` — unwrap the
+                // outer Result (task panic) then the inner Result (parse error).
+                let onions = match parse_result {
+                    Ok(Ok(onions)) => onions,
+                    Ok(Err(err)) => {
+                        eprintln!("  [{}] Parse error: {}", filename, err);
+                        return Err(format!("{}: parse error: {}", filename, err));
+                    }
+                    Err(err) => {
+                        eprintln!("  [{}] Task panic: {}", filename, err);
+                        return Err(format!("{}: task panic: {}", filename, err));
+                    }
+                };
+
                 eprintln!("  [{}] Found {} unique .onion address(es)", filename, onions.len());
 
+                Ok((idx, filename, local_path, ArchiveResult { onions }))
+            }
+        })
+        .buffer_unordered(config.jobs);
+
+    // --- Collect results back on the main task ---
+    //
+    // `buffer_unordered` yields results as futures complete. We process
+    // them sequentially here: merge onions into the shared results map,
+    // mark archives as processed, and optionally delete files.
+    //
+    // This is a key design choice: concurrent *work*, sequential *merging*.
+    // No locks, no race conditions — the simplest correct approach.
+    let mut process_count: usize = 0;
+    let mut fail_count: usize = 0;
+    let mut new_onions: usize = 0;
+
+    // `pin_mut!` pins the stream to the stack so we can poll it.
+    // This is needed because `buffer_unordered` returns a stream that
+    // must be pinned to be polled (a Rust async trait requirement).
+    futures::pin_mut!(archive_stream);
+
+    while let Some(task_result) = archive_stream.next().await {
+        match task_result {
+            Ok((_idx, filename, local_path, archive)) => {
                 let count_before = results.len();
-                for onion in onions {
+                for onion in archive.onions {
                     let archives = results.entry(onion).or_default();
-                    if !archives.contains(&filename.to_string()) {
-                        archives.push(filename.to_string());
+                    if !archives.contains(&filename) {
+                        archives.push(filename.clone());
                     }
                 }
                 let added = results.len() - count_before;
                 new_onions += added;
 
-                // Mark as processed and save results after each archive.
-                // If either fails, the next run reprocesses this archive
-                // (safe, just redundant).
-                if let Err(err) = mark_processed(filename) {
+                if let Err(err) = mark_processed(&filename) {
                     eprintln!("  Warning: couldn't mark as processed: {}", err);
                 }
                 if let Err(err) = save_results(&results) {
@@ -434,21 +643,21 @@ fn main() {
 
                 process_count += 1;
 
-                // --- Optionally delete the archive ---
-                if config.delete {
+                if delete {
                     match fs::remove_file(&local_path) {
                         Ok(()) => eprintln!("  [{}] Deleted {}", filename, local_path.display()),
                         Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", filename, err),
                     }
                 }
+
+                eprintln!();
             }
             Err(err) => {
-                eprintln!("  [{}] Parse error: {}", filename, err);
+                eprintln!("  Error: {}", err);
                 fail_count += 1;
+                eprintln!();
             }
         }
-
-        eprintln!();
     }
 
     // --- Final save (safety net) ---
