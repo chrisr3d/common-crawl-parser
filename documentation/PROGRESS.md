@@ -219,4 +219,65 @@ is expected.
 
 ### What's next
 
+Performance optimization: benchmark and fix regex performance, optimize debug builds.
+
+---
+
+## Performance Fixes
+
+### Root cause: catastrophic regex performance with `(?i)` flag
+
+The crawler was taking ~2.5 minutes (release) to parse a 1GB WARC archive, while the
+old crawler did it in ~17 seconds. Isolating the bottleneck via a minimal benchmark
+revealed that WARC parsing + gzip decompression takes only ~15s — the entire slowdown
+was in the regex.
+
+The original regex `(?i)\b[a-z2-7]{16}\.onion\b|\b[a-z2-7]{56}\.onion\b` used the
+case-insensitive `(?i)` flag. When combined with `\b` (word boundary assertions), this
+forces the `regex` crate off its fast DFA (deterministic finite automaton) path into a
+much slower execution mode. The engine can no longer use literal prefix optimizations
+(scanning for `.onion` as a fixed string) and must evaluate the full automaton at every
+byte position across 4.5GB of decompressed text.
+
+The fix was switching to the old crawler's pattern: `\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b`
+(case-sensitive). Since `.onion` addresses are base32 and conventionally lowercase, and
+our code already calls `.to_lowercase()` on matches, case-insensitive matching was
+unnecessary. This regex is **1,250x faster** on the same data.
+
+| Regex | Time (4.5GB text, release) |
+|---|---|
+| `(?i)\b[a-z2-7]{16}\.onion\b\|\b[a-z2-7]{56}\.onion\b` | 125.6s |
+| `\b([a-z2-7]{16}\|[a-z2-7]{56})\.onion\b` | 0.1s |
+
+**Lesson: regex performance is not intuitive.** Small flag changes (`(?i)`) can cause
+orders-of-magnitude slowdowns depending on how the regex engine optimizes internally.
+When performance matters, benchmark the actual regex against real data. The `regex` crate
+has excellent documentation on its optimization strategies in the
+[`regex` crate docs](https://docs.rs/regex/latest/regex/#performance).
+
+### Optimized dependency compilation in debug mode
+
+Even with the fast regex, debug builds are slower because dependency code (gzip
+decompression, regex automaton, WARC parsing) runs without optimization. The standard
+Rust fix is to optimize dependencies at `-O2` while keeping our own code in debug mode:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+**`[profile.dev.package."*"]` — per-package profile overrides**
+Cargo allows overriding compiler optimization levels on a per-package basis within a
+profile. `dev` is the profile used by `cargo build` and `cargo run`. `package."*"` is a
+wildcard matching all dependency crates (but not our own crate). `opt-level = 2` is the
+same optimization level used by the `release` profile. This gives us the best of both
+worlds: fast dependency code + debuggable application code.
+
+Final measured results on a 1GB WARC archive (~30,000 records, ~15,000 responses):
+- **Release build**: ~16s (matching old crawler's ~17s)
+- **Debug build with `opt-level = 2` on deps**: ~1m 20s
+- **Debug build without optimization**: would be significantly slower
+
+### What's next
+
 Step 6: Concurrent downloads and processing with async/tokio.

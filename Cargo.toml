@@ -7,4 +7,11 @@ edition = "2024"
 regex = "1"
 serde_json = "1"
 ureq = "3"
-warc = "0.3"
+warc = "0.4"
+
+# Optimize all dependencies even in debug builds.
+# Our code (gzip decompression, regex) spends 99% of CPU time inside
+# dependency crates. Optimizing them gives release-like performance
+# while keeping our own code in debug mode (fast compile, good errors).
+[profile.dev.package."*"]
+opt-level = 2

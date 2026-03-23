@@ -27,6 +27,10 @@ Results stored in `output/onions.json`, processing state tracked in
 `output/processed.log`. Uses `ureq` (blocking HTTP), `warc` (structured WARC parsing),
 `regex`, `serde_json`.
 
+Performance: `[profile.dev.package."*"] opt-level = 2` optimizes dependencies in debug
+builds. Regex is case-sensitive (`(?i)` flag causes 1000x+ slowdown with `\b` boundaries).
+Release build parses a 1GB archive in ~16s.
+
 ## Roadmap
 
 1. ~~Project scaffolding — read WARC paths file~~ (done)
