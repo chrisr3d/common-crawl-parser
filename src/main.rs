@@ -29,8 +29,18 @@ use warc::{RecordType, WarcReader};
 const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 
 
-/// Default number of concurrent downloads.
-const DEFAULT_JOBS: usize = 4;
+/// Detect the number of CPU cores available for parallel work.
+///
+/// `available_parallelism()` queries the OS for the number of logical CPUs
+/// (hardware threads). This is the right default for our workload: each job
+/// does CPU-bound parsing (gzip decompression + regex) via `spawn_blocking`,
+/// so one job per core avoids oversubscription. Falls back to 1 if detection
+/// fails (e.g. in constrained containers).
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
 
 /// File tracking which archives have been fully processed.
 const PROCESSED_FILE: &str = "output/processed.log";
@@ -48,7 +58,7 @@ const RESULTS_FILE: &str = "output/onions.json";
 /// download simultaneously. This is important because:
 /// - Too few jobs underutilizes network bandwidth (sequential bottleneck)
 /// - Too many jobs can overwhelm the server or local resources
-/// - Default of 4 is a reasonable balance for Common Crawl
+/// - Default matches CPU core count (scales to the machine)
 struct Config {
     paths_file: String,
     limit: usize,
@@ -61,7 +71,7 @@ struct Config {
 ///
 /// Supports:
 ///   --limit N / --limit=N  → cap how many archives to process (default: all)
-///   --jobs N / --jobs=N    → concurrent download tasks (default 4)
+///   --jobs N / --jobs=N    → concurrent download tasks (default: CPU cores)
 ///   --delete               → remove archive files after parsing
 ///   <positional>           → path to the WARC-paths file
 fn parse_args() -> Config {
@@ -70,7 +80,7 @@ fn parse_args() -> Config {
     let mut paths_file = String::from("warc.paths");
     let mut limit: usize = 0;
     let mut delete = false;
-    let mut jobs = DEFAULT_JOBS;
+    let mut jobs = default_jobs();
 
     let mut i = 0;
     while i < args.len() {
