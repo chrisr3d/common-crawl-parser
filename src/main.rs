@@ -28,8 +28,6 @@ use warc::{RecordType, WarcReader};
 /// Base URL for Common Crawl data archives.
 const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 
-/// Default number of archives to process per run.
-const DEFAULT_LIMIT: usize = 1;
 
 /// Default number of concurrent downloads.
 const DEFAULT_JOBS: usize = 4;
@@ -62,7 +60,7 @@ struct Config {
 /// Parse command-line arguments into a `Config`.
 ///
 /// Supports:
-///   --limit N / --limit=N  → cap how many archives to process
+///   --limit N / --limit=N  → cap how many archives to process (default: all)
 ///   --jobs N / --jobs=N    → concurrent download tasks (default 4)
 ///   --delete               → remove archive files after parsing
 ///   <positional>           → path to the WARC-paths file
@@ -70,7 +68,7 @@ fn parse_args() -> Config {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let mut paths_file = String::from("warc.paths");
-    let mut limit = DEFAULT_LIMIT;
+    let mut limit: usize = 0;
     let mut delete = false;
     let mut jobs = DEFAULT_JOBS;
 
@@ -389,9 +387,14 @@ async fn main() {
     // --- Parse CLI arguments (synchronous — runs before the async work) ---
     let config = parse_args();
 
+    let limit_display = if config.limit > 0 {
+        format!("{}", config.limit)
+    } else {
+        "all".to_string()
+    };
     eprintln!(
         "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {})",
-        config.paths_file, config.limit, config.jobs, config.delete
+        config.paths_file, limit_display, config.jobs, config.delete
     );
 
     // --- Open and read the paths file ---
@@ -447,7 +450,7 @@ async fn main() {
             continue;
         }
 
-        if work_items.len() >= config.limit {
+        if config.limit > 0 && work_items.len() >= config.limit {
             eprintln!(
                 "Reached processing limit of {}. Stopping.",
                 config.limit
