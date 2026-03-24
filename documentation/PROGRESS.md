@@ -398,3 +398,153 @@ by default (internally `limit = 0`, with the limit check guarded by `limit > 0`)
 The program now processes all unprocessed URIs in the paths file, which is the
 expected behavior for a batch processing tool. `--limit N` remains available for
 testing or resource-constrained runs.
+
+### Per-archive timing instrumentation
+
+Added wall-clock timing for each archive's download and parse phases using
+`std::time::Instant`. Each archive now reports its download time and parse time
+individually. The final summary includes average download and parse times across
+all processed archives, giving visibility into where time is spent.
+
+**`std::time::Instant` — monotonic clock for benchmarking**
+`Instant::now()` captures a point in time. `start.elapsed()` returns a `Duration`
+representing the wall-clock time since that instant. Unlike system clocks,
+`Instant` is monotonic — it never goes backwards (e.g. due to NTP adjustments),
+making it safe for measuring elapsed time. `Duration::as_secs_f64()` converts
+to a floating-point seconds value for display.
+
+### Portable TLS with `rustls`
+
+The default `reqwest` configuration uses OpenSSL for TLS, which requires system
+packages (`libssl-dev`, `pkg-config`) that may not be present on minimal Linux
+installations or Docker images. Switched to `rustls` — a pure-Rust TLS implementation:
+
+```toml
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+```
+
+This eliminates the system dependency entirely. The binary compiles on any platform
+with just the Rust toolchain, consistent with the project's portability goal.
+
+---
+
+## Post-1.0.0: CLI, Gzip Paths, and Code Structure
+
+### `clap` derive for CLI argument parsing
+
+Replaced the hand-rolled `while` loop argument parser (~50 lines of repetitive
+`strip_prefix` / `==` checks) with `clap`'s derive macro. The entire CLI definition
+is now a struct with attributes:
+
+```rust
+#[derive(Parser)]
+#[command(name = "onion-crawler")]
+#[command(about = "Extract .onion addresses from Common Crawl WARC archives")]
+struct Config {
+    /// Path to the WARC-paths file (supports .gz)
+    input: String,
+
+    /// Maximum number of archives to process (default: all)
+    #[arg(short, long)]
+    limit: Option<usize>,
+
+    /// Number of concurrent download+parse tasks
+    #[arg(short, long, default_value_t = default_jobs())]
+    jobs: usize,
+
+    /// Delete archive files after parsing
+    #[arg(short, long)]
+    delete: bool,
+}
+```
+
+### Rust concepts introduced
+
+**`clap` derive macro — declarative CLI definitions**
+`#[derive(Parser)]` generates all argument parsing code from the struct definition.
+Each field becomes a CLI argument: positional fields (no `#[arg]` with `short`/`long`)
+are positional arguments, fields with `#[arg(short, long)]` become flags. `clap`
+handles `--flag value`, `--flag=value`, `-f value`, type parsing, error messages,
+and `--help` generation automatically.
+
+**`///` doc comments as help text**
+`clap` turns doc comments (`///`) on struct fields into the `--help` descriptions.
+This is why the struct-level explanation uses regular comments (`//`) instead —
+otherwise `clap` would include those in the help banner too. The `#[command(about)]`
+attribute explicitly sets the one-line program description shown in `--help`.
+
+**`Option<usize>` for optional arguments**
+`limit` is `Option<usize>` instead of the previous `usize` with 0-means-unlimited.
+`Option` is Rust's way of expressing "this value may or may not be present" — it's
+either `Some(value)` or `None`. This is more expressive than sentinel values (0, -1)
+because the type itself encodes the possibility of absence.
+
+**`if let Some(x)` — pattern matching on `Option`**
+To check and extract an `Option` value in one step:
+```rust
+if let Some(limit) = config.limit {
+    if work_items.len() >= limit { break; }
+}
+```
+`if let` tries to match the right side against the pattern on the left. If
+`config.limit` is `Some(5)`, the pattern matches and `limit` is bound to `5` as
+a new local variable scoped to the block. If it's `None`, the block is skipped.
+This replaces the previous `if config.limit > 0 && ...` guard. The variable `limit`
+doesn't exist before this line — it's created by the pattern match, similar to how
+function parameters are created from passed arguments.
+
+**Required positional argument**
+The input paths file changed from a hardcoded default (`"warc.paths"`) to a required
+positional argument. With `clap`, a `String` field without `default_value` is required —
+running the program without it shows a clear error message. This is better for
+explicitness: the user always knows which file is being processed.
+
+### Gzip-compressed paths file support
+
+Common Crawl distributes `warc.paths.gz` files. Rather than requiring manual
+decompression, the program now detects `.gz` extensions and decompresses transparently:
+
+```rust
+let reader: Box<dyn BufRead> = if config.input.ends_with(".gz") {
+    let decoder = libflate::gzip::Decoder::new(file)?;
+    Box::new(BufReader::new(decoder))
+} else {
+    Box::new(BufReader::new(file))
+};
+```
+
+**`Box<dyn BufRead>` — trait objects for runtime polymorphism**
+The two branches return different concrete types (`BufReader<Decoder<File>>` vs
+`BufReader<File>`), but both implement `BufRead`. `Box<dyn BufRead>` is a trait
+object — a heap-allocated pointer to *any* type implementing `BufRead`. This lets
+us assign either branch to the same variable. The `dyn` keyword means "dynamic
+dispatch": method calls go through a vtable (function pointer table) at runtime,
+unlike generic code which is resolved at compile time. The tiny runtime cost is
+irrelevant here since we read the paths file once at startup.
+
+**Reusing transitive dependencies**
+`libflate` was already compiled as a transitive dependency of the `warc` crate.
+Adding `libflate = "1"` to `Cargo.toml` just makes it directly importable — no
+new download or compilation needed. This is a practical Rust tip: check `cargo tree`
+before adding a new crate — the functionality you need might already be in the
+dependency tree.
+
+### Binary + library crate structure
+
+Split the single `main.rs` into two files:
+- **`src/main.rs`** — CLI parsing with `clap` and pipeline orchestration (the coordinator)
+- **`src/lib.rs`** — all feature code: download, WARC parsing, state management
+
+**Why this structure?**
+Rust supports having both a binary (`main.rs`) and a library (`lib.rs`) in the same
+package. The binary is the executable entry point; the library holds reusable code.
+`main.rs` imports from the library using the crate name: `use onion_crawler::{...}`.
+This separation makes the code easier to navigate — the coordinator logic is separate
+from the feature implementations — and the library code could be reused by other
+binaries or tests.
+
+**`pub` visibility**
+Functions and constants in `lib.rs` that `main.rs` needs must be marked `pub` (public).
+By default, items in Rust are private to their module. `pub` makes them accessible from
+outside the crate. This is Rust's encapsulation: the library controls exactly what it
+exposes.
