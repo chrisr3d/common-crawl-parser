@@ -20,14 +20,40 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 use regex::Regex;
 
 use onion_crawler::{
     download_warc_async, filename_from_uri, load_processed, load_results,
-    mark_processed, parse_warc, save_results, RESULTS_FILE,
+    mark_processed, parse_warc, parse_warc_bytes, parse_warc_memchr, parse_warc_mmap,
+    save_results, RESULTS_FILE,
 };
+
+// ---------------------------------------------------------------------------
+// Parsing Strategy Selection
+// ---------------------------------------------------------------------------
+
+/// Parsing strategy — selects which optimization layer to use.
+///
+/// Each strategy produces identical results but uses different techniques,
+/// inspired by how ripgrep achieves its speed. Run all four on the same
+/// archive to benchmark the impact of each optimization.
+///
+/// `ValueEnum` derive lets `clap` parse the strategy name from the CLI
+/// (e.g., `--strategy memchr`). It auto-generates the list of valid values
+/// for `--help` output.
+#[derive(Clone, Copy, ValueEnum)]
+enum Strategy {
+    /// Original: warc crate + regex::Regex on UTF-8 strings
+    Baseline,
+    /// Custom parser + regex::bytes::Regex on raw &[u8] (no UTF-8 conversion)
+    Bytes,
+    /// Custom parser + SIMD memmem literal search (no regex engine)
+    Memchr,
+    /// Decompress → mmap → zero-copy memchr search
+    Mmap,
+}
 
 // ---------------------------------------------------------------------------
 // CLI Argument Parsing
@@ -72,6 +98,10 @@ struct Config {
     /// Delete archive files after parsing
     #[arg(short, long)]
     delete: bool,
+
+    /// Parsing strategy: baseline, bytes, memchr, or mmap
+    #[arg(short, long, value_enum, default_value_t = Strategy::Memchr)]
+    strategy: Strategy,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,9 +151,15 @@ async fn main() {
         Some(n) => format!("{}", n),
         None => "all".to_string(),
     };
+    let strategy_name = match config.strategy {
+        Strategy::Baseline => "baseline (warc crate + regex)",
+        Strategy::Bytes => "bytes (custom parser + regex::bytes)",
+        Strategy::Memchr => "memchr (custom parser + SIMD memmem)",
+        Strategy::Mmap => "mmap (decompress + mmap + SIMD memmem)",
+    };
     eprintln!(
-        "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {})",
-        config.input, limit_display, config.jobs, config.delete
+        "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {}, strategy: {})",
+        config.input, limit_display, config.jobs, config.delete, strategy_name
     );
 
     // --- Open and read the paths file ---
@@ -237,10 +273,16 @@ async fn main() {
     // Cloning an `Arc` just increments a counter — the regex itself is
     // never copied. This is Rust's standard pattern for sharing immutable
     // data across threads.
+    //
+    // Only the Baseline strategy uses this regex — the others use either
+    // `regex::bytes::Regex` (compiled per-call) or `memmem::Finder`.
+    // We still compile it unconditionally to keep the code simple.
     let onion_re = Arc::new(
         Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")
             .expect("Invalid regex"),
     );
+
+    let strategy = config.strategy;
 
     // --- Create a shared HTTP client ---
     //
@@ -323,13 +365,23 @@ async fn main() {
                 // Rule of thumb: if a function does CPU work or calls
                 // blocking I/O for more than a few microseconds, use
                 // `spawn_blocking`.
-                eprintln!("  [{}] Parsing...", filename);
+                eprintln!("  [{}] Parsing ({})...", filename, match strategy {
+                    Strategy::Baseline => "baseline",
+                    Strategy::Bytes => "bytes",
+                    Strategy::Memchr => "memchr",
+                    Strategy::Mmap => "mmap",
+                });
                 let parse_path = local_path.clone();
                 let parse_re = Arc::clone(&onion_re);
 
                 let parse_start = Instant::now();
                 let parse_result = tokio::task::spawn_blocking(move || {
-                    parse_warc(&parse_path, &parse_re)
+                    match strategy {
+                        Strategy::Baseline => parse_warc(&parse_path, &parse_re),
+                        Strategy::Bytes => parse_warc_bytes(&parse_path),
+                        Strategy::Memchr => parse_warc_memchr(&parse_path),
+                        Strategy::Mmap => parse_warc_mmap(&parse_path),
+                    }
                 })
                 .await;
                 let parse_time = parse_start.elapsed();

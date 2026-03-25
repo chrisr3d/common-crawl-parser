@@ -2,15 +2,28 @@
 //
 // This module contains all the feature-specific code:
 //   - Downloading WARC archives from Common Crawl (async with reqwest)
-//   - Parsing WARC records and extracting .onion addresses (sync with warc crate)
+//   - Parsing WARC records and extracting .onion addresses (multiple strategies)
 //   - Persistent state: processed log and results JSON
+//
+// ## Parsing strategies (ripgrep-inspired optimization layers)
+//
+// Four strategies are available, selectable at runtime via `--strategy`:
+//   - Baseline: original `warc` crate + `regex::Regex` on UTF-8 strings
+//   - Bytes:    custom WARC parser + `regex::bytes::Regex` on raw &[u8]
+//   - Memchr:   custom parser + SIMD `memmem` literal search (no regex)
+//   - Mmap:     decompress to temp file → mmap → zero-copy memchr search
+
+pub mod onion_search;
+pub mod warc_parser;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use flate2::read::MultiGzDecoder;
+use memchr::memmem;
 use regex::Regex;
 use warc::{RecordType, WarcReader};
 
@@ -192,6 +205,177 @@ pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<
 
     if records_scanned >= 10_000 {
         eprintln!();
+    }
+
+    Ok(onions)
+}
+
+/// Parse a WARC archive using the custom byte-level parser + `regex::bytes`.
+///
+/// ## What's different from the baseline
+///
+/// 1. **Custom WARC parser** — skips non-response record bodies entirely
+///    (the `warc` crate reads every body, even ones we discard)
+/// 2. **`regex::bytes::Regex`** — searches `&[u8]` directly, no UTF-8 conversion
+///    (eliminates `String::from_utf8_lossy` allocation per record)
+/// 3. **`flate2` decompression** — wraps zlib for faster gzip decoding
+///
+/// Expected ~1.5-2x speedup over baseline.
+pub fn parse_warc_bytes(path: &Path) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+    let file = fs::File::open(path)?;
+    let decoder = MultiGzDecoder::new(file);
+    let buf_reader = BufReader::new(decoder);
+    let iter = warc_parser::WarcRecordIter::new(buf_reader);
+
+    let onion_re = regex::bytes::Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")?;
+    let mut onions = HashSet::new();
+    let mut records_scanned: u64 = 0;
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+
+    for result in iter {
+        let record = result?;
+        records_scanned += 1;
+
+        onion_search::search_regex_bytes(&record.body, &onion_re, &mut onions);
+
+        if records_scanned % 10_000 == 0 {
+            eprint!(
+                "\r  [{}] Scanning (bytes): {} records, {} onion(s)",
+                filename, records_scanned, onions.len()
+            );
+        }
+    }
+
+    if records_scanned >= 10_000 {
+        eprintln!();
+    }
+
+    Ok(onions)
+}
+
+/// Parse a WARC archive using the custom parser + SIMD `memmem` literal search.
+///
+/// ## The ripgrep technique
+///
+/// Instead of running a regex engine on every byte, we:
+/// 1. Use `memmem::Finder` (SIMD-accelerated) to jump to ".onion" literals
+/// 2. Validate surrounding bytes with cheap comparisons
+///
+/// `memmem` scans 16-32 bytes per CPU cycle via SIMD. Since ".onion" is
+/// rare in typical web content, the validator almost never runs. This is
+/// dramatically faster than the regex NFA which must track state for every byte.
+///
+/// Expected ~3-5x speedup over baseline.
+pub fn parse_warc_memchr(path: &Path) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+    let file = fs::File::open(path)?;
+    let decoder = MultiGzDecoder::new(file);
+    let buf_reader = BufReader::new(decoder);
+    let iter = warc_parser::WarcRecordIter::new(buf_reader);
+
+    let finder = memmem::Finder::new(b".onion");
+    let mut onions = HashSet::new();
+    let mut records_scanned: u64 = 0;
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+
+    for result in iter {
+        let record = result?;
+        records_scanned += 1;
+
+        onion_search::search_memchr(&record.body, &finder, &mut onions);
+
+        if records_scanned % 10_000 == 0 {
+            eprint!(
+                "\r  [{}] Scanning (memchr): {} records, {} onion(s)",
+                filename, records_scanned, onions.len()
+            );
+        }
+    }
+
+    if records_scanned >= 10_000 {
+        eprintln!();
+    }
+
+    Ok(onions)
+}
+
+/// Parse a WARC archive using memory-mapped I/O + SIMD literal search.
+///
+/// ## How mmap works here
+///
+/// WARC archives are gzip-compressed, and gzip is a streaming format —
+/// you can't random-access into compressed data. So we decompress the
+/// entire archive to a temporary file first, then memory-map that file.
+///
+/// Memory mapping means the OS maps the file's contents directly into
+/// our virtual address space. Benefits:
+/// - **Zero-copy**: record bodies are `&[u8]` slices into the mapped region,
+///   no `Vec<u8>` allocation needed
+/// - **OS page cache**: the kernel manages which pages are in RAM, doing a
+///   better job than manual buffering for sequential access patterns
+/// - **No read syscalls**: data access happens through page faults, handled
+///   by the kernel's virtual memory system
+///
+/// The trade-off is disk space: a 1GB compressed archive decompresses to
+/// ~3-5GB on disk. For machines with enough disk space, this is the
+/// fastest approach.
+///
+/// Expected ~3-6x speedup over baseline.
+pub fn parse_warc_mmap(path: &Path) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+
+    // Phase 1: Decompress to a temporary file.
+    // We write to download/<name>.decompressed and clean up after parsing.
+    let tmp_path = path.with_extension("warc");
+    eprintln!("  [{}] Decompressing to temp file for mmap...", filename);
+    {
+        let file = fs::File::open(path)?;
+        let mut decoder = MultiGzDecoder::new(file);
+        let mut tmp_file = fs::File::create(&tmp_path)?;
+        io::copy(&mut decoder, &mut tmp_file)?;
+    }
+    let tmp_size = fs::metadata(&tmp_path)?.len();
+    eprintln!(
+        "  [{}] Decompressed: {:.1} MB",
+        filename,
+        tmp_size as f64 / 1_048_576.0
+    );
+
+    // Phase 2: Memory-map the decompressed file.
+    let tmp_file = fs::File::open(&tmp_path)?;
+    // SAFETY: memmap2::Mmap requires that the file is not modified while
+    // mapped. Since we created this temp file and no other process touches
+    // it, this is safe. The `unsafe` block is required by the mmap API
+    // because in general, another process could modify the file.
+    let mmap = unsafe { memmap2::Mmap::map(&tmp_file)? };
+
+    // Phase 3: Parse WARC records from the memory-mapped slice.
+    let iter = warc_parser::WarcSliceIter::new(&mmap);
+    let finder = memmem::Finder::new(b".onion");
+    let mut onions = HashSet::new();
+    let mut records_scanned: u64 = 0;
+
+    for record in iter {
+        records_scanned += 1;
+
+        onion_search::search_memchr(record.body, &finder, &mut onions);
+
+        if records_scanned % 10_000 == 0 {
+            eprint!(
+                "\r  [{}] Scanning (mmap): {} records, {} onion(s)",
+                filename, records_scanned, onions.len()
+            );
+        }
+    }
+
+    if records_scanned >= 10_000 {
+        eprintln!();
+    }
+
+    // Phase 4: Clean up the temporary decompressed file.
+    drop(mmap);
+    drop(tmp_file);
+    if let Err(e) = fs::remove_file(&tmp_path) {
+        eprintln!("  [{}] Warning: could not remove temp file: {}", filename, e);
     }
 
     Ok(onions)

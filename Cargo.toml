@@ -12,6 +12,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 warc = "0.4"
+memchr = "2"       # SIMD-accelerated byte/substring search (ripgrep's core technique)
+memmap2 = "0.9"    # memory-mapped file I/O for zero-copy parsing
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }  # SIMD-optimized gzip via zlib-ng
 
 # Optimize all dependencies even in debug builds.
 # Our code (gzip decompression, regex) spends 99% of CPU time inside
