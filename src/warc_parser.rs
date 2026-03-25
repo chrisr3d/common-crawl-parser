@@ -22,12 +22,21 @@ use memchr::memmem;
 // Streaming Parser — works with BufRead (e.g., gzip decoder + BufReader)
 // ---------------------------------------------------------------------------
 
-/// A parsed WARC response record — only the fields we need.
+/// A parsed WARC response record — the fields we need for .onion extraction.
 ///
 /// Non-response records are skipped entirely (their bodies are never read).
 /// This struct only exists for records where `WARC-Type: response`.
+///
+/// In addition to the body, we extract metadata from WARC headers:
+/// - `target_uri`: the original URL that was crawled (WARC-Target-URI header)
+/// - `date`: the timestamp of the crawl (WARC-Date header)
+///
+/// These let us track *where* and *when* each .onion address was found,
+/// not just *which archive* it appeared in.
 pub struct WarcRecord {
     pub body: Vec<u8>,
+    pub target_uri: String,
+    pub date: String,
 }
 
 /// Iterates WARC response records from a `BufRead` source.
@@ -99,6 +108,8 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
         // else is ignored — no allocation, no parsing.
         let mut is_response = false;
         let mut content_length: usize = 0;
+        let mut target_uri = String::new();
+        let mut date = String::new();
 
         loop {
             self.line_buf.clear();
@@ -110,7 +121,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
                         break; // End of headers (blank line)
                     }
 
-                    // Case-insensitive prefix check for WARC-Type.
+                    // Case-insensitive prefix check for headers we care about.
                     // We compare against lowercase — WARC spec allows mixed case
                     // but Common Crawl consistently uses this capitalization.
                     if let Some(value) = trim_header(&self.line_buf, "WARC-Type:") {
@@ -120,6 +131,10 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
                         // because we skip UTF-8 validation and error handling overhead.
                         // Content-Length is always a non-negative integer in ASCII digits.
                         content_length = parse_ascii_usize(value);
+                    } else if let Some(value) = trim_header(&self.line_buf, "WARC-Target-URI:") {
+                        target_uri = value.to_string();
+                    } else if let Some(value) = trim_header(&self.line_buf, "WARC-Date:") {
+                        date = value.to_string();
                     }
                 }
                 Err(e) => return Some(Err(e)),
@@ -155,7 +170,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
             return Some(Err(e));
         }
 
-        Some(Ok(WarcRecord { body }))
+        Some(Ok(WarcRecord { body, target_uri, date }))
     }
 }
 
@@ -216,13 +231,15 @@ fn skip_bytes<R: Read>(reader: &mut R, mut n: usize) -> io::Result<()> {
 // Slice Parser — works on contiguous &[u8] (e.g., memory-mapped file)
 // ---------------------------------------------------------------------------
 
-/// A reference to a WARC response body within a memory-mapped slice.
+/// A reference to a WARC response record within a memory-mapped slice.
 ///
-/// Unlike `WarcRecord` which owns its body `Vec<u8>`, this borrows directly
-/// from the mmap. Zero allocation, zero copying — the body bytes stay in
+/// Unlike `WarcRecord` which owns its data, this borrows directly
+/// from the mmap. Zero allocation, zero copying — the bytes stay in
 /// the OS page cache and are accessed through virtual memory.
 pub struct WarcSlice<'a> {
     pub body: &'a [u8],
+    pub target_uri: &'a [u8],
+    pub date: &'a [u8],
 }
 
 /// Iterates WARC response records from a contiguous byte slice.
@@ -270,6 +287,8 @@ impl<'a> Iterator for WarcSliceIter<'a> {
             let header_bytes = &self.data[record_start..record_start + header_end_offset];
             let mut is_response = false;
             let mut content_length: usize = 0;
+            let mut target_uri: &[u8] = b"";
+            let mut date: &[u8] = b"";
 
             // Split headers by \r\n and check each line.
             // We work on bytes to avoid UTF-8 conversion.
@@ -281,10 +300,13 @@ impl<'a> Iterator for WarcSliceIter<'a> {
                 if starts_with_ignore_case(line, b"warc-type:") {
                     let value = trim_bytes(&line[b"warc-type:".len()..]);
                     is_response = value.eq_ignore_ascii_case(b"response");
-                }
-                if starts_with_ignore_case(line, b"content-length:") {
+                } else if starts_with_ignore_case(line, b"content-length:") {
                     let value = trim_bytes(&line[b"content-length:".len()..]);
                     content_length = parse_ascii_usize_bytes(value);
+                } else if starts_with_ignore_case(line, b"warc-target-uri:") {
+                    target_uri = trim_bytes(&line[b"warc-target-uri:".len()..]);
+                } else if starts_with_ignore_case(line, b"warc-date:") {
+                    date = trim_bytes(&line[b"warc-date:".len()..]);
                 }
             }
 
@@ -302,9 +324,11 @@ impl<'a> Iterator for WarcSliceIter<'a> {
                 return None; // Truncated record at end of file
             }
 
-            // Zero-copy: the body is a slice into the original mmap.
+            // Zero-copy: the body and metadata are slices into the original mmap.
             return Some(WarcSlice {
                 body: &self.data[body_start..body_end],
+                target_uri,
+                date,
             });
         }
     }
@@ -356,16 +380,32 @@ mod tests {
     use super::*;
     use std::io::BufReader;
 
-    /// Build a minimal WARC record as raw bytes.
-    fn make_warc_record(warc_type: &str, body: &[u8]) -> Vec<u8> {
+    /// Build a minimal WARC record as raw bytes with optional metadata.
+    fn make_warc_record_with_meta(
+        warc_type: &str,
+        body: &[u8],
+        target_uri: Option<&str>,
+        date: Option<&str>,
+    ) -> Vec<u8> {
         let mut record = Vec::new();
         record.extend_from_slice(b"WARC/1.0\r\n");
         record.extend_from_slice(format!("WARC-Type: {}\r\n", warc_type).as_bytes());
         record.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        if let Some(uri) = target_uri {
+            record.extend_from_slice(format!("WARC-Target-URI: {}\r\n", uri).as_bytes());
+        }
+        if let Some(d) = date {
+            record.extend_from_slice(format!("WARC-Date: {}\r\n", d).as_bytes());
+        }
         record.extend_from_slice(b"\r\n");
         record.extend_from_slice(body);
         record.extend_from_slice(b"\r\n\r\n");
         record
+    }
+
+    /// Convenience wrapper for records without metadata.
+    fn make_warc_record(warc_type: &str, body: &[u8]) -> Vec<u8> {
+        make_warc_record_with_meta(warc_type, body, None, None)
     }
 
     /// Create a multi-record WARC byte stream with mixed record types.
@@ -375,12 +415,22 @@ mod tests {
         stream.extend_from_slice(&make_warc_record("warcinfo", b"software: test"));
         // A request record (should be skipped)
         stream.extend_from_slice(&make_warc_record("request", b"GET / HTTP/1.1\r\nHost: example.com"));
-        // A response record (should be returned)
-        stream.extend_from_slice(&make_warc_record("response", b"HTTP/1.1 200 OK\r\n\r\nHello world with abc2defghijklmnop.onion inside"));
+        // A response record (should be returned) — with metadata
+        stream.extend_from_slice(&make_warc_record_with_meta(
+            "response",
+            b"HTTP/1.1 200 OK\r\n\r\nHello world with abc2defghijklmnop.onion inside",
+            Some("https://example.com/page1"),
+            Some("2025-10-01T12:00:00Z"),
+        ));
         // Another request (skipped)
         stream.extend_from_slice(&make_warc_record("request", b"GET /page HTTP/1.1"));
-        // Another response (returned)
-        stream.extend_from_slice(&make_warc_record("response", b"HTTP/1.1 200 OK\r\n\r\nAnother page"));
+        // Another response (returned) — with metadata
+        stream.extend_from_slice(&make_warc_record_with_meta(
+            "response",
+            b"HTTP/1.1 200 OK\r\n\r\nAnother page",
+            Some("https://example.com/page2"),
+            Some("2025-10-01T12:01:00Z"),
+        ));
         stream
     }
 
@@ -400,6 +450,20 @@ mod tests {
     }
 
     #[test]
+    fn streaming_parser_extracts_metadata() {
+        let data = make_warc_stream();
+        let reader = BufReader::new(data.as_slice());
+        let records: Vec<_> = WarcRecordIter::new(reader)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(records[0].target_uri, "https://example.com/page1");
+        assert_eq!(records[0].date, "2025-10-01T12:00:00Z");
+        assert_eq!(records[1].target_uri, "https://example.com/page2");
+        assert_eq!(records[1].date, "2025-10-01T12:01:00Z");
+    }
+
+    #[test]
     fn slice_parser_only_returns_response_records() {
         let data = make_warc_stream();
         let records: Vec<_> = WarcSliceIter::new(&data).collect();
@@ -407,6 +471,17 @@ mod tests {
         assert_eq!(records.len(), 2, "Should return only the 2 response records");
         assert!(records[0].body.windows(6).any(|w| w == b".onion"),
             "First response should contain .onion");
+    }
+
+    #[test]
+    fn slice_parser_extracts_metadata() {
+        let data = make_warc_stream();
+        let records: Vec<_> = WarcSliceIter::new(&data).collect();
+
+        assert_eq!(records[0].target_uri, b"https://example.com/page1");
+        assert_eq!(records[0].date, b"2025-10-01T12:00:00Z");
+        assert_eq!(records[1].target_uri, b"https://example.com/page2");
+        assert_eq!(records[1].date, b"2025-10-01T12:01:00Z");
     }
 
     #[test]

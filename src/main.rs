@@ -12,7 +12,7 @@
 // New concepts: async/await, Tokio runtime, reqwest streaming, spawn_blocking,
 // bounded concurrency with buffer_unordered, Arc for shared ownership.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use regex::Regex;
 use onion_crawler::{
     download_warc_async, filename_from_uri, load_processed, load_results,
     mark_processed, parse_warc, parse_warc_bytes, parse_warc_memchr, parse_warc_mmap,
-    save_results, RESULTS_FILE,
+    save_results, OnionSource, RESULTS_FILE,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ struct Config {
 /// mutate shared state. Instead, each task returns its results and the
 /// main task merges them sequentially — no locks needed.
 struct ArchiveResult {
-    onions: HashSet<String>,
+    onions: HashMap<String, Vec<OnionSource>>,
     download_time: Duration,
     parse_time: Duration
 }
@@ -433,10 +433,12 @@ async fn main() {
                 total_download += archive.download_time;
                 total_parse += archive.parse_time;
                 let count_before = results.len();
-                for onion in archive.onions {
-                    let archives = results.entry(onion).or_default();
-                    if !archives.contains(&filename) {
-                        archives.push(filename.clone());
+                for (onion, sources) in archive.onions {
+                    let existing = results.entry(onion).or_default();
+                    for source in sources {
+                        if !existing.iter().any(|s| s.url == source.url && s.archive == source.archive) {
+                            existing.push(source);
+                        }
                     }
                 }
                 let added = results.len() - count_before;

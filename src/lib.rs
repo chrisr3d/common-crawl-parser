@@ -25,7 +25,28 @@ use std::path::{Path, PathBuf};
 use flate2::read::MultiGzDecoder;
 use memchr::memmem;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use warc::{RecordType, WarcReader};
+
+// ---------------------------------------------------------------------------
+// Data Types
+// ---------------------------------------------------------------------------
+
+/// Metadata about where an .onion address was found.
+///
+/// Each .onion address maps to a list of `OnionSource` entries, one for each
+/// distinct (URL, archive) pair where it appeared. This gives us rich context:
+/// not just "which archive" but "which specific clearnet page, when".
+///
+/// `Serialize` and `Deserialize` are derived for JSON persistence via `serde`.
+/// `Clone` is needed because the same source may be referenced across multiple
+/// search calls within a single record (rare, but possible with duplicates).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OnionSource {
+    pub url: String,
+    pub date: String,
+    pub archive: String,
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -172,11 +193,12 @@ pub async fn download_warc_async(
 /// Instead, we call this from `spawn_blocking` (see the pipeline in `main`),
 /// which runs it on Tokio's dedicated blocking thread pool. This is the
 /// idiomatic way to mix sync CPU work with async I/O in Tokio.
-pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashMap<String, Vec<OnionSource>>, Box<dyn Error + Send + Sync>> {
     let reader = WarcReader::from_path_gzip(path)?;
-    let mut onions = HashSet::new();
+    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
     let mut records_scanned: u64 = 0;
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let archive = filename.to_string();
 
     for result in reader.iter_records() {
         let record = match result {
@@ -190,9 +212,26 @@ pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<
 
         records_scanned += 1;
 
+        // Extract metadata from the warc crate's parsed headers.
+        let target_uri = record.header(warc::WarcHeader::TargetURI)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let date = record.header(warc::WarcHeader::Date)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let source = OnionSource {
+            url: target_uri,
+            date,
+            archive: archive.clone(),
+        };
+
         let body = String::from_utf8_lossy(record.body());
         for m in onion_re.find_iter(&body) {
-            onions.insert(m.as_str().to_lowercase());
+            let key = m.as_str().to_lowercase();
+            let sources = onions.entry(key).or_default();
+            if !sources.iter().any(|s| s.url == source.url && s.archive == source.archive) {
+                sources.push(source.clone());
+            }
         }
 
         if records_scanned % 10_000 == 0 {
@@ -221,22 +260,28 @@ pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<
 /// 3. **`flate2` decompression** — wraps zlib for faster gzip decoding
 ///
 /// Expected ~1.5-2x speedup over baseline.
-pub fn parse_warc_bytes(path: &Path) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+pub fn parse_warc_bytes(path: &Path) -> Result<HashMap<String, Vec<OnionSource>>, Box<dyn Error + Send + Sync>> {
     let file = fs::File::open(path)?;
     let decoder = MultiGzDecoder::new(file);
     let buf_reader = BufReader::new(decoder);
     let iter = warc_parser::WarcRecordIter::new(buf_reader);
 
     let onion_re = regex::bytes::Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")?;
-    let mut onions = HashSet::new();
+    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
     let mut records_scanned: u64 = 0;
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let archive = filename.to_string();
 
     for result in iter {
         let record = result?;
         records_scanned += 1;
 
-        onion_search::search_regex_bytes(&record.body, &onion_re, &mut onions);
+        let source = OnionSource {
+            url: record.target_uri,
+            date: record.date,
+            archive: archive.clone(),
+        };
+        onion_search::search_regex_bytes(&record.body, &onion_re, &source, &mut onions);
 
         if records_scanned % 10_000 == 0 {
             eprint!(
@@ -266,22 +311,28 @@ pub fn parse_warc_bytes(path: &Path) -> Result<HashSet<String>, Box<dyn Error + 
 /// dramatically faster than the regex NFA which must track state for every byte.
 ///
 /// Expected ~3-5x speedup over baseline.
-pub fn parse_warc_memchr(path: &Path) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+pub fn parse_warc_memchr(path: &Path) -> Result<HashMap<String, Vec<OnionSource>>, Box<dyn Error + Send + Sync>> {
     let file = fs::File::open(path)?;
     let decoder = MultiGzDecoder::new(file);
     let buf_reader = BufReader::new(decoder);
     let iter = warc_parser::WarcRecordIter::new(buf_reader);
 
     let finder = memmem::Finder::new(b".onion");
-    let mut onions = HashSet::new();
+    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
     let mut records_scanned: u64 = 0;
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let archive = filename.to_string();
 
     for result in iter {
         let record = result?;
         records_scanned += 1;
 
-        onion_search::search_memchr(&record.body, &finder, &mut onions);
+        let source = OnionSource {
+            url: record.target_uri,
+            date: record.date,
+            archive: archive.clone(),
+        };
+        onion_search::search_memchr(&record.body, &finder, &source, &mut onions);
 
         if records_scanned % 10_000 == 0 {
             eprint!(
@@ -320,8 +371,9 @@ pub fn parse_warc_memchr(path: &Path) -> Result<HashSet<String>, Box<dyn Error +
 /// fastest approach.
 ///
 /// Expected ~3-6x speedup over baseline.
-pub fn parse_warc_mmap(path: &Path) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+pub fn parse_warc_mmap(path: &Path) -> Result<HashMap<String, Vec<OnionSource>>, Box<dyn Error + Send + Sync>> {
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let archive = filename.to_string();
 
     // Phase 1: Decompress to a temporary file.
     // We write to download/<name>.decompressed and clean up after parsing.
@@ -351,13 +403,19 @@ pub fn parse_warc_mmap(path: &Path) -> Result<HashSet<String>, Box<dyn Error + S
     // Phase 3: Parse WARC records from the memory-mapped slice.
     let iter = warc_parser::WarcSliceIter::new(&mmap);
     let finder = memmem::Finder::new(b".onion");
-    let mut onions = HashSet::new();
+    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
     let mut records_scanned: u64 = 0;
 
     for record in iter {
         records_scanned += 1;
 
-        onion_search::search_memchr(record.body, &finder, &mut onions);
+        // Convert zero-copy byte slices to owned Strings for the source.
+        let source = OnionSource {
+            url: String::from_utf8_lossy(record.target_uri).to_string(),
+            date: String::from_utf8_lossy(record.date).to_string(),
+            archive: archive.clone(),
+        };
+        onion_search::search_memchr(record.body, &finder, &source, &mut onions);
 
         if records_scanned % 10_000 == 0 {
             eprint!(
@@ -414,7 +472,10 @@ pub fn mark_processed(filename: &str) -> io::Result<()> {
 }
 
 /// Load existing results from the JSON file.
-pub fn load_results() -> HashMap<String, Vec<String>> {
+///
+/// Supports both the new format (`HashMap<String, Vec<OnionSource>>`) and
+/// falls back to an empty map if the file contains the old format or is invalid.
+pub fn load_results() -> HashMap<String, Vec<OnionSource>> {
     let path = Path::new(RESULTS_FILE);
     if !path.exists() {
         return HashMap::new();
@@ -425,7 +486,7 @@ pub fn load_results() -> HashMap<String, Vec<String>> {
 }
 
 /// Save the results map to the JSON file.
-pub fn save_results(results: &HashMap<String, Vec<String>>) -> Result<(), Box<dyn Error>> {
+pub fn save_results(results: &HashMap<String, Vec<OnionSource>>) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all("output")?;
     let json = serde_json::to_string_pretty(results)?;
     fs::write(RESULTS_FILE, json)?;
