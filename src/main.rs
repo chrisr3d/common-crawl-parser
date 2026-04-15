@@ -26,10 +26,12 @@ use regex::Regex;
 
 use onion_crawler::{
     download_warc_async, download_warc_to_memory, filename_from_uri,
-    load_processed_from, load_results_from, mark_processed_in, merge_results,
+    load_favicons_from, load_processed_from, load_results_from,
+    mark_processed_in, merge_favicons, merge_results,
     parse_warc, parse_warc_bytes, parse_warc_bytes_from_memory, parse_warc_memchr,
-    parse_warc_memchr_from_memory, parse_warc_mmap, save_results_to, OnionSource,
-    DEFAULT_OUTPUT_DIR, RESULTS_FILENAME,
+    parse_warc_memchr_from_memory, parse_warc_mmap, save_favicons_to, save_results_to,
+    FaviconSource, OnionSource,
+    DEFAULT_OUTPUT_DIR, FAVICONS_FILENAME, RESULTS_FILENAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -271,6 +273,7 @@ enum Command {
 /// main task merges them sequentially — no locks needed.
 struct ArchiveResult {
     onions: HashMap<String, Vec<OnionSource>>,
+    favicon_urls: HashMap<String, Vec<FaviconSource>>,
     download_time: Duration,
     parse_time: Duration
 }
@@ -330,17 +333,33 @@ fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
         output_dir
     );
 
-    let merged = merge_results(input_dirs);
+    let merged_onions = merge_results(input_dirs);
+    let merged_favicons = merge_favicons(input_dirs);
 
-    eprintln!("Merged: {} unique .onion address(es)", merged.len());
+    eprintln!(
+        "Merged: {} unique .onion address(es), {} unique favicon URL(s)",
+        merged_onions.len(),
+        merged_favicons.len()
+    );
 
-    match save_results_to(&merged, output_dir) {
+    match save_results_to(&merged_onions, output_dir) {
         Ok(()) => {
             let path = Path::new(output_dir).join(RESULTS_FILENAME);
-            eprintln!("Results saved to {}", path.display());
+            eprintln!("Onion results saved to {}", path.display());
         }
         Err(err) => {
-            eprintln!("Error saving merged results: {}", err);
+            eprintln!("Error saving merged onion results: {}", err);
+            process::exit(1);
+        }
+    }
+
+    match save_favicons_to(&merged_favicons, output_dir) {
+        Ok(()) => {
+            let path = Path::new(output_dir).join(FAVICONS_FILENAME);
+            eprintln!("Favicon results saved to {}", path.display());
+        }
+        Err(err) => {
+            eprintln!("Error saving merged favicon results: {}", err);
             process::exit(1);
         }
     }
@@ -504,11 +523,13 @@ async fn run_crawl(input: String, config: Config) {
     // --- Load persistent state ---
     let processed = load_processed_from(&config.output_dir);
     let mut results = load_results_from(&config.output_dir);
+    let mut favicon_results = load_favicons_from(&config.output_dir);
 
     eprintln!(
-        "State: {} already processed, {} onion(s) in results\n",
+        "State: {} already processed, {} onion(s), {} favicon URL(s) in results\n",
         processed.len(),
-        results.len()
+        results.len(),
+        favicon_results.len()
     );
 
     // --- Filter URIs: skip already-processed, apply limit ---
@@ -547,7 +568,6 @@ async fn run_crawl(input: String, config: Config) {
 
     if work_items.is_empty() {
         eprintln!("No archives to process.");
-        // Still save results (safety net) and print summary.
         match save_results_to(&results, &output_dir) {
             Ok(()) => {
                 let path = Path::new(&output_dir).join(RESULTS_FILENAME);
@@ -555,13 +575,21 @@ async fn run_crawl(input: String, config: Config) {
             }
             Err(err) => eprintln!("Error saving results: {}", err)
         }
+        match save_favicons_to(&favicon_results, &output_dir) {
+            Ok(()) => {
+                let path = Path::new(&output_dir).join(FAVICONS_FILENAME);
+                eprintln!("Favicons saved to {}", path.display());
+            }
+            Err(err) => eprintln!("Error saving favicons: {}", err)
+        }
         eprintln!(
-            "\nSummary: 0 processed, {} skipped, 0 failed, 0 new onion(s)",
+            "\nSummary: 0 processed, {} skipped, 0 failed, 0 new onion(s), 0 new favicon URL(s)",
             skip_count
         );
         eprintln!(
-            "Total: {} unique .onion address(es) in results",
-            results.len()
+            "Total: {} unique .onion address(es), {} unique favicon URL(s) in results",
+            results.len(),
+            favicon_results.len()
         );
         return;
     }
@@ -727,8 +755,8 @@ async fn run_crawl(input: String, config: Config) {
 
                 // `spawn_blocking` returns a `JoinHandle` — unwrap the
                 // outer Result (task panic) then the inner Result (parse error).
-                let onions = match parse_result {
-                    Ok(Ok(onions)) => onions,
+                let parsed = match parse_result {
+                    Ok(Ok(result)) => result,
                     Ok(Err(err)) => {
                         eprintln!("  [{}] Parse error: {}", filename, err);
                         return Err(format!("{}: parse error: {}", filename, err));
@@ -740,9 +768,17 @@ async fn run_crawl(input: String, config: Config) {
                 };
 
                 eprintln!("  [{}] Parsing time: {:.1}s", filename, parse_time.as_secs_f64());
-                eprintln!("  [{}] Found {} unique .onion address(es)", filename, onions.len());
+                eprintln!(
+                    "  [{}] Found {} unique .onion address(es), {} favicon URL(s)",
+                    filename, parsed.onions.len(), parsed.favicon_urls.len()
+                );
 
-                Ok((idx, filename, local_path, ArchiveResult { onions, download_time, parse_time }))
+                Ok((idx, filename, local_path, ArchiveResult {
+                    onions: parsed.onions,
+                    favicon_urls: parsed.favicon_urls,
+                    download_time,
+                    parse_time
+                }))
             }
         })
         .buffer_unordered(effective_jobs);
@@ -758,6 +794,7 @@ async fn run_crawl(input: String, config: Config) {
     let mut process_count: usize = 0;
     let mut fail_count: usize = 0;
     let mut new_onions: usize = 0;
+    let mut new_favicons: usize = 0;
     let mut total_download = Duration::ZERO;
     let mut total_parse = Duration::ZERO;
 
@@ -771,6 +808,8 @@ async fn run_crawl(input: String, config: Config) {
             Ok((_idx, filename, local_path, archive)) => {
                 total_download += archive.download_time;
                 total_parse += archive.parse_time;
+
+                // Merge onion results
                 let count_before = results.len();
                 for (onion, sources) in archive.onions {
                     let existing = results.entry(onion).or_default();
@@ -780,14 +819,28 @@ async fn run_crawl(input: String, config: Config) {
                         }
                     }
                 }
-                let added = results.len() - count_before;
-                new_onions += added;
+                new_onions += results.len() - count_before;
+
+                // Merge favicon results
+                let fav_count_before = favicon_results.len();
+                for (url, sources) in archive.favicon_urls {
+                    let existing = favicon_results.entry(url).or_default();
+                    for source in sources {
+                        if !existing.iter().any(|s| s.page_url == source.page_url && s.archive == source.archive) {
+                            existing.push(source);
+                        }
+                    }
+                }
+                new_favicons += favicon_results.len() - fav_count_before;
 
                 if let Err(err) = mark_processed_in(&filename, &output_dir) {
                     eprintln!("  Warning: couldn't mark as processed: {}", err);
                 }
                 if let Err(err) = save_results_to(&results, &output_dir) {
                     eprintln!("  Warning: couldn't save results: {}", err);
+                }
+                if let Err(err) = save_favicons_to(&favicon_results, &output_dir) {
+                    eprintln!("  Warning: couldn't save favicons: {}", err);
                 }
 
                 process_count += 1;
@@ -819,15 +872,23 @@ async fn run_crawl(input: String, config: Config) {
         }
         Err(err) => eprintln!("Error saving results: {}", err)
     }
+    match save_favicons_to(&favicon_results, &output_dir) {
+        Ok(()) => {
+            let path = Path::new(&output_dir).join(FAVICONS_FILENAME);
+            eprintln!("Favicons saved to {}", path.display());
+        }
+        Err(err) => eprintln!("Error saving favicons: {}", err)
+    }
 
     // --- Summary ---
     eprintln!(
-        "\nSummary: {} processed, {} skipped, {} failed, {} new onion(s)",
-        process_count, skip_count, fail_count, new_onions
+        "\nSummary: {} processed, {} skipped, {} failed, {} new onion(s), {} new favicon URL(s)",
+        process_count, skip_count, fail_count, new_onions, new_favicons
     );
     eprintln!(
-        "Total: {} unique .onion address(es) in results",
-        results.len()
+        "Total: {} unique .onion address(es), {} unique favicon URL(s) in results",
+        results.len(),
+        favicon_results.len()
     );
     if process_count > 0 {
         let avg_dl = total_download.as_secs_f64() / process_count as f64;
