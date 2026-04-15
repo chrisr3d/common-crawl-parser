@@ -55,6 +55,15 @@ pub struct OnionSource {
 /// Base URL for Common Crawl data archives.
 const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 
+/// Default directory for output files.
+pub const DEFAULT_OUTPUT_DIR: &str = "output";
+
+/// Filename for the processed-archives log.
+pub const PROCESSED_FILENAME: &str = "processed.log";
+
+/// Filename for the extracted .onion results.
+pub const RESULTS_FILENAME: &str = "onions.json";
+
 /// File tracking which archives have been fully processed.
 pub const PROCESSED_FILE: &str = "output/processed.log";
 
@@ -633,7 +642,18 @@ pub fn parse_warc_mmap(path: &Path) -> Result<HashMap<String, Vec<OnionSource>>,
 /// `HashSet` stores unique values with O(1) average-case lookup via hashing.
 /// It's the right tool when the core question is "have we seen this before?"
 pub fn load_processed() -> HashSet<String> {
-    let path = Path::new(PROCESSED_FILE);
+    load_processed_from(DEFAULT_OUTPUT_DIR)
+}
+
+/// Load processed archives from a custom output directory.
+///
+/// ## HPC / batch mode
+///
+/// When running as a SLURM array job, each task uses its own output directory
+/// (`--output-dir output/42/`) so concurrent jobs never contend on the same
+/// files. This variant accepts the directory path instead of using the default.
+pub fn load_processed_from(output_dir: &str) -> HashSet<String> {
+    let path = Path::new(output_dir).join(PROCESSED_FILENAME);
     if !path.exists() {
         return HashSet::new();
     }
@@ -648,11 +668,17 @@ pub fn load_processed() -> HashSet<String> {
 
 /// Append a filename to the processed log.
 pub fn mark_processed(filename: &str) -> io::Result<()> {
-    fs::create_dir_all("output")?;
+    mark_processed_in(filename, DEFAULT_OUTPUT_DIR)
+}
+
+/// Append a filename to the processed log in a custom output directory.
+pub fn mark_processed_in(filename: &str, output_dir: &str) -> io::Result<()> {
+    fs::create_dir_all(output_dir)?;
+    let path = Path::new(output_dir).join(PROCESSED_FILENAME);
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
-        .open(PROCESSED_FILE)?;
+        .open(path)?;
     writeln!(file, "{}", filename)
 }
 
@@ -661,7 +687,12 @@ pub fn mark_processed(filename: &str) -> io::Result<()> {
 /// Supports both the new format (`HashMap<String, Vec<OnionSource>>`) and
 /// falls back to an empty map if the file contains the old format or is invalid.
 pub fn load_results() -> HashMap<String, Vec<OnionSource>> {
-    let path = Path::new(RESULTS_FILE);
+    load_results_from(DEFAULT_OUTPUT_DIR)
+}
+
+/// Load results from a custom output directory.
+pub fn load_results_from(output_dir: &str) -> HashMap<String, Vec<OnionSource>> {
+    let path = Path::new(output_dir).join(RESULTS_FILENAME);
     if !path.exists() {
         return HashMap::new();
     }
@@ -672,8 +703,65 @@ pub fn load_results() -> HashMap<String, Vec<OnionSource>> {
 
 /// Save the results map to the JSON file.
 pub fn save_results(results: &HashMap<String, Vec<OnionSource>>) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all("output")?;
+    save_results_to(results, DEFAULT_OUTPUT_DIR)
+}
+
+/// Save results to a custom output directory.
+pub fn save_results_to(
+    results: &HashMap<String, Vec<OnionSource>>,
+    output_dir: &str,
+) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(output_dir)?;
+    let path = Path::new(output_dir).join(RESULTS_FILENAME);
     let json = serde_json::to_string_pretty(results)?;
-    fs::write(RESULTS_FILE, json)?;
+    fs::write(path, json)?;
     Ok(())
+}
+
+/// Merge multiple result files into a single deduplicated result map.
+///
+/// ## HPC merge step
+///
+/// After a SLURM array job completes, each task has produced its own
+/// `onions.json` in a separate output directory. This function reads all
+/// of them and merges into a single map, deduplicating on `(url, archive)`
+/// pairs — the same logic used during per-archive merging in `main`.
+pub fn merge_results(
+    input_dirs: &[PathBuf],
+) -> HashMap<String, Vec<OnionSource>> {
+    let mut merged: HashMap<String, Vec<OnionSource>> = HashMap::new();
+
+    for dir in input_dirs {
+        let path = dir.join(RESULTS_FILENAME);
+        if !path.exists() {
+            eprintln!("Warning: no results file in {}", dir.display());
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("Warning: cannot read {}: {}", path.display(), err);
+                continue;
+            }
+        };
+        let partial: HashMap<String, Vec<OnionSource>> =
+            match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(err) => {
+                    eprintln!("Warning: invalid JSON in {}: {}", path.display(), err);
+                    continue;
+                }
+            };
+
+        for (onion, sources) in partial {
+            let existing = merged.entry(onion).or_default();
+            for source in sources {
+                if !existing.iter().any(|s| s.url == source.url && s.archive == source.archive) {
+                    existing.push(source);
+                }
+            }
+        }
+    }
+
+    merged
 }

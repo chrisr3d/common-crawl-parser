@@ -26,9 +26,10 @@ use regex::Regex;
 
 use onion_crawler::{
     download_warc_async, download_warc_to_memory, filename_from_uri,
-    load_processed, load_results, mark_processed, parse_warc, parse_warc_bytes,
-    parse_warc_bytes_from_memory, parse_warc_memchr, parse_warc_memchr_from_memory,
-    parse_warc_mmap, save_results, OnionSource, RESULTS_FILE
+    load_processed_from, load_results_from, mark_processed_in, merge_results,
+    parse_warc, parse_warc_bytes, parse_warc_bytes_from_memory, parse_warc_memchr,
+    parse_warc_memchr_from_memory, parse_warc_mmap, save_results_to, OnionSource,
+    DEFAULT_OUTPUT_DIR, RESULTS_FILENAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -174,16 +175,44 @@ fn get_available_memory() -> Option<u64> {
 // Field doc comments (`///`) become the help descriptions automatically.
 // We use `//` (not `///`) for these explanatory comments so clap doesn't
 // include them in the `--help` output — only `///` on fields becomes help text.
+//
+// ## Subcommands for HPC / batch mode
+//
+// The CLI uses subcommands to support two modes:
+//   - `run` (default): download + parse archives (the original behavior)
+//   - `merge`: combine partial results from parallel SLURM array tasks
+//
+// `SubcommandRequiredElseHelp` is not used — when no subcommand is given,
+// we default to `run` for backwards compatibility. The `input` positional
+// argument on the top-level struct is what makes this work: clap sees it
+// and treats the invocation as an implicit `run`.
+// ## Subcommands for HPC / batch mode
+//
+// The CLI uses subcommands to support two modes:
+//   - default (no subcommand): download + parse archives (the original behavior)
+//   - `merge`: combine partial results from parallel SLURM array tasks
+//
+// The top-level struct keeps all the `run` flags directly so existing
+// invocations (`onion-crawler warc.paths -l 3`) continue to work unchanged.
+// Only the `merge` subcommand requires an explicit keyword.
 #[derive(Parser)]
 #[command(name = "onion-crawler")]
 #[command(about = "Extract .onion addresses from Common Crawl WARC archives")]
 struct Config {
-    /// Path to the WARC-paths file (supports .gz)
-    input: String,
+    /// Path to the WARC-paths file (supports .gz) — omit when using `merge`
+    input: Option<String>,
 
     /// Maximum number of archives to process (default: all)
     #[arg(short, long)]
     limit: Option<usize>,
+
+    /// Skip the first N paths in the file (for SLURM array partitioning)
+    ///
+    /// Combined with --limit, this lets each SLURM array task process a
+    /// non-overlapping slice: task 0 gets --offset 0 --limit 1000,
+    /// task 1 gets --offset 1000 --limit 1000, etc.
+    #[arg(short, long, default_value_t = 0)]
+    offset: usize,
 
     /// Number of concurrent download+parse tasks
     #[arg(short, long, default_value_t = default_jobs())]
@@ -199,7 +228,35 @@ struct Config {
 
     /// Parse from memory instead of disk (skips file I/O, uses more RAM)
     #[arg(short = 'm', long)]
-    stream: bool
+    stream: bool,
+
+    /// Output directory for results and processed log (default: output/)
+    ///
+    /// In HPC batch mode, each SLURM task should use a unique directory
+    /// (e.g., `--output-dir output/42/`) to avoid file contention.
+    #[arg(long, default_value = DEFAULT_OUTPUT_DIR)]
+    output_dir: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Merge partial results from multiple output directories (HPC post-processing)
+    ///
+    /// After a SLURM array job completes, each task has written its own
+    /// `onions.json` in a separate directory. This subcommand reads them all,
+    /// deduplicates, and writes a combined result.
+    Merge {
+        /// Directories containing partial onions.json files to merge
+        #[arg(required = true)]
+        input_dirs: Vec<PathBuf>,
+
+        /// Output directory for the merged result (default: output/)
+        #[arg(short, long, default_value = DEFAULT_OUTPUT_DIR)]
+        output_dir: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +302,52 @@ async fn main() {
     // if required arguments are missing or `--help` is passed.
     let config = Config::parse();
 
+    // --- Dispatch: merge subcommand or default crawl pipeline ---
+    if let Some(Command::Merge { input_dirs, output_dir }) = config.command {
+        run_merge(&input_dirs, &output_dir);
+        return;
+    }
+
+    // Default mode: require the input paths file
+    let input = match config.input {
+        Some(ref path) => path.clone(),
+        None => {
+            eprintln!("Error: missing required argument <INPUT> (path to WARC-paths file)");
+            eprintln!("Usage: onion-crawler <INPUT> [OPTIONS]");
+            eprintln!("       onion-crawler merge <INPUT_DIRS>...");
+            process::exit(1);
+        }
+    };
+
+    run_crawl(input, config).await;
+}
+
+/// Merge partial results from multiple SLURM task output directories.
+fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
+    eprintln!(
+        "Merging results from {} directories into '{}'",
+        input_dirs.len(),
+        output_dir
+    );
+
+    let merged = merge_results(input_dirs);
+
+    eprintln!("Merged: {} unique .onion address(es)", merged.len());
+
+    match save_results_to(&merged, output_dir) {
+        Ok(()) => {
+            let path = Path::new(output_dir).join(RESULTS_FILENAME);
+            eprintln!("Results saved to {}", path.display());
+        }
+        Err(err) => {
+            eprintln!("Error saving merged results: {}", err);
+            process::exit(1);
+        }
+    }
+}
+
+/// Main crawl pipeline — download and parse WARC archives.
+async fn run_crawl(input: String, config: Config) {
     let limit_display = match config.limit {
         Some(n) => format!("{}", n),
         None => "all".to_string()
@@ -341,25 +444,36 @@ async fn main() {
         capped_jobs // Disk mode — no memory concern
     };
 
+    let offset_display = if config.offset > 0 {
+        format!(", offset: {}", config.offset)
+    } else {
+        String::new()
+    };
+    let output_dir_display = if config.output_dir != DEFAULT_OUTPUT_DIR {
+        format!(", output: {}", config.output_dir)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {}, strategy: {}, stream: {})",
-        config.input, limit_display, effective_jobs, config.delete, strategy_name, stream_enabled
+        "Reading WARC paths from '{}' (limit: {}{}, jobs: {}, delete after: {}, strategy: {}, stream: {}{})",
+        input, limit_display, offset_display, effective_jobs,
+        config.delete, strategy_name, stream_enabled, output_dir_display
     );
 
     // --- Open and read the paths file ---
     // Supports both plain text and gzip-compressed (.gz) paths files.
     // Common Crawl distributes warc.paths.gz — we decompress transparently
     // using `libflate`, which is already in the dependency tree via the `warc` crate.
-    let file = File::open(&config.input).unwrap_or_else(|err| {
-        eprintln!("Error: cannot open '{}': {}", config.input, err);
+    let file = File::open(&input).unwrap_or_else(|err| {
+        eprintln!("Error: cannot open '{}': {}", input, err);
         process::exit(1);
     });
 
-    let reader: Box<dyn BufRead> = if config.input.ends_with(".gz") {
+    let reader: Box<dyn BufRead> = if input.ends_with(".gz") {
         let decoder = libflate::gzip::Decoder::new(file).unwrap_or_else(|err| {
             eprintln!(
                 "Error: failed to decompress '{}': {}",
-                config.input, err
+                input, err
             );
             process::exit(1);
         });
@@ -373,18 +487,23 @@ async fn main() {
         .filter_map(Result::ok)
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
+        .skip(config.offset)
         .collect();
 
     if uris.is_empty() {
-        eprintln!("No paths found in '{}'", config.input);
+        eprintln!("No paths found in '{}' (after offset {})", input, config.offset);
         process::exit(1);
     }
 
-    eprintln!("Found {} path(s) in file", uris.len());
+    eprintln!(
+        "Found {} path(s) in file{}",
+        uris.len(),
+        if config.offset > 0 { format!(" (after skipping {})", config.offset) } else { String::new() }
+    );
 
     // --- Load persistent state ---
-    let processed = load_processed();
-    let mut results = load_results();
+    let processed = load_processed_from(&config.output_dir);
+    let mut results = load_results_from(&config.output_dir);
 
     eprintln!(
         "State: {} already processed, {} onion(s) in results\n",
@@ -424,11 +543,16 @@ async fn main() {
         work_items.push((i + 1, uri.clone()));
     }
 
+    let output_dir = config.output_dir;
+
     if work_items.is_empty() {
         eprintln!("No archives to process.");
         // Still save results (safety net) and print summary.
-        match save_results(&results) {
-            Ok(()) => eprintln!("Results saved to {}", RESULTS_FILE),
+        match save_results_to(&results, &output_dir) {
+            Ok(()) => {
+                let path = Path::new(&output_dir).join(RESULTS_FILENAME);
+                eprintln!("Results saved to {}", path.display());
+            }
             Err(err) => eprintln!("Error saving results: {}", err)
         }
         eprintln!(
@@ -659,10 +783,10 @@ async fn main() {
                 let added = results.len() - count_before;
                 new_onions += added;
 
-                if let Err(err) = mark_processed(&filename) {
+                if let Err(err) = mark_processed_in(&filename, &output_dir) {
                     eprintln!("  Warning: couldn't mark as processed: {}", err);
                 }
-                if let Err(err) = save_results(&results) {
+                if let Err(err) = save_results_to(&results, &output_dir) {
                     eprintln!("  Warning: couldn't save results: {}", err);
                 }
 
@@ -688,8 +812,11 @@ async fn main() {
     }
 
     // --- Final save (safety net) ---
-    match save_results(&results) {
-        Ok(()) => eprintln!("Results saved to {}", RESULTS_FILE),
+    match save_results_to(&results, &output_dir) {
+        Ok(()) => {
+            let path = Path::new(&output_dir).join(RESULTS_FILENAME);
+            eprintln!("Results saved to {}", path.display());
+        }
         Err(err) => eprintln!("Error saving results: {}", err)
     }
 
