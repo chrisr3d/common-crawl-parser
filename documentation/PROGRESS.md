@@ -883,3 +883,63 @@ too many in-memory buffers).
 
 Analysis and visualization of the extracted metadata — correlating clearnet URLs
 with onion addresses across crawl dates.
+
+---
+
+## Step 10: Loops Instead of Recursion in `WarcRecordIter`
+
+### What we built
+
+`WarcRecordIter::next` used to skip each non-`response` record by calling
+`return self.next();` — one extra stack frame per skipped record. A comment claimed
+Rust would optimize the tail call away. It doesn't have to, and here it didn't: a
+sampled WAT Archive contains 63,523 consecutive `metadata` records and a sampled WET
+Archive 20,614 consecutive `conversion` records, enough to blow the stack of the
+`bytes` and `memchr` strategies (`documentation/RESEARCH-warc-wat-wet.md` §4.5).
+
+The fix wraps the whole record parse in an outer `loop` and replaces the recursive
+call with `continue`, the same shape `WarcSliceIter` (mmap) already used. A new unit
+test feeds 100,000 `metadata` records followed by one `response` through the
+iterator; the old code aborts with `has overflowed its stack`, the new code yields
+exactly the one record.
+
+Also deleted `src/tmp_main.rs`: an untracked, uncompiled copy of `src/main.rs` from
+commit `683b654`.
+
+### Rust concepts introduced
+
+**No guaranteed tail-call elimination**
+Some languages (Scheme, Erlang) promise that a call in tail position reuses the
+caller's stack frame, so tail recursion runs in constant stack space. Rust makes no
+such promise. LLVM *may* turn a tail call into a jump in optimized builds, but not
+in debug builds, and nothing in the language requires it. Explicit tail calls (the
+reserved `become` keyword, RFC 3407) are not available on stable Rust 1.91.
+
+**Destructors make "tail calls" not tail calls**
+`return self.next();` looks like the last thing the function does, but it isn't:
+the locals `target_uri` and `date` are `String`s, and their destructors run *after*
+`self.next()` returns. The caller's frame must stay alive to run those destructors,
+so the call is not in tail position at all. In Rust, any live value with a
+destructor quietly defeats tail-call optimization.
+
+**Stack overflow is an abort, not a panic**
+Threads spawned by Rust currently get a 2 MiB stack by default — that includes test threads
+and Tokio's `spawn_blocking` pool, where our parsers run. When recursion runs past
+the guard page at the end of the stack, the runtime prints
+`fatal runtime error: stack overflow` and aborts the whole process. Unlike a panic,
+it can't be caught or unwound, so one pathological Archive would kill every
+concurrent job.
+
+**`loop` + `continue` — the iterator skipping idiom**
+An iterator that must skip uninteresting items should loop inside `next()` until it
+finds one to return, rather than recurse. The standard library does the same:
+`Filter::next` calls `find` on the inner iterator, which loops. Stack usage is then
+constant no matter how many items are skipped, and the final value leaves the loop
+with an explicit `return`.
+
+**`break` and `continue` target the innermost loop**
+`next()` now nests the header-reading loops inside the outer record loop. A `break`
+inside an inner loop exits only that loop; the `continue` in the skip branch sits
+directly in the outer loop's body, so it restarts the record parse. When a
+`continue` or `break` needs to reach an outer loop from inside an inner one, Rust
+uses labels: `'record: loop { ... continue 'record; ... }`.
