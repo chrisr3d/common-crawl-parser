@@ -943,3 +943,127 @@ inside an inner loop exits only that loop; the `continue` in the skip branch sit
 directly in the outer loop's body, so it restarts the record parse. When a
 `continue` or `break` needs to reach an outer loop from inside an inner one, Rust
 uses labels: `'record: loop { ... continue 'record; ... }`.
+
+---
+
+## Step 11: Characterization Tests for the Parse Functions
+
+### What we built
+
+Integration tests that pin what the six public parse functions (`parse_warc`,
+`parse_warc_bytes`, `parse_warc_memchr`, `parse_warc_mmap`,
+`parse_warc_bytes_from_memory`, `parse_warc_memchr_from_memory`) extract today. The
+next step replaces all six with one `parse_archive`; these tests show whether that
+changes the output, and where.
+
+- `tests/common/mod.rs` -- shared helpers. `WarcBuilder` writes WARC records
+  programmatically (computed `Content-Length`, unique `WARC-Record-ID`) and gzips
+  each record as its own gzip member, as Common Crawl does. `Snapshot` turns a
+  `ParseResult` into something comparable with `==`. `parse_with_every_function`
+  runs all six functions on one Archive and `assert_all_agree` compares them.
+- `tests/parse_characterization.rs` -- a hand-built fixture Archive of 10 records
+  (`warcinfo`, then `request` / `response` / `metadata` for three pages) and three
+  tests:
+  - `fixture_yields_pinned_artifacts`: the exact onions, favicon URLs and inline
+    favicons expected from the fixture, written out by hand.
+  - `every_parse_function_agrees_on_fixture`: all six functions return the same
+    `Snapshot`.
+  - `every_parse_function_agrees_on_real_archive` (`#[ignore]`): the same check on a
+    real downloaded Archive named by `REAL_WARC_ARCHIVE`.
+
+The fixture covers an onion in an `Onion-Location` HTTP header, v2 and v3 onions in
+the body (one twice on the same page, one in uppercase), `<link rel="icon">` with a
+relative `href`, `<link rel="apple-touch-icon">`, `<meta name="msapplication-TileImage">`,
+an inline `data:image/png;base64,...` favicon, a `text/plain` response containing
+favicon markup, and an onion that only appears in `request` and `metadata` records.
+
+Current behaviour the pinned test records, right or wrong:
+
+- Onion search covers the whole HTTP response, headers included, and ignores
+  `Content-Type`.
+- Uppercase onions are not extracted: both engines match `[a-z2-7]` only.
+- Favicon search only runs on `text/html` / `application/xhtml` responses, and adds
+  a root `/favicon.ico` guess for every HTML page (to be dropped, ADR-0003).
+- Only `response` records are searched.
+
+Known gap, not covered by the fixture: the two onion engines disagree when a
+non-ASCII letter touches the address. In `café3g2upl4pq6kufc4m.onion`, the memchr
+engine sees `é`'s bytes as a word boundary and extracts the onion; `regex`'s Unicode
+`\b` treats `é` as a word character and doesn't. The fixture stays ASCII so the
+agreement test pins what the engines share.
+
+On `CC-NEWS-20251001002341-04358.warc.gz` (1 GB) all six functions agree: 1 onion,
+6,006 favicon URLs, 2 inline favicons; 54 s for all six in a release build.
+
+```sh
+cargo test                                   # fixture tests; real-Archive test ignored
+REAL_WARC_ARCHIVE=download/CC-NEWS-...warc.gz \
+  cargo test --release -- --ignored --nocapture
+```
+
+### Rust concepts introduced
+
+**Integration tests in `tests/`**
+Unit tests live next to the code in `#[cfg(test)] mod tests` and can reach private
+items. Files in `tests/` are different: Cargo compiles each one as a separate crate
+that links against the library, so it sees only `pub` items, imported by crate name
+(`use onion_crawler::parse_warc_memchr;`). That is the right level for these tests:
+they only touch the public API, so a refactor has to update them only where that API
+changes, never because of internal changes.
+Integration tests can use every crate in `[dependencies]` and `[dev-dependencies]`;
+the fixture builder uses `flate2`'s `GzEncoder` without adding anything to
+`Cargo.toml`.
+
+**Shared test helpers: `tests/common/mod.rs`**
+Every `.rs` file directly inside `tests/` becomes its own test binary. A helper file
+at `tests/common.rs` would therefore show up as an empty test crate. Putting it in a
+subdirectory as `tests/common/mod.rs` stops Cargo from compiling it on its own; each
+test file that needs it declares `mod common;`. Each such test file compiles its own
+copy, so a helper that one file doesn't use produces a dead-code warning in that
+crate.
+
+**Characterization tests**
+A characterization test asserts what code *does*, not what it *should* do. The classic
+recipe (Michael Feathers, *Working Effectively with Legacy Code*) is to run the code
+and record its output. Here the expected values were written by hand from reading the
+fixture first, and the first run confirmed them; a value only copied from a run would
+also have pinned any behaviour nobody had noticed. The pinned values include behaviour
+we plan to change (the `/favicon.ico` guess), so when the refactor changes it, the
+test diff shows exactly that line and nothing else.
+
+**`#[ignore = "reason"]`**
+Marks a test that `cargo test` skips and lists as `ignored, <reason>`.
+`cargo test -- --ignored` runs only the ignored tests; `-- --include-ignored` runs
+everything. The real-Archive test also checks its environment variable with
+`std::env::var_os` and returns early when it is unset, so `--ignored` passes cleanly
+on a machine without a downloaded Archive.
+
+**`CARGO_TARGET_TMPDIR`**
+Cargo sets this variable when compiling integration tests and benchmarks: a scratch
+directory inside `target/`. `env!("CARGO_TARGET_TMPDIR")` reads it at compile time,
+so no temp-dir crate is needed. Tests run in parallel threads, so each one writes its
+fixture to its own subdirectory; `parse_warc_mmap` also writes a decompressed `.warc`
+next to the Archive, which must not collide either.
+
+**Consuming builders**
+`WarcBuilder`'s methods take `self` by value and return it, so an Archive reads as one
+chain: `WarcBuilder::new().warcinfo(..).request(..).response(..).finish()`. Taking
+ownership means a half-built value can't be reused by accident after `finish()`
+consumes it.
+
+**Comparing values the library can't compare**
+`OnionSource` and `FaviconSource` don't derive `PartialEq`, and the refactor replaces
+them anyway. Rather than change production code for the tests, the tests convert a
+`ParseResult` into their own `Snapshot` type, and each source into their own
+`Sighting`. `impl From<ParseResult> for Snapshot` is allowed in the test crate because
+the orphan rule only needs *one* side of the impl to be local: here `Snapshot` is.
+When the library types change, the conversions change but the hand-written expected
+values don't. `Snapshot` uses `BTreeMap` instead of `HashMap`: equality is the same, but
+`Debug` prints keys in sorted order, so a failure prints the same diff every time.
+
+**Generic helper with an `Into` bound**
+`OnionSource` and `FaviconSource` each get an `impl From<...> for Sighting`. One
+function then converts lists of either: `fn sightings<T: Into<Sighting>>(sources:
+Vec<T>) -> Vec<Sighting>`. Implementing `From` gives `Into` for free (the standard
+library has a blanket `impl<T, U: From<T>> Into<U> for T`), so bounds are usually
+written with `Into`, the direction the caller needs.
