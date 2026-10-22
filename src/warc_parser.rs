@@ -82,95 +82,98 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
     type Item = io::Result<WarcRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // --- Phase 1: Find the start of the next WARC record ---
-        //
-        // WARC records start with "WARC/1.0\r\n". We skip blank lines
-        // between records (the \r\n\r\n terminator of the previous record).
+        // Each pass of this outer loop parses one record. Skipped records
+        // `continue` to the next pass instead of calling `self.next()`
+        // recursively: Rust does not guarantee tail-call elimination, so
+        // recursion would cost one stack frame per skipped record.
         loop {
-            self.line_buf.clear();
-            match self.reader.read_line(&mut self.line_buf) {
-                Ok(0) => return None, // EOF
-                Ok(_) => {
-                    if self.line_buf.starts_with("WARC/") {
-                        break; // Found record start
+            // --- Phase 1: Find the start of the next WARC record ---
+            //
+            // WARC records start with "WARC/1.0\r\n". We skip blank lines
+            // between records (the \r\n\r\n terminator of the previous record).
+            loop {
+                self.line_buf.clear();
+                match self.reader.read_line(&mut self.line_buf) {
+                    Ok(0) => return None, // EOF
+                    Ok(_) => {
+                        if self.line_buf.starts_with("WARC/") {
+                            break; // Found record start
+                        }
+                        // Skip blank lines / record terminators between records
                     }
-                    // Skip blank lines / record terminators between records
+                    Err(e) => return Some(Err(e)),
                 }
-                Err(e) => return Some(Err(e)),
             }
-        }
 
-        // --- Phase 2: Parse headers — only WARC-Type and Content-Length ---
-        //
-        // We read header lines until we hit the empty line (\r\n or \n)
-        // that separates headers from body. For each line, we only check
-        // if it starts with "WARC-Type:" or "Content-Length:". Everything
-        // else is ignored — no allocation, no parsing.
-        let mut is_response = false;
-        let mut content_length: usize = 0;
-        let mut target_uri = String::new();
-        let mut date = String::new();
+            // --- Phase 2: Parse headers — only WARC-Type and Content-Length ---
+            //
+            // We read header lines until we hit the empty line (\r\n or \n)
+            // that separates headers from body. For each line, we only check
+            // if it starts with "WARC-Type:" or "Content-Length:". Everything
+            // else is ignored — no allocation, no parsing.
+            let mut is_response = false;
+            let mut content_length: usize = 0;
+            let mut target_uri = String::new();
+            let mut date = String::new();
 
-        loop {
-            self.line_buf.clear();
-            match self.reader.read_line(&mut self.line_buf) {
-                Ok(0) => return None, // Unexpected EOF in headers
-                Ok(_) => {
-                    let trimmed = self.line_buf.trim();
-                    if trimmed.is_empty() {
-                        break; // End of headers (blank line)
+            loop {
+                self.line_buf.clear();
+                match self.reader.read_line(&mut self.line_buf) {
+                    Ok(0) => return None, // Unexpected EOF in headers
+                    Ok(_) => {
+                        let trimmed = self.line_buf.trim();
+                        if trimmed.is_empty() {
+                            break; // End of headers (blank line)
+                        }
+
+                        // Case-insensitive prefix check for headers we care about.
+                        // We compare against lowercase — WARC spec allows mixed case
+                        // but Common Crawl consistently uses this capitalization.
+                        if let Some(value) = trim_header(&self.line_buf, "WARC-Type:") {
+                            is_response = value.eq_ignore_ascii_case("response");
+                        } else if let Some(value) = trim_header(&self.line_buf, "Content-Length:") {
+                            // Manual ASCII digit parsing — faster than str::parse::<usize>
+                            // because we skip UTF-8 validation and error handling overhead.
+                            // Content-Length is always a non-negative integer in ASCII digits.
+                            content_length = parse_ascii_usize(value);
+                        } else if let Some(value) = trim_header(&self.line_buf, "WARC-Target-URI:")
+                        {
+                            target_uri = value.to_string();
+                        } else if let Some(value) = trim_header(&self.line_buf, "WARC-Date:") {
+                            date = value.to_string();
+                        }
                     }
-
-                    // Case-insensitive prefix check for headers we care about.
-                    // We compare against lowercase — WARC spec allows mixed case
-                    // but Common Crawl consistently uses this capitalization.
-                    if let Some(value) = trim_header(&self.line_buf, "WARC-Type:") {
-                        is_response = value.eq_ignore_ascii_case("response");
-                    } else if let Some(value) = trim_header(&self.line_buf, "Content-Length:") {
-                        // Manual ASCII digit parsing — faster than str::parse::<usize>
-                        // because we skip UTF-8 validation and error handling overhead.
-                        // Content-Length is always a non-negative integer in ASCII digits.
-                        content_length = parse_ascii_usize(value);
-                    } else if let Some(value) = trim_header(&self.line_buf, "WARC-Target-URI:") {
-                        target_uri = value.to_string();
-                    } else if let Some(value) = trim_header(&self.line_buf, "WARC-Date:") {
-                        date = value.to_string();
-                    }
+                    Err(e) => return Some(Err(e)),
                 }
-                Err(e) => return Some(Err(e)),
             }
-        }
 
-        // --- Phase 3: Read or skip the body ---
-        //
-        // This is where the big optimization happens. For non-response records
-        // (request, metadata, warcinfo, etc.), we skip the body entirely by
-        // reading and discarding `content_length` bytes. The `warc` crate
-        // reads and allocates the body for EVERY record, even ones we'll
-        // immediately discard. Skipping saves ~60% of memory allocations
-        // and data copying.
-        if !is_response || content_length == 0 {
-            // Skip body bytes by reading into a discard buffer.
-            // We can't seek (gzip streams don't support seeking), so we
-            // read and throw away the bytes. Using a stack buffer avoids
-            // heap allocation for the skip operation.
-            if let Err(e) = skip_bytes(&mut self.reader, content_length) {
+            // --- Phase 3: Read or skip the body ---
+            //
+            // This is where the big optimization happens. For non-response records
+            // (request, metadata, warcinfo, etc.), we skip the body entirely by
+            // reading and discarding `content_length` bytes. The `warc` crate
+            // reads and allocates the body for EVERY record, even ones we'll
+            // immediately discard. Skipping saves ~60% of memory allocations
+            // and data copying.
+            if !is_response || content_length == 0 {
+                // Skip body bytes by reading into a discard buffer.
+                // We can't seek (gzip streams don't support seeking), so we
+                // read and throw away the bytes. Using a stack buffer avoids
+                // heap allocation for the skip operation.
+                if let Err(e) = skip_bytes(&mut self.reader, content_length) {
+                    return Some(Err(e));
+                }
+                continue; // Move on to the next record
+            }
+
+            // Response record — read the body into a buffer.
+            let mut body = vec![0u8; content_length];
+            if let Err(e) = self.reader.read_exact(&mut body) {
                 return Some(Err(e));
             }
-            // Recurse to find the next response record.
-            // This tail-recursive pattern is fine — Rust will optimize it,
-            // and WARC files rarely have thousands of consecutive non-response
-            // records (typically they alternate request/response).
-            return self.next();
-        }
 
-        // Response record — read the body into a buffer.
-        let mut body = vec![0u8; content_length];
-        if let Err(e) = self.reader.read_exact(&mut body) {
-            return Some(Err(e));
+            return Some(Ok(WarcRecord { body, target_uri, date }));
         }
-
-        Some(Ok(WarcRecord { body, target_uri, date }))
     }
 }
 
@@ -510,6 +513,21 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(records.len(), 0, "Empty body responses are skipped");
+    }
+
+    #[test]
+    fn streaming_parser_survives_long_run_of_skipped_records() {
+        // WAT Archives contain tens of thousands of consecutive `metadata`
+        // records. Skipping them must not grow the stack per record.
+        let mut data = make_warc_record("metadata", b"{}").repeat(100_000);
+        data.extend_from_slice(&make_warc_record("response", b"hello"));
+
+        let reader = BufReader::new(data.as_slice());
+        let records: Vec<_> = WarcRecordIter::new(reader)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 1, "Only the trailing response is returned");
+        assert_eq!(records[0].body, b"hello");
     }
 
     #[test]
