@@ -1209,3 +1209,135 @@ the right fallback only when losing the data it replaces is acceptable.
 `(?-u:...)` turns Unicode mode off for the enclosed part of the pattern, so `\b` checks
 only `[0-9A-Za-z_]` on each side. It is also cheaper: a Unicode `\b` can force the
 `regex` crate off its fast DFA when the input contains non-ASCII bytes.
+
+---
+
+## Step 13: Processed State per (Shard, Kind), New CLI, Crate Rename
+
+### What we built
+
+A run can now extract any subset of Artifact kinds, and a later run can add a kind
+without redoing the work already done (ADR-0002). The crate is renamed `onion-crawler` →
+`cc-extract` (version 2.0.0: the CLI changed in incompatible ways).
+
+- **`processed.log` per (Shard, kind)**: each line is `<shard> <kind>`, such as
+  `CC-MAIN-20260305070756-20260305100756-00000 onion`. Before, a line held the Archive file
+  name, so a Shard processed once was skipped forever, even for a kind added later. Lines
+  without a known kind (every line written before this step) are ignored: they don't say
+  which kinds were extracted, so those Shards are processed again.
+- **Scheduling**: for each Archive in the paths file, `main` computes the requested kinds
+  not yet done for its Shard. None missing: skipped. Otherwise the Archive is scheduled
+  with only those kinds' extractors (`new_extractor`). `--limit` counts scheduled Archives.
+- **Save, then mark**: after a Shard finishes, each kind's Sightings are merged, its JSON
+  file saved, and only then is `<shard> <kind>` appended (`save_then_mark`). The old code
+  marked the Archive first and saved after, so a crash in between lost that Archive's
+  results for good.
+- **Only requested kinds are loaded and saved**: `-e onion` never reads or writes
+  `favicons.json`. File names come from `ArtifactKind::output_filename()`; the per-kind
+  `load_results_from` / `load_favicons_from` / `merge_results` / `merge_favicons` pairs are
+  replaced by `load_sightings_from`, `save_sightings_to` and `merge_sightings_from`, which
+  take the kind as a parameter.
+- **`merge`** loops over `ArtifactKind::all()` and merges every kind whose file exists in
+  at least one input directory. It fails if no directory has any results file.
+- **CLI**: `-s/--strategy` and `-m/--stream` are gone, replaced by three independent options:
+
+  | New option | Values | Default |
+  |------------|--------|---------|
+  | `-e/--extract` | comma-separated Artifact kinds | `onion,favicon` |
+  | `-t/--transport` | `disk`, `memory`, `mmap` | `disk` |
+  | `--onion-engine` | `memchr`, `regex` | `memchr` |
+
+  The old flags map as follows: `-s memchr` = defaults, `-s bytes` = `--onion-engine regex`,
+  `-s mmap` = `-t mmap`, `-m` = `-t memory`. The RAM guard now applies to `-t memory`.
+
+```sh
+cargo run -- warc.paths -e onion            # onions only
+cargo run -- warc.paths -e onion,favicon    # same Shards: only favicon runs
+```
+
+The end-to-end test `tests/crawl_cli.rs` does exactly this on a fixture Archive, checks that
+the second run extracts `favicon` only, and that the output directory ends up with the same
+Sightings and `processed.log` lines as a single `-e onion,favicon` run.
+
+### Rust concepts introduced
+
+**`clap::ValueEnum` on a library type**
+`#[derive(ValueEnum)]` on `ArtifactKind` and `OnionEngine` turns each variant into a CLI
+value, kebab-cased (`Onion` → `onion`; a future `InlineFavicon` → `inline-favicon`), with the
+variant's doc comment as its help text. The derive also generates `value_variants()`, the
+list of all variants, which `ArtifactKind::all()` returns, so a new kind is listed
+everywhere without editing a hand-maintained array. `Display` is built from
+`to_possible_value()` and `FromStr` from `ValueEnum::from_str`, so the CLI, progress
+output and `processed.log` share one spelling per kind; a log written with `Display` is
+always readable with `parse()`.
+
+`Transport` can't derive `ValueEnum`: its variants carry a path or the downloaded bytes,
+which don't exist when the command line is parsed. `main` has a fieldless
+`TransportChoice` enum for the option, and each task turns it into a `Transport` once the
+Archive is downloaded.
+
+**Fully qualified syntax: `<Self as ValueEnum>::from_str`**
+`ArtifactKind` implements both `FromStr` and `ValueEnum`, and both traits have a
+`from_str` method. Inside `impl FromStr`, a plain `Self::from_str(..)` would be ambiguous
+(the compiler reports error E0034 and stops). `<Self as ValueEnum>::from_str(name, false)`
+says which trait's method is meant.
+
+**Comma-delimited lists in `clap`**
+A `Vec<T>` field makes an option take several values. `value_delimiter = ','` also splits
+one argument on commas, so `-e onion,favicon` and `-e onion -e favicon` give the same
+`Vec`. `default_value = "onion,favicon"` is split the same way and shown as typed in
+`--help`; the typed alternative, `default_values_t = [..]`, would display as
+`onion favicon`, which is not how the user writes it. Repeats (`-e onion,onion`) are
+removed with `sort()` then `dedup()`: `dedup` only drops *adjacent* equal elements, so
+sorting first is what makes it remove all of them. Sorting needs `Ord`, now derived on
+`ArtifactKind` (declaration order).
+
+**`HashSet` of tuples**
+`load_processed_from` returns `HashSet<(Shard, ArtifactKind)>`. Tuples implement `Hash` and
+`Eq` whenever all their fields do, so the pair is a set element with no extra code, and
+"is `onion` done for this Shard?" is `processed.contains(&(shard.clone(), kind))`. The
+`clone` is needed because `contains` takes a reference to a whole tuple, and a tuple
+of references `(&Shard, ArtifactKind)` is a different type; one small allocation per check
+is negligible next to downloading an Archive.
+
+**`filter_map` with `?` inside the closure**
+Each `processed.log` line goes through a closure returning `Option`:
+`let (shard, kind) = line.split_once(' ')?;` returns `None` for a line without a space,
+`kind.parse::<ArtifactKind>().ok()?` for an unknown kind. `filter_map` keeps only the
+`Some` values, so ignoring malformed lines takes no `if`/`continue` at all.
+
+**`BTreeMap` for a stable order**
+The loaded results are a `BTreeMap<ArtifactKind, Sightings>`. A `HashMap` would work too,
+but would iterate in a different order every run, shuffling the kinds in the summary
+lines. A `BTreeMap` iterates in key order (`Ord`), so output is the same every time.
+
+**Ordering for crash safety**
+Two writes that belong together (save the results, record the pair as done) can't happen
+atomically, so their order decides what a crash between them leaves behind:
+
+- save, then mark: results saved, pair not marked. The next run redoes the Shard for that
+  kind; `merge_sightings` skips the Sightings already in the file, so the redo costs time
+  and changes nothing.
+- mark, then save: pair marked, results lost, and no later run looks for them again.
+
+The rule is: write the data first, the record that the data exists last. `save_then_mark`
+does both with `?` between them, so a failed save returns before the mark is written. It
+is also the only public way to mark a pair: `mark_processed_in` is private, so no caller
+can get the order wrong. `tests/output_state.rs` checks the failure case by putting a
+*directory* where `onions.json` should be written. Writing then fails even for root, which
+file permissions alone would not guarantee.
+
+**End-to-end tests of a binary: `CARGO_BIN_EXE_<name>`**
+Before running integration tests, Cargo builds the package's binaries and passes each
+path at compile time as `env!("CARGO_BIN_EXE_cc-extract")`. `tests/crawl_cli.rs` runs it
+with `std::process::Command`, setting `current_dir` to a scratch directory whose
+`download/` already holds the fixture Archive, so the binary skips the download and needs
+no network. The test compares the *loaded* output, not the bytes: a `HashMap` is
+serialized in a different order each run, so two identical results files rarely match
+byte for byte.
+
+**`#[allow(dead_code)] mod common;`**
+`tests/crawl_cli.rs` uses only `WarcBuilder` and `http_response` from the shared helpers.
+Each test crate compiles its own copy of `common`, so the helpers it doesn't use would
+each raise a dead-code warning; the attribute on the `mod` line silences them for that
+crate only.
