@@ -1,4 +1,4 @@
-// onion-crawler — Step 6: Concurrent downloads & processing with Tokio
+// cc-extract — Step 6: Concurrent downloads & processing with Tokio
 //
 // Building on Step 5, the pipeline now runs concurrently:
 //   - Multiple archives download in parallel (async I/O with reqwest)
@@ -12,6 +12,7 @@
 // New concepts: async/await, Tokio runtime, reqwest streaming, spawn_blocking,
 // bounded concurrency with buffer_unordered, Arc for shared ownership.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -22,40 +23,72 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 
-use onion_crawler::{
-    download_warc_async, download_warc_to_memory, filename_from_uri,
-    load_favicons_from, load_processed_from, load_results_from,
-    mark_processed_in, merge_favicons, merge_results, merge_sightings,
-    parse_archive, save_favicons_to, save_results_to,
-    ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor, Shard, Sightings,
-    Transport, DEFAULT_OUTPUT_DIR, FAVICONS_FILENAME, RESULTS_FILENAME,
+use cc_extract::{
+    download_warc_async, download_warc_to_memory, filename_from_uri, load_processed_from,
+    load_sightings_from, merge_sightings, merge_sightings_from, parse_archive, save_sightings_to,
+    save_then_mark, ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor,
+    Shard, Sightings, Transport, DEFAULT_OUTPUT_DIR,
 };
 
 // ---------------------------------------------------------------------------
-// Parsing Strategy Selection
+// Transport and extractor selection
 // ---------------------------------------------------------------------------
 
-/// Parsing strategy — selects which optimization layer to use.
+/// How downloaded Archives reach the parser, as chosen with `--transport`.
 ///
-/// Each strategy produces identical results but uses different techniques,
-/// inspired by how ripgrep achieves its speed. Run all three on the same
-/// archive to benchmark the impact of each optimization; the original
-/// `warc`-crate approach lives on as `cargo run --example baseline`.
+/// The library's `Transport` can't be parsed from the command line
+/// directly: its variants carry the file path or the downloaded bytes,
+/// which only exist once an Archive is downloaded. This fieldless enum is
+/// the choice alone; each task turns it into a `Transport` (see
+/// `run_crawl`). All three give identical results; run them on the same
+/// Archive to compare their speed.
 ///
-/// Each strategy is a Transport + onion engine pair for `parse_archive`
-/// (see `run_crawl`); `--transport` and `--onion-engine` will replace it.
+/// `ValueEnum` derive lets `clap` parse the name from the CLI (e.g.,
+/// `--transport memory`). It auto-generates the list of valid values for
+/// `--help` output, with each variant's doc comment as its description.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TransportChoice {
+    /// Download to download/, stream-decompress from the file
+    Disk,
+    /// Download into RAM, stream-decompress from there (no disk I/O, ~1 GB per job)
+    Memory,
+    /// Download to download/, decompress to a temporary .warc, memory-map it
+    Mmap,
+}
+
+/// The extractor for one Artifact kind, set up from the CLI options.
 ///
-/// `ValueEnum` derive lets `clap` parse the strategy name from the CLI
-/// (e.g., `--strategy memchr`). It auto-generates the list of valid values
-/// for `--help` output.
-#[derive(Clone, Copy, ValueEnum)]
-enum Strategy {
-    /// Custom parser + regex::bytes::Regex on raw &[u8] (no UTF-8 conversion)
-    Bytes,
-    /// Custom parser + SIMD memmem literal search (no regex engine)
-    Memchr,
-    /// Decompress → mmap → zero-copy memchr search
-    Mmap
+/// The one place a kind is matched to its `Extractor`: a new kind makes
+/// this `match` non-exhaustive, so the compiler points here.
+fn new_extractor(kind: ArtifactKind, onion_engine: OnionEngine) -> Box<dyn Extractor> {
+    match kind {
+        ArtifactKind::Onion => Box::new(OnionExtractor::new(onion_engine)),
+        ArtifactKind::Favicon => Box::new(FaviconExtractor::new()),
+    }
+}
+
+/// The name `clap` accepts for `value`, for messages (`memory`, `regex`).
+fn cli_name(value: &impl ValueEnum) -> String {
+    value
+        .to_possible_value()
+        .expect("no CLI value is skipped")
+        .get_name()
+        .to_string()
+}
+
+/// `onion,favicon`: kinds as written for `--extract`.
+fn kind_list(kinds: &[ArtifactKind]) -> String {
+    let names: Vec<String> = kinds.iter().map(ToString::to_string).collect();
+    names.join(",")
+}
+
+/// `2 onion(s), 5 favicon(s)`: one count per kind.
+fn count_list(counts: impl IntoIterator<Item = (ArtifactKind, usize)>) -> String {
+    let counts: Vec<String> = counts
+        .into_iter()
+        .map(|(kind, count)| format!("{} {}(s)", count, kind))
+        .collect();
+    counts.join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -180,25 +213,15 @@ fn get_available_memory() -> Option<u64> {
 // ## Subcommands for HPC / batch mode
 //
 // The CLI uses subcommands to support two modes:
-//   - `run` (default): download + parse archives (the original behavior)
-//   - `merge`: combine partial results from parallel SLURM array tasks
-//
-// `SubcommandRequiredElseHelp` is not used — when no subcommand is given,
-// we default to `run` for backwards compatibility. The `input` positional
-// argument on the top-level struct is what makes this work: clap sees it
-// and treats the invocation as an implicit `run`.
-// ## Subcommands for HPC / batch mode
-//
-// The CLI uses subcommands to support two modes:
 //   - default (no subcommand): download + parse archives (the original behavior)
 //   - `merge`: combine partial results from parallel SLURM array tasks
 //
 // The top-level struct keeps all the `run` flags directly so existing
-// invocations (`onion-crawler warc.paths -l 3`) continue to work unchanged.
+// invocations (`cc-extract warc.paths -l 3`) work without a keyword.
 // Only the `merge` subcommand requires an explicit keyword.
 #[derive(Parser)]
-#[command(name = "onion-crawler")]
-#[command(about = "Extract .onion addresses from Common Crawl WARC archives")]
+#[command(name = "cc-extract")]
+#[command(about = "Extract artifacts, such as .onion addresses and favicon URLs, from Common Crawl archives")]
 struct Config {
     /// Path to the WARC-paths file (supports .gz) — omit when using `merge`
     input: Option<String>,
@@ -223,13 +246,28 @@ struct Config {
     #[arg(short, long)]
     delete: bool,
 
-    /// Parsing strategy: bytes, memchr, or mmap
-    #[arg(short, long, value_enum, default_value_t = Strategy::Memchr)]
-    strategy: Strategy,
+    /// Artifact kinds to extract, comma-separated
+    ///
+    /// A Shard is processed again only for the kinds not yet done for it
+    /// in `processed.log`, so a kind can be added in a later run.
+    //
+    // ## Comma-delimited lists
+    //
+    // `Vec<ArtifactKind>` makes the option take several values;
+    // `value_delimiter = ','` splits `-e onion,favicon` into two, each
+    // parsed through `ArtifactKind`'s `ValueEnum` derive. The default is
+    // written as the user would type it and split the same way, so
+    // `--help` shows `[default: onion,favicon]`.
+    #[arg(short, long, value_enum, value_delimiter = ',', default_value = "onion,favicon")]
+    extract: Vec<ArtifactKind>,
 
-    /// Parse from memory instead of disk (skips file I/O, uses more RAM)
-    #[arg(short = 'm', long)]
-    stream: bool,
+    /// How downloaded archives reach the parser
+    #[arg(short, long, value_enum, default_value_t = TransportChoice::Disk)]
+    transport: TransportChoice,
+
+    /// Search used to find .onion addresses
+    #[arg(long, value_enum, default_value_t = OnionEngine::Memchr)]
+    onion_engine: OnionEngine,
 
     /// Output directory for results and processed log (default: output/)
     ///
@@ -247,10 +285,10 @@ enum Command {
     /// Merge partial results from multiple output directories (HPC post-processing)
     ///
     /// After a SLURM array job completes, each task has written its own
-    /// `onions.json` in a separate directory. This subcommand reads them all,
-    /// deduplicates, and writes a combined result.
+    /// results files in a separate directory. This subcommand reads them
+    /// all, deduplicates, and writes one combined file per Artifact kind.
     Merge {
-        /// Directories containing partial onions.json files to merge
+        /// Directories containing partial results files to merge
         #[arg(required = true)]
         input_dirs: Vec<PathBuf>,
 
@@ -261,8 +299,17 @@ enum Command {
 }
 
 // ---------------------------------------------------------------------------
-// Per-archive task result
+// Per-archive task input and result
 // ---------------------------------------------------------------------------
+
+/// One Archive to process, and the requested kinds not yet done for its
+/// Shard. Only those kinds' extractors run on it.
+struct ScheduledArchive {
+    /// 1-based position among the paths after `--offset`, for log messages.
+    index: usize,
+    uri: String,
+    kinds: Vec<ArtifactKind>,
+}
 
 /// The outcome of processing a single archive — passed back from each
 /// concurrent task to the main task for merging.
@@ -271,6 +318,7 @@ enum Command {
 /// mutate shared state. Instead, each task returns its results and the
 /// main task merges them sequentially — no locks needed.
 struct ArchiveResult {
+    shard: Shard,
     /// What each extractor found, tagged with its Artifact kind.
     found: Vec<(ArtifactKind, Sightings)>,
     download_time: Duration,
@@ -315,8 +363,8 @@ async fn main() {
         Some(ref path) => path.clone(),
         None => {
             eprintln!("Error: missing required argument <INPUT> (path to WARC-paths file)");
-            eprintln!("Usage: onion-crawler <INPUT> [OPTIONS]");
-            eprintln!("       onion-crawler merge <INPUT_DIRS>...");
+            eprintln!("Usage: cc-extract <INPUT> [OPTIONS]");
+            eprintln!("       cc-extract merge <INPUT_DIRS>...");
             process::exit(1);
         }
     };
@@ -325,6 +373,10 @@ async fn main() {
 }
 
 /// Merge partial results from multiple SLURM task output directories.
+///
+/// Every Artifact kind is merged whose results file exists in at least one
+/// of the directories, so `merge` needs no option to say which kinds the
+/// tasks extracted.
 fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
     eprintln!(
         "Merging results from {} directories into '{}'",
@@ -332,35 +384,29 @@ fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
         output_dir
     );
 
-    let merged_onions = merge_results(input_dirs);
-    let merged_favicons = merge_favicons(input_dirs);
+    let mut merged_any = false;
+    for &kind in ArtifactKind::all() {
+        let Some(merged) = merge_sightings_from(kind, input_dirs) else {
+            continue;
+        };
+        merged_any = true;
+        eprintln!("Merged: {}", count_list([(kind, merged.len())]));
 
-    eprintln!(
-        "Merged: {} unique .onion address(es), {} unique favicon URL(s)",
-        merged_onions.len(),
-        merged_favicons.len()
-    );
-
-    match save_results_to(&merged_onions, output_dir) {
-        Ok(()) => {
-            let path = Path::new(output_dir).join(RESULTS_FILENAME);
-            eprintln!("Onion results saved to {}", path.display());
-        }
-        Err(err) => {
-            eprintln!("Error saving merged onion results: {}", err);
-            process::exit(1);
+        match save_sightings_to(kind, &merged, output_dir) {
+            Ok(()) => {
+                let path = Path::new(output_dir).join(kind.output_filename());
+                eprintln!("{} results saved to {}", kind, path.display());
+            }
+            Err(err) => {
+                eprintln!("Error saving merged {} results: {}", kind, err);
+                process::exit(1);
+            }
         }
     }
 
-    match save_favicons_to(&merged_favicons, output_dir) {
-        Ok(()) => {
-            let path = Path::new(output_dir).join(FAVICONS_FILENAME);
-            eprintln!("Favicon results saved to {}", path.display());
-        }
-        Err(err) => {
-            eprintln!("Error saving merged favicon results: {}", err);
-            process::exit(1);
-        }
+    if !merged_any {
+        eprintln!("Error: no loadable results file in any of the input directories");
+        process::exit(1);
     }
 }
 
@@ -380,40 +426,35 @@ fn load_or_exit(loaded: Result<Sightings, Box<dyn Error>>) -> Sightings {
     })
 }
 
+/// Save every requested kind's results file, reporting each one.
+fn save_all(results: &BTreeMap<ArtifactKind, Sightings>, output_dir: &str) {
+    for (&kind, sightings) in results {
+        match save_sightings_to(kind, sightings, output_dir) {
+            Ok(()) => {
+                let path = Path::new(output_dir).join(kind.output_filename());
+                eprintln!("{} results saved to {}", kind, path.display());
+            }
+            Err(err) => eprintln!("Error saving {} results: {}", kind, err),
+        }
+    }
+}
+
 /// Main crawl pipeline — download and parse WARC archives.
 async fn run_crawl(input: String, config: Config) {
     let limit_display = match config.limit {
         Some(n) => format!("{}", n),
         None => "all".to_string()
     };
-    let strategy_name = match config.strategy {
-        Strategy::Bytes => "bytes (custom parser + regex::bytes)",
-        Strategy::Memchr => "memchr (custom parser + SIMD memmem)",
-        Strategy::Mmap => "mmap (decompress + mmap + SIMD memmem)"
-    };
 
-    // --- Check stream mode compatibility ---
-    //
-    // ## Graceful degradation
-    //
-    // Not all strategies support in-memory parsing. Rather than erroring
-    // out, we warn the user and fall back to disk mode. This is a common
-    // CLI UX pattern: prefer doing the right thing with a warning over
-    // refusing to run.
-    let stream_enabled = if config.stream {
-        match config.strategy {
-            Strategy::Mmap => {
-                eprintln!(
-                    "Warning: --stream is not compatible with 'mmap' strategy \
-                     (memory mapping requires a file). Falling back to disk mode."
-                );
-                false
-            }
-            Strategy::Bytes | Strategy::Memchr => true,
-        }
-    } else {
-        false
-    };
+    // `-e onion,onion` would otherwise run two onion extractors.
+    // `sort` + `dedup` drops repeats (`dedup` only removes *adjacent*
+    // duplicates, hence the sort first); kinds then come in declaration order.
+    let mut kinds = config.extract.clone();
+    kinds.sort();
+    kinds.dedup();
+
+    let transport_choice = config.transport;
+    let onion_engine = config.onion_engine;
 
     // --- Cap jobs at 2× CPU cores ---
     //
@@ -435,26 +476,26 @@ async fn run_crawl(input: String, config: Config) {
         config.jobs
     };
 
-    // --- Cap concurrent jobs based on available RAM (stream mode only) ---
+    // --- Cap concurrent jobs based on available RAM (memory Transport only) ---
     //
     // ## Defensive resource management
     //
-    // In stream mode, each concurrent job holds an entire archive in memory
-    // (~800 MB–1 GB). Without a cap, a 16-core machine with 8 GB of RAM
-    // would try to hold 16 archives simultaneously — guaranteed OOM.
+    // With `--transport memory`, each concurrent job holds an entire archive
+    // in memory (~800 MB–1 GB). Without a cap, a 16-core machine with 8 GB
+    // of RAM would try to hold 16 archives simultaneously — guaranteed OOM.
     //
     // We query available RAM once at startup and compute the maximum safe
-    // number of concurrent stream jobs. `buffer_unordered` then provides
+    // number of concurrent in-memory jobs. `buffer_unordered` then provides
     // natural backpressure: when a job finishes and frees its buffer, the
     // next one starts and allocates a new buffer.
-    let effective_jobs = if stream_enabled {
+    let effective_jobs = if transport_choice == TransportChoice::Memory {
         const MAX_ARCHIVE_SIZE: u64 = 1_073_741_824; // 1 GB worst case
         if let Some(available) = get_available_memory() {
             let max_jobs = (available / MAX_ARCHIVE_SIZE).max(1) as usize;
             if max_jobs < capped_jobs {
                 eprintln!(
-                    "Warning: available RAM ({:.1} GB) limits stream jobs to {} \
-                     (requested {}). Use disk mode or free memory for more concurrency.",
+                    "Warning: available RAM ({:.1} GB) limits in-memory jobs to {} \
+                     (requested {}). Use --transport disk or free memory for more concurrency.",
                     available as f64 / 1_073_741_824.0,
                     max_jobs,
                     capped_jobs,
@@ -467,7 +508,7 @@ async fn run_crawl(input: String, config: Config) {
             capped_jobs // Can't detect RAM — proceed with CPU-capped jobs
         }
     } else {
-        capped_jobs // Disk mode — no memory concern
+        capped_jobs // Archives go to disk — no memory concern
     };
 
     let offset_display = if config.offset > 0 {
@@ -481,9 +522,10 @@ async fn run_crawl(input: String, config: Config) {
         String::new()
     };
     eprintln!(
-        "Reading WARC paths from '{}' (limit: {}{}, jobs: {}, delete after: {}, strategy: {}, stream: {}{})",
-        input, limit_display, offset_display, effective_jobs,
-        config.delete, strategy_name, stream_enabled, output_dir_display
+        "Reading WARC paths from '{}' (extract: {}, limit: {}{}, jobs: {}, delete after: {}, \
+         transport: {}, onion engine: {}{})",
+        input, kind_list(&kinds), limit_display, offset_display, effective_jobs,
+        config.delete, cli_name(&transport_choice), cli_name(&onion_engine), output_dir_display
     );
 
     // --- Open and read the paths file ---
@@ -528,22 +570,29 @@ async fn run_crawl(input: String, config: Config) {
     );
 
     // --- Load persistent state ---
+    //
+    // Only the requested kinds' results are loaded, and only those files
+    // are saved again: a run with `-e onion` never touches `favicons.json`.
+    // A `BTreeMap` keeps the kinds in declaration order for the messages.
     let processed = load_processed_from(&config.output_dir);
-    let mut results = load_or_exit(load_results_from(&config.output_dir));
-    let mut favicon_results = load_or_exit(load_favicons_from(&config.output_dir));
+    let mut results: BTreeMap<ArtifactKind, Sightings> = kinds
+        .iter()
+        .map(|&kind| (kind, load_or_exit(load_sightings_from(kind, &config.output_dir))))
+        .collect();
 
     eprintln!(
-        "State: {} already processed, {} onion(s), {} favicon URL(s) in results\n",
+        "State: {} (Shard, kind) pair(s) done; {} in results\n",
         processed.len(),
-        results.len(),
-        favicon_results.len()
+        count_list(results.iter().map(|(&kind, sightings)| (kind, sightings.len())))
     );
 
-    // --- Filter URIs: skip already-processed, apply limit ---
+    // --- Schedule: the requested kinds still missing for each Shard ---
+    //
     // We do this upfront so we know exactly which archives to process
-    // concurrently. Skipped archives are logged but don't count toward
-    // the limit.
-    let mut work_items: Vec<(usize, String)> = Vec::new();
+    // concurrently. An Archive whose Shard is done for every requested kind
+    // is skipped and doesn't count toward the limit; any other is scheduled
+    // with only its missing kinds.
+    let mut work_items: Vec<ScheduledArchive> = Vec::new();
     let mut skip_count: usize = 0;
 
     for (i, uri) in uris.iter().enumerate() {
@@ -555,7 +604,14 @@ async fn run_crawl(input: String, config: Config) {
             }
         };
 
-        if processed.contains(filename) {
+        let shard = Shard::from_archive_name(filename);
+        let missing: Vec<ArtifactKind> = kinds
+            .iter()
+            .copied()
+            .filter(|&kind| !processed.contains(&(shard.clone(), kind)))
+            .collect();
+
+        if missing.is_empty() {
             eprintln!("[{}] {} — already processed, skipping", i + 1, filename);
             skip_count += 1;
             continue;
@@ -568,49 +624,26 @@ async fn run_crawl(input: String, config: Config) {
             }
         }
 
-        work_items.push((i + 1, uri.clone()));
+        work_items.push(ScheduledArchive { index: i + 1, uri: uri.clone(), kinds: missing });
     }
 
     let output_dir = config.output_dir;
 
     if work_items.is_empty() {
         eprintln!("No archives to process.");
-        match save_results_to(&results, &output_dir) {
-            Ok(()) => {
-                let path = Path::new(&output_dir).join(RESULTS_FILENAME);
-                eprintln!("Results saved to {}", path.display());
-            }
-            Err(err) => eprintln!("Error saving results: {}", err)
-        }
-        match save_favicons_to(&favicon_results, &output_dir) {
-            Ok(()) => {
-                let path = Path::new(&output_dir).join(FAVICONS_FILENAME);
-                eprintln!("Favicons saved to {}", path.display());
-            }
-            Err(err) => eprintln!("Error saving favicons: {}", err)
-        }
+        save_all(&results, &output_dir);
         eprintln!(
-            "\nSummary: 0 processed, {} skipped, 0 failed, 0 new onion(s), 0 new favicon URL(s)",
+            "\nSummary: 0 processed, {} skipped, 0 failed",
             skip_count
         );
         eprintln!(
-            "Total: {} unique .onion address(es), {} unique favicon URL(s) in results",
-            results.len(),
-            favicon_results.len()
+            "Total in results: {}",
+            count_list(results.iter().map(|(&kind, sightings)| (kind, sightings.len())))
         );
         return;
     }
 
     eprintln!("Processing {} archive(s) with {} concurrent job(s)\n", work_items.len(), effective_jobs);
-
-    let strategy = config.strategy;
-
-    // The onion engine each strategy stands for. The Transport also
-    // depends on where the download went, so it is chosen per task below.
-    let onion_engine = match strategy {
-        Strategy::Bytes => OnionEngine::Regex,
-        Strategy::Memchr | Strategy::Mmap => OnionEngine::Memchr,
-    };
 
     // --- Create a shared HTTP client ---
     //
@@ -629,7 +662,7 @@ async fn run_crawl(input: String, config: Config) {
     //
     // ## How the pipeline works
     //
-    // `stream::iter(work_items)` creates a stream of (index, uri) pairs.
+    // `stream::iter(work_items)` creates a stream of scheduled archives.
     // `.map(|item| async { ... })` transforms each into a future that
     // downloads + parses one archive.
     //
@@ -642,7 +675,7 @@ async fn run_crawl(input: String, config: Config) {
     // "Unordered" means faster archives finish first — we don't block
     // waiting for a slow download just because it started earlier.
     let archive_stream = stream::iter(work_items)
-        .map(|(idx, uri)| {
+        .map(|ScheduledArchive { index: idx, uri, kinds }| {
             // Clone the shared client for this task. `reqwest::Client` is
             // an `Arc` inside, so the clone is cheap (just increments a
             // reference count) and shares the connection pool.
@@ -657,40 +690,44 @@ async fn run_crawl(input: String, config: Config) {
                     }
                 };
 
-                eprintln!("[{}] {}", idx, filename);
+                eprintln!("[{}] {}: extracting {}", idx, filename, kind_list(&kinds));
 
                 // --- Download phase ---
                 //
-                // In stream mode, we download to memory (`Vec<u8>`) instead
-                // of disk. The compressed bytes stay in RAM and are passed
-                // directly to the parser. In disk mode, we write to
-                // `download/<filename>` as before.
+                // With the memory Transport, we download to memory
+                // (`Vec<u8>`) instead of disk. The compressed bytes stay in
+                // RAM and are passed directly to the parser. The other two
+                // write to `download/<filename>` first, unless the file is
+                // already there. Either way the result is the `Transport`
+                // the parser reads from.
                 let local_path: PathBuf = Path::new("download").join(&filename);
                 let download_start = Instant::now();
 
-                // `Option<Vec<u8>>` holds the in-memory buffer in stream mode.
-                // In disk mode, this stays `None` and the parser reads from disk.
-                let memory_buffer: Option<Vec<u8>> = if stream_enabled {
-                    match download_warc_to_memory(&client, &uri).await {
-                        Ok(buf) => Some(buf),
-                        Err(err) => {
-                            eprintln!("  [{}] Download error: {}", filename, err);
-                            return Err(format!("{}: download error: {}", filename, err));
-                        }
-                    }
-                } else {
-                    if !local_path.exists() {
-                        match download_warc_async(&client, &uri).await {
-                            Ok(_) => {}
+                let transport = match transport_choice {
+                    TransportChoice::Memory => {
+                        match download_warc_to_memory(&client, &uri).await {
+                            Ok(data) => Transport::Memory(data),
                             Err(err) => {
                                 eprintln!("  [{}] Download error: {}", filename, err);
                                 return Err(format!("{}: download error: {}", filename, err));
                             }
                         }
-                    } else {
-                        eprintln!("  [{}] Already downloaded", filename);
                     }
-                    None
+                    TransportChoice::Disk | TransportChoice::Mmap => {
+                        if !local_path.exists() {
+                            if let Err(err) = download_warc_async(&client, &uri).await {
+                                eprintln!("  [{}] Download error: {}", filename, err);
+                                return Err(format!("{}: download error: {}", filename, err));
+                            }
+                        } else {
+                            eprintln!("  [{}] Already downloaded", filename);
+                        }
+                        if transport_choice == TransportChoice::Mmap {
+                            Transport::Mmap(local_path.clone())
+                        } else {
+                            Transport::Disk(local_path.clone())
+                        }
+                    }
                 };
 
                 let download_time = download_start.elapsed();
@@ -710,34 +747,26 @@ async fn run_crawl(input: String, config: Config) {
                 // async task until the blocking work finishes, freeing the
                 // worker thread for other downloads.
                 //
-                // In stream mode, the `Vec<u8>` buffer is *moved* into the
-                // blocking closure — this is a zero-cost ownership transfer
-                // (no data copying). After the move, the async task no longer
-                // owns the buffer, and the compiler prevents use-after-move.
-                let strategy_label = match strategy {
-                    Strategy::Bytes => if stream_enabled { "bytes/stream" } else { "bytes" },
-                    Strategy::Memchr => if stream_enabled { "memchr/stream" } else { "memchr" },
-                    Strategy::Mmap => "mmap"
-                };
-                eprintln!("  [{}] Parsing ({})...", filename, strategy_label);
-                let transport = match (strategy, memory_buffer) {
-                    (Strategy::Mmap, _) => Transport::Mmap(local_path.clone()),
-                    // Stream mode: parse from the in-memory buffer
-                    (_, Some(data)) => Transport::Memory(data),
-                    // Disk mode: parse from the downloaded file
-                    (_, None) => Transport::Disk(local_path.clone()),
-                };
+                // With the memory Transport, the `Vec<u8>` inside
+                // `Transport::Memory` is *moved* into the blocking closure —
+                // a zero-cost ownership transfer (no data copying). After the
+                // move, the async task no longer owns the buffer, and the
+                // compiler prevents use-after-move.
+                eprintln!("  [{}] Parsing ({})...", filename, cli_name(&transport_choice));
                 let shard = Shard::from_archive_name(&filename);
+                // The closure takes ownership of what it captures; the clone
+                // keeps a `shard` here for the result.
+                let parse_shard = shard.clone();
 
                 let parse_start = Instant::now();
                 let parse_result = tokio::task::spawn_blocking(
                     move || -> Result<Vec<(ArtifactKind, Sightings)>, Box<dyn Error + Send + Sync>> {
-                        // One boxed extractor per Artifact kind for this Shard.
-                        let mut extractors: Vec<Box<dyn Extractor>> = vec![
-                            Box::new(OnionExtractor::new(onion_engine)),
-                            Box::new(FaviconExtractor::new()),
-                        ];
-                        parse_archive(transport, &shard, &mut extractors)?;
+                        // One boxed extractor per kind still missing for this Shard.
+                        let mut extractors: Vec<Box<dyn Extractor>> = kinds
+                            .iter()
+                            .map(|&kind| new_extractor(kind, onion_engine))
+                            .collect();
+                        parse_archive(transport, &parse_shard, &mut extractors)?;
                         Ok(extractors
                             .into_iter()
                             .map(|extractor| (extractor.kind(), extractor.into_sightings()))
@@ -762,13 +791,14 @@ async fn run_crawl(input: String, config: Config) {
                 };
 
                 eprintln!("  [{}] Parsing time: {:.1}s", filename, parse_time.as_secs_f64());
-                let counts: Vec<String> = found
-                    .iter()
-                    .map(|(kind, sightings)| format!("{} {}(s)", sightings.len(), kind))
-                    .collect();
-                eprintln!("  [{}] Found {}", filename, counts.join(", "));
+                eprintln!(
+                    "  [{}] Found {}",
+                    filename,
+                    count_list(found.iter().map(|(kind, sightings)| (*kind, sightings.len())))
+                );
 
-                Ok((idx, filename, local_path, ArchiveResult {
+                Ok((filename, local_path, ArchiveResult {
+                    shard,
                     found,
                     download_time,
                     parse_time
@@ -780,15 +810,15 @@ async fn run_crawl(input: String, config: Config) {
     // --- Collect results back on the main task ---
     //
     // `buffer_unordered` yields results as futures complete. We process
-    // them sequentially here: merge onions into the shared results map,
-    // mark archives as processed, and optionally delete files.
+    // them sequentially here: merge Sightings into each kind's map, save
+    // it, mark the (Shard, kind) pairs as done, and optionally delete files.
     //
     // This is a key design choice: concurrent *work*, sequential *merging*.
     // No locks, no race conditions — the simplest correct approach.
     let mut process_count: usize = 0;
     let mut fail_count: usize = 0;
-    let mut new_onions: usize = 0;
-    let mut new_favicons: usize = 0;
+    let mut new_counts: BTreeMap<ArtifactKind, usize> =
+        kinds.iter().map(|&kind| (kind, 0)).collect();
     let mut total_download = Duration::ZERO;
     let mut total_parse = Duration::ZERO;
 
@@ -799,36 +829,38 @@ async fn run_crawl(input: String, config: Config) {
 
     while let Some(task_result) = archive_stream.next().await {
         match task_result {
-            Ok((_idx, filename, local_path, archive)) => {
+            Ok((filename, local_path, archive)) => {
                 total_download += archive.download_time;
                 total_parse += archive.parse_time;
 
-                // Merge each kind's results into its accumulated map
+                // For each kind: merge, save its file, *then* mark the pair
+                // done. A crash or failed write in between leaves the pair
+                // unmarked, never marked with its Sightings unsaved (see
+                // `save_then_mark`).
                 for (kind, sightings) in archive.found {
-                    let (all, new_count) = match kind {
-                        ArtifactKind::Onion => (&mut results, &mut new_onions),
-                        ArtifactKind::Favicon => (&mut favicon_results, &mut new_favicons),
-                    };
+                    // Extractors only run for requested kinds, and every
+                    // requested kind was loaded. Inserting an empty map here
+                    // instead would overwrite a results file never loaded.
+                    let all = results
+                        .get_mut(&kind)
+                        .expect("results are loaded for every requested kind");
                     let count_before = all.len();
                     merge_sightings(all, sightings);
-                    *new_count += all.len() - count_before;
-                }
+                    *new_counts.entry(kind).or_default() += all.len() - count_before;
 
-                if let Err(err) = mark_processed_in(&filename, &output_dir) {
-                    eprintln!("  Warning: couldn't mark as processed: {}", err);
-                }
-                if let Err(err) = save_results_to(&results, &output_dir) {
-                    eprintln!("  Warning: couldn't save results: {}", err);
-                }
-                if let Err(err) = save_favicons_to(&favicon_results, &output_dir) {
-                    eprintln!("  Warning: couldn't save favicons: {}", err);
+                    if let Err(err) = save_then_mark(kind, all, &archive.shard, &output_dir) {
+                        eprintln!(
+                            "  [{}] Warning: {} will be extracted again next run: {}",
+                            filename, kind, err
+                        );
+                    }
                 }
 
                 process_count += 1;
 
-                // In stream mode there is no local file to delete — the
-                // data was parsed from memory and already dropped.
-                if delete && !stream_enabled {
+                // With the memory Transport there is no local file to
+                // delete — the data was parsed from memory and already dropped.
+                if delete && transport_choice != TransportChoice::Memory {
                     match fs::remove_file(&local_path) {
                         Ok(()) => eprintln!("  [{}] Deleted {}", filename, local_path.display()),
                         Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", filename, err)
@@ -846,30 +878,19 @@ async fn run_crawl(input: String, config: Config) {
     }
 
     // --- Final save (safety net) ---
-    match save_results_to(&results, &output_dir) {
-        Ok(()) => {
-            let path = Path::new(&output_dir).join(RESULTS_FILENAME);
-            eprintln!("Results saved to {}", path.display());
-        }
-        Err(err) => eprintln!("Error saving results: {}", err)
-    }
-    match save_favicons_to(&favicon_results, &output_dir) {
-        Ok(()) => {
-            let path = Path::new(&output_dir).join(FAVICONS_FILENAME);
-            eprintln!("Favicons saved to {}", path.display());
-        }
-        Err(err) => eprintln!("Error saving favicons: {}", err)
-    }
+    save_all(&results, &output_dir);
 
     // --- Summary ---
     eprintln!(
-        "\nSummary: {} processed, {} skipped, {} failed, {} new onion(s), {} new favicon URL(s)",
-        process_count, skip_count, fail_count, new_onions, new_favicons
+        "\nSummary: {} processed, {} skipped, {} failed, new: {}",
+        process_count,
+        skip_count,
+        fail_count,
+        count_list(new_counts)
     );
     eprintln!(
-        "Total: {} unique .onion address(es), {} unique favicon URL(s) in results",
-        results.len(),
-        favicon_results.len()
+        "Total in results: {}",
+        count_list(results.iter().map(|(&kind, sightings)| (kind, sightings.len())))
     );
     if process_count > 0 {
         let avg_dl = total_download.as_secs_f64() / process_count as f64;

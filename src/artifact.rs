@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::page_record::PageRecord;
@@ -23,25 +25,66 @@ use crate::page_record::PageRecord;
 
 /// A category of information that can be extracted from the crawl.
 ///
-/// The behaviour of each kind lives in its `Extractor`; this enum only
-/// names it. It derives `Copy` because it is a plain tag (one byte), and
+/// The behaviour of each kind lives in its `Extractor`; this enum names it
+/// and holds the facts that don't depend on any page: its name and its
+/// output file. It derives `Copy` because it is a plain tag (one byte), and
 /// `Eq` + `Hash` as the Rust API guidelines recommend for public value
-/// types, so callers can put kinds in sets or use them as map keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// types, so callers can put kinds in sets or use them as map keys. `Ord`
+/// (declaration order) lets a `BTreeMap` keyed by kind list them the same
+/// way every run.
+///
+/// ## `clap::ValueEnum`: one name per kind
+///
+/// The derive turns each variant into a CLI value, kebab-cased (`Onion` →
+/// `onion`, a future `InlineFavicon` → `inline-favicon`), so `--extract`
+/// parses kinds without hand-written code. `Display` and `FromStr` below
+/// reuse those names, so the CLI, progress output and `processed.log` all
+/// spell a kind the same way and can't drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ValueEnum)]
 pub enum ArtifactKind {
-    /// `.onion` addresses.
+    /// .onion addresses
     Onion,
-    /// Favicon URLs that HTML pages declare.
+    /// Favicon URLs that HTML pages declare
     Favicon,
 }
 
-/// `Display` gives the user-facing name, used in progress output.
+impl ArtifactKind {
+    /// Every kind, in declaration order. `value_variants` comes from the
+    /// `ValueEnum` derive, so a new variant is listed without editing this.
+    pub fn all() -> &'static [ArtifactKind] {
+        Self::value_variants()
+    }
+
+    /// Name of the JSON file this kind's Sightings are saved in.
+    pub fn output_filename(self) -> &'static str {
+        match self {
+            ArtifactKind::Onion => "onions.json",
+            ArtifactKind::Favicon => "favicons.json",
+        }
+    }
+}
+
+/// `Display` gives the CLI name, used in progress output and
+/// `processed.log`.
 impl fmt::Display for ArtifactKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ArtifactKind::Onion => "onion",
-            ArtifactKind::Favicon => "favicon",
-        })
+        // `to_possible_value` returns `None` only for variants marked
+        // `#[value(skip)]`, and none is.
+        let value = self.to_possible_value().expect("every kind has a CLI name");
+        f.write_str(value.get_name())
+    }
+}
+
+/// Parse a CLI name back into a kind, so `"onion".parse::<ArtifactKind>()`
+/// works outside `clap` too (reading `processed.log`).
+impl FromStr for ArtifactKind {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        // Both traits define a `from_str`; the fully qualified
+        // `<Self as ValueEnum>::` says which one is meant. `false`: names
+        // are case-sensitive, as on the command line.
+        <Self as ValueEnum>::from_str(name, false)
     }
 }
 

@@ -15,10 +15,10 @@
 // ## Examples and dev-dependencies
 //
 // Each file in `examples/` is a small program of its own, linked against
-// the library like an outside user would (`use onion_crawler::...`). Cargo
+// the library like an outside user would (`use cc_extract::...`). Cargo
 // builds examples only on request (`cargo run --example`, `cargo test`),
 // and they may use `[dev-dependencies]`. That is why `warc` can be a
-// dev-dependency: the library and the `onion-crawler` binary no longer
+// dev-dependency: the library and the `cc-extract` binary no longer
 // compile it at all.
 
 use std::collections::HashSet;
@@ -27,7 +27,7 @@ use std::error::Error;
 use std::process;
 use std::time::Instant;
 
-use onion_crawler::onion_search::ONION_PATTERN;
+use cc_extract::onion_search::ONION_PATTERN;
 use regex::Regex;
 use warc::{RecordType, WarcReader};
 

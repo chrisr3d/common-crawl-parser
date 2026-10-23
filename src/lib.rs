@@ -1,4 +1,4 @@
-// onion-crawler library — download, parsing, and state management
+// cc-extract library — download, parsing, and state management
 //
 // This module ties the pieces together:
 //   - Downloading WARC archives from Common Crawl (async with reqwest)
@@ -28,7 +28,7 @@ pub mod page_record;
 pub mod warc_parser;
 
 // Re-exports: the types callers need most, importable from the crate root
-// (`onion_crawler::Sighting` rather than `onion_crawler::artifact::Sighting`).
+// (`cc_extract::Sighting` rather than `cc_extract::artifact::Sighting`).
 pub use artifact::{ArtifactKind, Shard, Sighting, Sightings, merge_sightings};
 pub use extractor::{Extractor, FaviconExtractor, OnionEngine, OnionExtractor};
 pub use page_record::{PageRecord, WarcResponse};
@@ -51,20 +51,9 @@ const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 /// Default directory for output files.
 pub const DEFAULT_OUTPUT_DIR: &str = "output";
 
-/// Filename for the processed-archives log.
+/// Filename for the log of done (Shard, Artifact kind) pairs. Each kind's
+/// results file is named by `ArtifactKind::output_filename`.
 pub const PROCESSED_FILENAME: &str = "processed.log";
-
-/// Filename for the extracted .onion results.
-pub const RESULTS_FILENAME: &str = "onions.json";
-
-/// Filename for extracted favicon references.
-pub const FAVICONS_FILENAME: &str = "favicons.json";
-
-/// File tracking which archives have been fully processed.
-pub const PROCESSED_FILE: &str = "output/processed.log";
-
-/// JSON file storing extracted .onion addresses and their source archives.
-pub const RESULTS_FILE: &str = "output/onions.json";
 
 // ---------------------------------------------------------------------------
 // Download Logic
@@ -200,7 +189,7 @@ pub async fn download_warc_async(
 ///
 /// Each archive is ~800 MB compressed. With `-j 4`, that's ~3.2 GB of RAM.
 /// This is acceptable for modern machines and comparable to what the `mmap`
-/// strategy uses in virtual memory. The benefit is zero disk usage in the
+/// Transport uses in virtual memory. The benefit is zero disk usage in the
 /// `download/` directory.
 pub async fn download_warc_to_memory(
     client: &reqwest::Client,
@@ -469,59 +458,87 @@ fn hand_over(
 // State Management
 // ---------------------------------------------------------------------------
 
-/// Load the set of already-processed archive filenames.
+/// Load the (Shard, Artifact kind) pairs already done in `output_dir`.
+///
+/// `processed.log` holds one `<shard> <kind>` line per done pair (ADR-0002),
+/// such as `CC-MAIN-20260305070756-20260305100756-00000 onion`. Lines
+/// without a kind name this version knows are ignored: a bare Archive
+/// name, as written before kinds were tracked, doesn't say which kinds were
+/// extracted, so the Shard is simply processed again.
+///
+/// ## `HashSet` of tuples
 ///
 /// `HashSet` stores unique values with O(1) average-case lookup via hashing.
-/// It's the right tool when the core question is "have we seen this before?"
-pub fn load_processed() -> HashSet<String> {
-    load_processed_from(DEFAULT_OUTPUT_DIR)
-}
-
-/// Load processed archives from a custom output directory.
+/// A tuple is hashable when each of its fields is, so `(Shard, ArtifactKind)`
+/// works as a key with no extra code, and "is `onion` done for this Shard?"
+/// is one `contains(&(shard, kind))`.
 ///
 /// ## HPC / batch mode
 ///
 /// When running as a SLURM array job, each task uses its own output directory
 /// (`--output-dir output/42/`) so concurrent jobs never contend on the same
-/// files. This variant accepts the directory path instead of using the default.
-pub fn load_processed_from(output_dir: &str) -> HashSet<String> {
+/// files.
+pub fn load_processed_from(output_dir: &str) -> HashSet<(Shard, ArtifactKind)> {
     let path = Path::new(output_dir).join(PROCESSED_FILENAME);
-    if !path.exists() {
-        return HashSet::new();
-    }
-
     let content = fs::read_to_string(path).unwrap_or_default();
     content
         .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        // `filter_map` drops the lines for which the closure returns `None`;
+        // `?` inside it returns that `None` early.
+        .filter_map(|line| {
+            let (shard, kind) = line.trim().split_once(' ')?;
+            let kind = kind.parse::<ArtifactKind>().ok()?;
+            // A Shard id has no Format suffix, so it is kept whole.
+            Some((Shard::from_archive_name(shard), kind))
+        })
         .collect()
 }
 
-/// Append a filename to the processed log.
-pub fn mark_processed(filename: &str) -> io::Result<()> {
-    mark_processed_in(filename, DEFAULT_OUTPUT_DIR)
-}
-
-/// Append a filename to the processed log in a custom output directory.
-pub fn mark_processed_in(filename: &str, output_dir: &str) -> io::Result<()> {
+/// Append one `<shard> <kind>` line to the processed log.
+fn mark_processed_in(shard: &Shard, kind: ArtifactKind, output_dir: &str) -> io::Result<()> {
     fs::create_dir_all(output_dir)?;
     let path = Path::new(output_dir).join(PROCESSED_FILENAME);
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)?;
-    writeln!(file, "{}", filename)
+    writeln!(file, "{} {}", shard, kind)
 }
 
-/// Load existing results from the JSON file.
-pub fn load_results() -> Result<Sightings, Box<dyn Error>> {
-    load_results_from(DEFAULT_OUTPUT_DIR)
+/// Save `kind`'s Sightings, then record `shard` as done for `kind`.
+///
+/// ## Ordering for crash safety
+///
+/// The two writes can't happen at once, so the order decides what a crash
+/// (or a failed write) between them leaves behind:
+///
+/// - save, then mark (this order): the Sightings are saved but the pair is
+///   not marked. The next run processes the Shard again for this kind, and
+///   the Sightings it finds are already in the file; `merge_sightings`
+///   skips them, so the redo costs time but changes nothing.
+/// - mark, then save: the pair is marked but its Sightings are lost, and
+///   no later run would ever look for them again.
+///
+/// `?` returns as soon as the save fails, so the mark is never written
+/// after a failed save.
+pub fn save_then_mark(
+    kind: ArtifactKind,
+    sightings: &Sightings,
+    shard: &Shard,
+    output_dir: &str,
+) -> Result<(), Box<dyn Error>> {
+    save_sightings_to(kind, sightings, output_dir)?;
+    mark_processed_in(shard, kind, output_dir)
+        .map_err(|err| format!("saved, but could not mark {} {}: {}", shard, kind, err))?;
+    Ok(())
 }
 
-/// Load results from a custom output directory.
-pub fn load_results_from(output_dir: &str) -> Result<Sightings, Box<dyn Error>> {
-    load_sightings(&Path::new(output_dir).join(RESULTS_FILENAME))
+/// Load `kind`'s saved Sightings from `output_dir`.
+pub fn load_sightings_from(
+    kind: ArtifactKind,
+    output_dir: &str,
+) -> Result<Sightings, Box<dyn Error>> {
+    load_sightings(&Path::new(output_dir).join(kind.output_filename()))
 }
 
 /// Load one kind's saved Sightings; a missing file means none yet.
@@ -547,111 +564,45 @@ fn load_sightings(path: &Path) -> Result<Sightings, Box<dyn Error>> {
     Ok(sightings)
 }
 
-/// Save the results map to the JSON file.
-pub fn save_results(results: &Sightings) -> Result<(), Box<dyn Error>> {
-    save_results_to(results, DEFAULT_OUTPUT_DIR)
-}
-
-/// Save results to a custom output directory.
-pub fn save_results_to(
-    results: &Sightings,
+/// Save `kind`'s Sightings to its file in `output_dir`.
+pub fn save_sightings_to(
+    kind: ArtifactKind,
+    sightings: &Sightings,
     output_dir: &str,
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(output_dir)?;
-    let path = Path::new(output_dir).join(RESULTS_FILENAME);
-    let json = serde_json::to_string_pretty(results)?;
-    fs::write(path, json)?;
+    let path = Path::new(output_dir).join(kind.output_filename());
+    let json = serde_json::to_string_pretty(sightings)?;
+    fs::write(&path, json).map_err(|err| format!("cannot write {}: {}", path.display(), err))?;
     Ok(())
 }
 
-/// Merge multiple result files into a single deduplicated result map.
+/// Merge `kind`'s Sightings saved in several output directories into one
+/// deduplicated map; `None` when no directory has a loadable file for
+/// `kind`.
 ///
 /// ## HPC merge step
 ///
-/// After a SLURM array job completes, each task has produced its own
-/// `onions.json` in a separate output directory. This function reads all
-/// of them and merges into a single map, deduplicating on `(page_url, shard)`
-/// pairs — the same `merge_sightings` used during per-archive merging in `main`.
-pub fn merge_results(
-    input_dirs: &[PathBuf],
-) -> Sightings {
-    let mut merged: Sightings = Sightings::new();
+/// After a SLURM array job completes, each task has saved its results in a
+/// separate output directory. The `merge` subcommand calls this once per
+/// Artifact kind, deduplicating on `(page_url, shard)` pairs with the same
+/// `merge_sightings` the crawl uses after each Archive. A file that can't
+/// be loaded is reported and skipped, so one bad task doesn't block the
+/// merge of all the others.
+pub fn merge_sightings_from(kind: ArtifactKind, input_dirs: &[PathBuf]) -> Option<Sightings> {
+    let mut merged: Option<Sightings> = None;
 
     for dir in input_dirs {
-        let path = dir.join(RESULTS_FILENAME);
-        if !path.exists() {
-            eprintln!("Warning: no results file in {}", dir.display());
-            continue;
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(err) => {
-                eprintln!("Warning: cannot read {}: {}", path.display(), err);
-                continue;
-            }
-        };
-        let partial: Sightings =
-            match serde_json::from_str(&content) {
-                Ok(m) => m,
-                Err(err) => {
-                    eprintln!("Warning: invalid JSON in {}: {}", path.display(), err);
-                    continue;
-                }
-            };
-
-        merge_sightings(&mut merged, partial);
-    }
-
-    merged
-}
-
-// ---------------------------------------------------------------------------
-// Favicon State Management
-// ---------------------------------------------------------------------------
-
-/// Load existing favicon results from a custom output directory.
-pub fn load_favicons_from(output_dir: &str) -> Result<Sightings, Box<dyn Error>> {
-    load_sightings(&Path::new(output_dir).join(FAVICONS_FILENAME))
-}
-
-/// Save favicon URL results to a custom output directory.
-pub fn save_favicons_to(
-    favicons: &Sightings,
-    output_dir: &str,
-) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(output_dir)?;
-    let path = Path::new(output_dir).join(FAVICONS_FILENAME);
-    let json = serde_json::to_string_pretty(favicons)?;
-    fs::write(path, json)?;
-    Ok(())
-}
-
-/// Merge favicon results from multiple output directories.
-pub fn merge_favicons(input_dirs: &[PathBuf]) -> Sightings {
-    let mut merged: Sightings = Sightings::new();
-
-    for dir in input_dirs {
-        let path = dir.join(FAVICONS_FILENAME);
+        let path = dir.join(kind.output_filename());
         if !path.exists() {
             continue;
         }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(err) => {
-                eprintln!("Warning: cannot read {}: {}", path.display(), err);
-                continue;
-            }
-        };
-        let partial: Sightings =
-            match serde_json::from_str(&content) {
-                Ok(m) => m,
-                Err(err) => {
-                    eprintln!("Warning: invalid JSON in {}: {}", path.display(), err);
-                    continue;
-                }
-            };
-
-        merge_sightings(&mut merged, partial);
+        match load_sightings(&path) {
+            // `get_or_insert_with` creates the map the first time a file
+            // is found, which is what turns `None` into `Some`.
+            Ok(partial) => merge_sightings(merged.get_or_insert_with(Sightings::new), partial),
+            Err(err) => eprintln!("Warning: {}, skipping it", err),
+        }
     }
 
     merged

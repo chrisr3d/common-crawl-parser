@@ -5,6 +5,7 @@
 // which kinds are in the list, so adding an Artifact kind means writing one
 // more `impl Extractor`, without touching the parsing loop.
 
+use clap::ValueEnum;
 use memchr::memmem;
 use regex::bytes::Regex;
 
@@ -52,11 +53,14 @@ pub trait Extractor {
 // ---------------------------------------------------------------------------
 
 /// Which search the onion extractor runs. Both find the same addresses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `ValueEnum` lets `--onion-engine` parse it, like `ArtifactKind`; the
+/// variants' doc comments become the values' help text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OnionEngine {
-    /// SIMD `memmem` search for `.onion`, then hand-written validation.
+    /// SIMD memmem search for ".onion", then hand-written validation
     Memchr,
-    /// `regex::bytes` with `onion_search::ONION_PATTERN`.
+    /// Regular expression (regex::bytes) over the raw bytes
     Regex,
 }
 

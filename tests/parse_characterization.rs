@@ -14,11 +14,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use cc_extract::{OnionEngine, Shard, Sighting, Transport};
 use common::{
     Snapshot, WarcBuilder, assert_all_agree, http_response, parse, parse_with_every_combination,
     write_archive,
 };
-use onion_crawler::{OnionEngine, Shard, Sighting, Transport};
 
 /// File name of the fixture Archive.
 const ARCHIVE_NAME: &str = "CC-MAIN-20250101000000-20250101010101-00000.warc.gz";

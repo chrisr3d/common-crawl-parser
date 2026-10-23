@@ -9,7 +9,7 @@
 // `mod common;`.
 //
 // Integration tests see the crate exactly like an outside user does: only
-// `pub` items, imported by crate name (`onion_crawler::...`).
+// `pub` items, imported by crate name (`cc_extract::...`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -22,12 +22,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use onion_crawler::{
+use cc_extract::{
     ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor, Shard, Sighting,
     Transport, parse_archive,
 };
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 // ---------------------------------------------------------------------------
 // Building WARC Archives
