@@ -1067,3 +1067,145 @@ function then converts lists of either: `fn sightings<T: Into<Sighting>>(sources
 Vec<T>) -> Vec<Sighting>`. Implementing `From` gives `Into` for free (the standard
 library has a blanket `impl<T, U: From<T>> Into<U> for T`), so bounds are usually
 written with `Into`, the direction the caller needs.
+
+---
+
+## Step 12: One `parse_archive`, Extractors per Artifact Kind
+
+### What we built
+
+The six `parse_warc*` functions are gone. Each one hard-wired the onion and favicon
+searches into its own copy of the record loop, so adding an Artifact kind meant editing
+all six. They are replaced by one function that only connects three independent choices:
+
+```rust
+pub fn parse_archive(
+    transport: Transport,                 // how the bytes arrive
+    shard: &Shard,                        // which Shard they belong to
+    extractors: &mut [Box<dyn Extractor>], // what to extract
+) -> Result<(), Box<dyn Error + Send + Sync>>
+```
+
+- **Transport** (`lib.rs`): `Disk(PathBuf)`, `Memory(Vec<u8>)` or `Mmap(PathBuf)`. Disk
+  and Memory share one streaming loop (`File` and `Cursor<Vec<u8>>` are both `Read`);
+  Mmap decompresses to a temporary `.warc` and uses the slice parser.
+- **Format** (`page_record.rs`): every record becomes a `PageRecord::Warc(WarcResponse)`
+  (page URL, crawl date, full HTTP response) that borrows the parser's bytes.
+  `split_http_response` / `is_html_content` moved here, behind `WarcResponse::html_body()`.
+- **Artifact kind** (`extractor.rs`): `trait Extractor` with one implementation per kind.
+  `OnionExtractor` searches the whole HTTP response, headers included, with either engine
+  (`OnionEngine::Memchr` or `OnionEngine::Regex`); `FaviconExtractor` scans HTML bodies.
+  The loop hands each record to every extractor and never names a kind.
+- **Domain types** (`artifact.rs`): `ArtifactKind`, `Shard` (the Archive file name without
+  `.warc.gz`), and `Sighting { page_url, date, shard }`, which replaces both `OnionSource`
+  and `FaviconSource`. The "same page already listed?" check, previously copied in nine
+  places, now lives in one place: `add_sightings` (during extraction) and `merge_sightings`
+  (per-Archive merge in `main`, and the `merge` subcommand) both call it.
+
+Behaviour changes, each visible as one line in the characterization test diff:
+
+- JSON shape: `{"page_url", "date", "shard"}` instead of `{"url", "date", "archive"}`;
+  `shard` drops the `.warc.gz` suffix. Existing output files are not converted, and
+  are no longer silently lost either: `load_results_from` / `load_favicons_from` used
+  to turn any file they couldn't parse into an empty map, which the next save then
+  wrote over the old results. They now return an error naming the file, and the crawl
+  stops before writing anything (`tests/output_state.rs`).
+- No root `/favicon.ico` guess for every HTML page (ADR-0003): only declared favicons.
+- Inline `data:` favicons are no longer part of the parse result. They were never saved
+  anyway; they come back as their own Artifact kind.
+- Both onion engines use ASCII word boundaries. The regex pattern is now
+  `(?-u:\b)([a-z2-7]{16}|[a-z2-7]{56})\.onion(?-u:\b)`, matching memchr's
+  `is_word_boundary_byte`. Before, `café3g2upl4pq6kufc4m.onion` was found by memchr but
+  not by the regex engine, whose Unicode `\b` counts `é` as a word character. The
+  fixture now contains such a case, and every Transport × engine pair must agree on it.
+
+The CLI is unchanged for now: `-s bytes` means the Regex engine, `-s memchr` the Memchr
+engine, `-s mmap` the Mmap Transport with Memchr, `-m` the Memory Transport. The next
+step replaces these with `--transport` and `--onion-engine`. `-s baseline` is gone: the
+original `warc`-crate parser is now a standalone benchmark,
+
+```sh
+cargo run --release --example baseline -- download/CC-NEWS-...warc.gz
+```
+
+On `CC-NEWS-20251001002341-04358.warc.gz` (1 GB, release build) all six Transport ×
+engine pairs agree: 1 onion and 4,884 favicon URLs (6,006 before: 1,122 root `/favicon.ico`
+URLs existed only as guesses, no page declared them). Disk and Memory take ~6.3 s each, Mmap ~9.7 s (it writes
+the decompressed copy first); the baseline example finds the same onion in 15.9 s.
+
+### Rust concepts introduced
+
+**Trait objects: `Box<dyn Extractor>`**
+`OnionExtractor` and `FaviconExtractor` are different types with different sizes, so a
+`Vec` can't hold both directly. `Box<dyn Extractor>` stores each on the heap behind a
+*fat pointer*: the data pointer plus a pointer to a *vtable*, a per-type table of the
+trait's methods. `extractor.extract(record, shard)` looks the method up in that table at
+runtime (*dynamic dispatch*). Generics (`fn parse_archive<E: Extractor>`) would dispatch
+statically and inline better, but one list could then hold only one extractor type; the
+set of kinds is chosen at runtime, which is exactly what trait objects are for. The cost,
+one indirect call per record per extractor, disappears next to gzip decompression.
+
+**`self: Box<Self>` receivers**
+`into_sightings(self: Box<Self>) -> Sightings` consumes the extractor to move its results
+out without cloning. A plain `self` receiver needs to know the concrete type's size,
+which a `dyn Extractor` doesn't have, so such a method couldn't be called on a trait
+object. Taking `self` *through the box* works: the box has a known size, and the method
+receives ownership of the heap value.
+
+**Enums with data**
+`Transport::Memory(Vec<u8>)` carries the downloaded bytes, `Transport::Disk(PathBuf)` the
+file to read. Each variant holds exactly what that way of reading needs, so a "memory"
+transport without bytes cannot be built and `parse_archive` has no invalid case to
+check. `match transport { Transport::Memory(data) => ... }` moves the bytes out of the
+enum and into the parser in the same step. `OnionExtractor` uses the same idea privately:
+the public `OnionEngine` is a plain choice (`Memchr` / `Regex`), turned once into an
+`OnionSearch` enum that holds the built `memmem::Finder` or compiled `Regex`.
+
+**Lifetimes in `PageRecord<'a>`**
+`PageRecord<'a>` holds `&'a str` and `&'a [u8]` instead of owned `String`s and `Vec`s.
+`'a` names how long the borrowed bytes live, and the compiler rejects any use of a
+`PageRecord` after its source is gone. One type now serves both parsers: on the
+streaming path it borrows the current `WarcRecord`'s buffers, on the mmap path it borrows
+a region of the mapped file. In both cases it lives for one loop iteration, and nothing is
+copied to build it. On the mmap path `String::from_utf8_lossy` returns a `Cow<str>` that
+borrows the header bytes whenever they are valid UTF-8, so even the URL is usually not
+copied (the old code called `.to_string()` on every record).
+
+**Exhaustive `match` on a one-variant enum**
+`PageRecord` has a single variant today, yet the extractors `match` on it rather than
+reaching into it. When a `Wat` variant is added, every such `match` stops compiling until
+it handles WAT records: the compiler lists exactly the places a new Format affects.
+
+**The newtype pattern: `Shard(String)`**
+A tuple struct wrapping one `String`. At runtime it is a `String`; to the compiler it is
+a different type, so an Archive file name can't be passed where a Shard is expected, and
+`Shard::from_archive_name` is the one place the `.warc.gz` suffix is stripped. `serde`
+serializes a newtype as its inner value, so in JSON a Shard is a plain string.
+
+**Re-exports with `pub use`**
+`lib.rs` declares the new modules `pub mod artifact;` etc. and also re-exports their main
+types: `pub use artifact::{Shard, Sighting, ...};`. Callers write
+`use onion_crawler::Sighting;` instead of `onion_crawler::artifact::Sighting`, and the
+module layout can change later without breaking them.
+
+**Dev-dependencies and examples**
+Each file in `examples/` is a small program of its own, linked against the library like
+an outside crate (`use onion_crawler::onion_search::ONION_PATTERN;`). Cargo builds
+examples only on request (`cargo run --example baseline`, and `cargo test` builds them
+to check they compile). Examples, tests and benchmarks may use `[dev-dependencies]`;
+the library and binary may not. Moving `warc` there means `cargo build` no longer
+compiles it, while the benchmark that needs it still works.
+
+**Errors instead of defaults: `unwrap_or_default` vs `?`**
+`serde_json::from_str(&content).unwrap_or_default()` reads as "use an empty map if
+parsing fails", which sounds harmless until the empty map is saved over the file. The
+loaders now return `Result<Sightings, Box<dyn Error>>`, and `?` passes a failure up to
+`main`, which decides to stop. `.map_err(|err| format!("cannot load {}: {}", path, err))?`
+adds the file name on the way: `format!` builds a `String`, and `?` converts it into a
+`Box<dyn Error>` through the standard library's `From<String>` impl. A default is
+the right fallback only when losing the data it replaces is acceptable.
+
+**ASCII word boundaries in `regex`: `(?-u:\b)`**
+`(?-u:...)` turns Unicode mode off for the enclosed part of the pattern, so `\b` checks
+only `[0-9A-Za-z_]` on each side. It is also cheaper: a Unicode `\b` can force the
+`regex` crate off its fast DFA when the input contains non-ASCII bytes.

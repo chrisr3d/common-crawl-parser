@@ -63,7 +63,6 @@ cargo run -- warc.paths -l 3                   # process up to 3 archives
 cargo run -- warc.paths -j 2                   # 2 concurrent downloads (default: CPU cores)
 cargo run -- warc.paths -d                     # delete archive after parsing
 cargo run -- warc.paths -s memchr              # select parsing strategy (default)
-cargo run -- warc.paths -s baseline            # original warc crate + regex
 cargo run -- warc.paths -s bytes               # custom parser + regex::bytes
 cargo run -- warc.paths -s mmap                # mmap + memchr (needs disk space)
 cargo run -- warc.paths -m                     # parse from memory (no disk I/O)
@@ -72,15 +71,17 @@ cargo run -- warc.paths.gz -l 3 -j 2 -d       # combined (short flags)
 cargo run -- warc.paths.gz -l 3 -j 2 -m -s memchr  # combined with stream mode
 cargo run -- warc.paths --limit 3 --jobs 2 --delete --strategy memchr  # combined (long flags)
 cargo run -- --help                            # show usage and all options
+cargo run --release --example baseline -- download/X.warc.gz  # original parser, as a benchmark
 ```
 
 ## Parsing Strategies
 
-Four ripgrep-inspired optimization layers, selectable at runtime via `-s` / `--strategy`:
+Three ripgrep-inspired optimization layers, selectable at runtime via `-s` / `--strategy`.
+The original approach (`warc` crate + `regex::Regex` on UTF-8 strings, ~16s/GB) is kept
+as a benchmark: `cargo run --release --example baseline -- <archive.warc.gz>`.
 
 | Strategy | Technique | Speedup vs baseline |
 |----------|-----------|---------------------|
-| `baseline` | `warc` crate + `regex::Regex` on UTF-8 strings | 1x (~16s/GB) |
 | `bytes` | Custom WARC parser + `regex::bytes` on raw `&[u8]` | ~1.5-2x |
 | `memchr` (default) | Custom parser + SIMD `memmem` literal search | ~3-5x |
 | `mmap` | Decompress to temp file + mmap + zero-copy memchr | ~3-6x |
@@ -90,7 +91,7 @@ literal search replaces the regex engine, `zlib-ng` backend for faster gzip deco
 
 The `bytes` and `memchr` strategies also support `--stream` / `-m` mode, which downloads
 archives into memory and parses from a `Cursor<Vec<u8>>` instead of a file — eliminating
-all disk I/O. Incompatible strategies (`baseline`, `mmap`) fall back to disk mode with a
+all disk I/O. The `mmap` strategy needs a file, so it falls back to disk mode with a
 warning. Memory cost: ~800 MB per archive × concurrent jobs. Layered resource guards
 automatically cap concurrency: jobs are limited to 2× CPU cores, and in stream mode,
 further limited by available RAM (queried at startup on macOS and Linux) to prevent OOM.
@@ -98,19 +99,22 @@ further limited by available RAM (queried at startup on macOS and Linux) to prev
 ## Output Format
 
 Results are stored in `output/onions.json` as nested JSON. Each `.onion` address maps to
-a list of sources with the clearnet URL where it was found, the crawl date, and the archive:
+a list of Sightings: the clearnet page where it was found, the crawl date, and the Shard
+(the Archive file name without `.warc.gz`):
 
 ```json
 {
   "example1234567890.onion": [
     {
-      "url": "https://example.com/page",
+      "page_url": "https://example.com/page",
       "date": "2024-09-15T12:34:56Z",
-      "archive": "CC-NEWS-20240915.warc.gz"
+      "shard": "CC-NEWS-20240915"
     }
   ]
 }
 ```
 
-Source metadata is extracted from WARC headers (`WARC-Target-URI`, `WARC-Date`) during
-parsing. Results are deduplicated on `(url, archive)` pairs.
+Sighting metadata is extracted from WARC headers (`WARC-Target-URI`, `WARC-Date`) during
+parsing. Results are deduplicated on `(page_url, shard)` pairs. Files written before this
+shape (with `url` / `archive` fields) are not converted: a run that finds one in its output
+directory stops with an error instead of overwriting it.

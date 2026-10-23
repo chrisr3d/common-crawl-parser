@@ -1,142 +1,64 @@
-# onion-crawler
+# CLAUDE.md
 
-Rust learning project that extracts `.onion` addresses from Common Crawl WARC archives.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build & Run
+## Project
+
+Rust learning project that extracts `.onion` addresses from Common Crawl WARC archives. Teaching-oriented: code should be idiomatic Rust with clear comments explaining concepts. Edition 2024 (rustc 1.91+). Progress tracked in `documentation/PROGRESS.md`.
+
+## Commands
 
 ```sh
-cargo build                                    # compile
-cargo run -- warc.paths                        # download & parse all archives
-cargo run -- warc.paths.gz                     # same, from gzipped paths file
-cargo run -- warc.paths -l 3                   # process up to 3 archives
-cargo run -- warc.paths -j 2                   # 2 concurrent downloads (default: CPU cores)
-cargo run -- warc.paths -d                     # delete archive after parsing
-cargo run -- warc.paths -s memchr              # select parsing strategy (default)
-cargo run -- warc.paths -s baseline            # original warc crate + regex
-cargo run -- warc.paths -s bytes               # custom parser + regex::bytes
-cargo run -- warc.paths -s mmap                # mmap + memchr (needs disk space)
-cargo run -- warc.paths -m                     # parse from memory (no disk I/O)
-cargo run -- warc.paths -s bytes --stream      # stream mode with bytes strategy
-cargo run -- warc.paths.gz -l 3 -j 2 -d       # combined (short flags)
-cargo run -- warc.paths.gz -l 3 -j 2 -m -s memchr  # combined with stream mode
-cargo run -- warc.paths --limit 3 --jobs 2 --delete --strategy memchr  # combined (long flags)
-cargo run -- --help                            # show usage and all options
+cargo build                    # compile (debug)
+cargo build --release          # compile (optimized)
+cargo test                     # run all tests
+cargo test --lib               # run only library tests (skip integration tests)
+cargo clippy                   # lint
+cargo fmt                      # format
+cargo fmt -- --check           # check formatting without modifying
+cargo run -- warc.paths -l 3   # process 3 archives (needs warc.paths file)
+cargo run -- --help            # show all CLI options
+cargo run --release --example baseline -- <archive.warc.gz>  # original warc-crate parser, as a benchmark
 ```
 
-## Constraints
+Key CLI flags: `-l` (limit archives), `-j` (concurrent jobs), `-d` (delete after parse), `-s` (strategy: bytes/memchr/mmap), `-m` (stream from memory).
 
-- **Teaching project**: code should be idiomatic Rust with clear comments explaining concepts
-- **Edition 2024** (rustc 1.91+)
-- Progress tracked in `PROGRESS.md`
+## Architecture
 
-## Current State
+Parsing separates three independent choices: Transport (how bytes arrive), Format (how records are read, WARC only for now), Artifact kind (what is extracted). Vocabulary in `GLOSSARY.md`.
 
-Steps 1–9 complete: full async pipeline from reading WARC paths → concurrent HTTP
-downloads → pipelined WARC parsing → `.onion` extraction → deduplication → JSON
-output. Three-state processing model (processed → skip, downloaded → parse, missing →
-download + parse). Multiple archives download in parallel (configurable `-j N`,
-default: CPU core count), and parsing starts immediately when each download completes via
-`spawn_blocking`. Layered resource guards cap concurrency at 2× CPU cores and available
-RAM (stream mode). Results stored in `output/onions.json` as nested JSON with source
-metadata (URL, date, archive), processing state tracked in `output/processed.log`.
+- **`src/main.rs`** -- CLI parsing (`clap` derive), pipeline orchestration, concurrent task dispatch via `buffer_unordered`. Maps `-s`/`-m` to a `Transport` + `OnionEngine` and builds the extractors. Contains platform-specific `get_available_memory()` behind `#[cfg(target_os)]`.
+- **`src/lib.rs`** -- `Transport { Disk(PathBuf), Memory(Vec<u8>), Mmap(PathBuf) }` and `parse_archive(transport, &shard, &mut extractors)`, the one parsing loop; async download (`reqwest`); state management (`output/processed.log`, `output/onions.json`, `output/favicons.json`). Re-exports the main types at the crate root.
+- **`src/artifact.rs`** -- `ArtifactKind`, `Shard` (Archive name without `.warc.gz`), `Sighting { page_url, date, shard }`, `Sightings` map, and the only dedup logic (`add_sightings`, `merge_sightings`).
+- **`src/extractor.rs`** -- `trait Extractor` (one boxed extractor per kind per Shard), `OnionExtractor` (engine `Memchr | Regex`), `FaviconExtractor`. The parsing loop never names a kind.
+- **`src/page_record.rs`** -- `PageRecord<'a>` (one variant per Format, `Warc(WarcResponse)` today) borrowing the parser's bytes; HTML detection via `WarcResponse::html_body()`.
+- **`src/warc_parser.rs`** -- Custom byte-level WARC record parser. `WarcRecordIter<R: BufRead>` for streaming, `WarcSliceIter<'a>` for mmap. Skips non-response record bodies for performance.
+- **`src/onion_search.rs`** -- `ONION_PATTERN` (ASCII word boundaries) and the two engines: `search_regex_bytes()` (regex::bytes) and `search_memchr()` (SIMD memmem). Both return `Vec<String>`.
+- **`src/favicon_search.rs`** -- Byte-level `<link>`/`<meta>` favicon scanner. Declared favicons only, no root `/favicon.ico` guess (ADR-0003).
 
-Code is split into four files:
-- `src/main.rs` — CLI parsing + pipeline orchestration + strategy dispatch
-- `src/lib.rs` — download, parse functions (4 strategies + 2 in-memory variants), and state management
-- `src/warc_parser.rs` — custom byte-level WARC parser (streaming + mmap slice)
-- `src/onion_search.rs` — onion extraction strategies (regex-bytes, memchr)
+**Data flow**: Read paths file -> filter already-processed -> concurrent download (async) -> `spawn_blocking` parse (CPU-bound) -> merge results sequentially -> save JSON.
 
-CLI uses `clap` derive for argument parsing with short flags (`-l`, `-j`, `-d`, `-s`, `-m`)
-and auto-generated `--help`. Input paths file is a required positional argument and
-supports gzip-compressed `.gz` files (decompressed transparently via `libflate`).
-Per-archive timing reports download and parse durations, with averages in the final summary.
+**Parsing strategies** (`-s`, interim until `--transport` / `--onion-engine`): `bytes` (Disk + Regex engine), `memchr` (Disk + Memchr, default), `mmap` (Mmap + Memchr). `-m` switches `bytes`/`memchr` to the Memory Transport. The original `warc`-crate parser lives in `examples/baseline.rs` (`warc` is a dev-dependency).
 
-### Parsing Strategies (Step 7)
+**Output**: `output/onions.json` and `output/favicons.json` -- nested JSON mapping each Artifact to a list of `Sighting` (page_url, date, shard). Deduplicated on `(page_url, shard)` pairs.
 
-Four ripgrep-inspired parsing strategies, selectable at runtime via `-s` / `--strategy`:
+## Performance notes
 
-| Strategy | Parser | Search | Performance |
-|----------|--------|--------|-------------|
-| `baseline` | `warc` crate | `regex::Regex` on UTF-8 `String` | ~16s/GB (reference) |
-| `bytes` | Custom streaming | `regex::bytes::Regex` on `&[u8]` | ~1.5-2x faster |
-| `memchr` (default) | Custom streaming | SIMD `memmem` literal search | ~3-5x faster |
-| `mmap` | Custom slice (mmap) | SIMD `memmem` + zero-copy bodies | ~3-6x faster |
+- `[profile.dev.package."*"] opt-level = 2` optimizes dependencies in debug builds
+- Regex must be case-sensitive -- `(?i)` with `\b` causes 1000x+ slowdown
+- `flate2` uses `zlib-ng` backend for SIMD gzip decompression
+- Resource guards cap concurrency at `min(requested_jobs, 2x CPU cores, available_RAM / 1GB)`
 
-Key optimizations over the baseline:
-- **Custom WARC parser** skips non-response record bodies (~60% of data never read)
-- **`regex::bytes`** eliminates `String::from_utf8_lossy` allocation per record
-- **`memchr::memmem`** uses SIMD to scan for `.onion` literals at 16-32 bytes/cycle,
-  replacing the regex NFA engine entirely
-- **mmap variant** decompresses to temp file, memory-maps it, returns zero-copy `&[u8]`
-  body slices (trades disk space for speed)
-- **`flate2` with `zlib-ng`** backend for SIMD-optimized gzip decompression
+## Agent skills
 
-### WARC Metadata Extraction (Step 8)
+### Issue tracker
 
-Each `.onion` address is stored with its source context as an `OnionSource` struct:
-`url` (WARC-Target-URI — the crawled page), `date` (WARC-Date — crawl timestamp),
-and `archive` (the WARC filename). Output is nested JSON: each onion maps to a list
-of `OnionSource` objects, deduplicated on `(url, archive)` pairs.
+Issues live as local markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
 
-The custom WARC parser (`warc_parser.rs`) extracts `WARC-Target-URI` and `WARC-Date`
-headers alongside `WARC-Type` and `Content-Length`. The baseline strategy reads them
-from the `warc` crate's parsed headers. `OnionSource` derives `Serialize`/`Deserialize`
-via `serde` for JSON persistence. `load_results()` gracefully falls back to an empty
-map if the file contains the old format.
+### Triage labels
 
-### In-Memory Streaming Mode (Step 9)
+Default five canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), recorded as a `Status:` line in each issue file. See `docs/agents/triage-labels.md`.
 
-The `--stream` / `-m` flag downloads archives into a `Vec<u8>` in memory instead of
-writing to disk, then parses directly from that buffer using `std::io::Cursor`. This
-eliminates all disk I/O in the download/parse pipeline.
+### Domain docs
 
-Compatible with `bytes` and `memchr` strategies (which use the generic
-`WarcRecordIter<R: BufRead>` parser). Incompatible strategies (`baseline`, `mmap`)
-print a warning and fall back to disk mode. Memory cost: ~800 MB per archive ×
-concurrent jobs.
-
-Key concepts: `Cursor<Vec<u8>>` as a `Read` adapter (same interface as `File`),
-`Vec::with_capacity` pre-allocation from `Content-Length`, zero-cost ownership
-transfer of the buffer via `move` into `spawn_blocking`.
-
-### Resource Guards (Step 9b)
-
-Layered concurrency caps prevent oversubscription and OOM:
-
-1. **CPU cap**: `min(config.jobs, 2 × cpu_cores)` — beyond 2× cores, `spawn_blocking`
-   tasks queue up adding context switching overhead without throughput gain.
-2. **RAM cap** (stream mode only): `min(capped_jobs, available_ram / 1 GB)` — each
-   in-memory archive costs ~800 MB–1 GB; exceeding available RAM causes OOM.
-3. **`buffer_unordered(effective_jobs)`** — natural backpressure: finished jobs free
-   their buffers before new ones start.
-
-`effective_jobs = min(config.jobs, 2 × cores, available_ram / 1 GB)` — the most
-restrictive limit wins. In disk mode, the RAM cap is skipped.
-
-`get_available_memory()` uses `#[cfg(target_os)]` conditional compilation with three
-platform-specific implementations (all safe Rust, no `unsafe`):
-- **macOS**: `std::process::Command` running `sysctl -n` for page size + free/speculative/purgeable pages
-- **Linux**: parsing `MemAvailable` from `/proc/meminfo`
-- **Other**: returns `None` (skips RAM check, proceeds with CPU-capped jobs)
-
-Dependencies: `clap` (CLI parsing), `reqwest` (async HTTP), `tokio` (async runtime),
-`futures` (stream utilities), `warc` (baseline WARC parsing), `regex`, `serde`,
-`serde_json`, `libflate` (gzip for paths file), `flate2` with `zlib-ng` (gzip for
-custom parser), `memchr` (SIMD literal search), `memmap2` (memory-mapped I/O).
-
-Performance: `[profile.dev.package."*"] opt-level = 2` optimizes dependencies in debug
-builds. Regex is case-sensitive (`(?i)` flag causes 1000x+ slowdown with `\b` boundaries).
-With `memchr` strategy + `zlib-ng`, release build parses an 864MB archive in ~5.6s
-(vs ~4.3s for `rg -z` on the same file).
-
-## Roadmap
-
-1. ~~Project scaffolding — read WARC paths file~~ (done)
-2. ~~HTTP download of WARC archives~~ (done)
-3. ~~Gzip decompression + WARC record parsing~~ (done)
-4. ~~Regex extraction of `.onion` addresses~~ (done)
-5. ~~Deduplication and output formatting~~ (done)
-6. ~~Concurrent downloads with async/tokio~~ (done)
-7. ~~Ripgrep-style parsing strategies~~ (done)
-8. ~~WARC metadata extraction~~ (done)
-9. ~~In-memory streaming mode~~ (done)
+Single-context: one `GLOSSARY.md` + `docs/adr/` at repo root. See `docs/agents/domain.md`.
