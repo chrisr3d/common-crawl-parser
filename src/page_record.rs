@@ -109,10 +109,49 @@ fn is_html_content(http_headers: &[u8]) -> bool {
             // Check for text/html or application/xhtml anywhere in the value
             // (it may include charset, e.g. "text/html; charset=utf-8").
             let lower: Vec<u8> = value.iter().map(|b| b.to_ascii_lowercase()).collect();
-            return lower.windows(9).any(|w| w == b"text/html")
-                || lower.windows(16).any(|w| w == b"application/xhtml");
+            // The window size comes from the needle itself: a hand-counted
+            // `windows(16)` for the 17-byte "application/xhtml" never
+            // matched, so XHTML pages were skipped.
+            let contains = |needle: &[u8]| lower.windows(needle.len()).any(|w| w == needle);
+            return contains(b"text/html") || contains(b"application/xhtml");
         }
     }
     false
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `html_body()` of a response with this `Content-Type` and body `<p>`.
+    fn html_body_for(content_type: &str) -> Option<Vec<u8>> {
+        let http_response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\r\n<p>");
+        let response = WarcResponse {
+            page_url: "https://example.com/",
+            date: "2025-01-01T00:00:00Z",
+            http_response: http_response.as_bytes(),
+        };
+        response.html_body().map(<[u8]>::to_vec)
+    }
+
+    #[test]
+    fn html_and_xhtml_responses_have_an_html_body() {
+        assert_eq!(
+            html_body_for("text/html; charset=utf-8").as_deref(),
+            Some(&b"<p>"[..])
+        );
+        assert_eq!(
+            html_body_for("application/xhtml+xml").as_deref(),
+            Some(&b"<p>"[..])
+        );
+    }
+
+    #[test]
+    fn other_responses_have_no_html_body() {
+        assert_eq!(html_body_for("text/plain"), None);
+    }
+}
