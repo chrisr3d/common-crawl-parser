@@ -12,7 +12,6 @@
 // `pub` items, imported by crate name (`onion_crawler::...`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
 use std::fmt::Debug;
 // Two traits named `Write`: `io::Write` lets `write!` target a `Vec<u8>`,
 // `fmt::Write` lets it target a `String`. `as _` imports the second one's
@@ -26,11 +25,9 @@ use std::time::Instant;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use onion_crawler::{
-    FaviconSource, OnionSource, ParseResult, parse_warc, parse_warc_bytes,
-    parse_warc_bytes_from_memory, parse_warc_memchr, parse_warc_memchr_from_memory,
-    parse_warc_mmap,
+    ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor, Shard, Sighting,
+    Transport, parse_archive,
 };
-use regex::Regex;
 
 // ---------------------------------------------------------------------------
 // Building WARC Archives
@@ -40,10 +37,9 @@ use regex::Regex;
 ///
 /// Common Crawl compresses every record as its own gzip member and
 /// concatenates the members into one `.warc.gz` file. A plain `GzDecoder`
-/// stops after the first member; the parsers must use `MultiGzDecoder` (and
-/// the `warc` crate libflate's `MultiDecoder`) to see every record. Building
-/// the fixture the same way means a reader that forgets this only sees the
-/// first record, and the tests catch it.
+/// stops after the first member; the parser must use `MultiGzDecoder` to see
+/// every record. Building the fixture the same way means a reader that
+/// forgets this only sees the first record, and the tests catch it.
 ///
 /// The methods take `self` by value and return it (a *consuming builder*),
 /// so a whole Archive reads as one chain of calls:
@@ -67,8 +63,7 @@ impl WarcBuilder {
     /// Append one record, compressed as its own gzip member.
     ///
     /// `Content-Length` is computed from `block`, and every record gets a
-    /// unique `WARC-Record-ID`: the `warc` crate (baseline parser) rejects
-    /// records without one.
+    /// unique `WARC-Record-ID`, as the WARC format requires.
     fn record(
         mut self,
         warc_type: &str,
@@ -172,7 +167,7 @@ pub fn http_response(headers: &[(&str, &str)], body: &str) -> Vec<u8> {
 /// `CARGO_TARGET_TMPDIR` is set by Cargo only when compiling integration
 /// tests and benchmarks: a scratch directory inside `target/`. `env!` reads
 /// it at compile time. Tests run in parallel threads, so each test gets its
-/// own subdirectory; the `mmap` strategy also writes a decompressed `.warc`
+/// own subdirectory; the `Mmap` Transport also writes a decompressed `.warc`
 /// next to the Archive, which must not collide either.
 pub fn write_archive(test_name: &str, file_name: &str, bytes: &[u8]) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test_name);
@@ -185,142 +180,86 @@ pub fn write_archive(test_name: &str, file_name: &str, bytes: &[u8]) -> PathBuf 
 }
 
 // ---------------------------------------------------------------------------
-// Comparing parse results
+// Parsing and comparing results
 // ---------------------------------------------------------------------------
 
-/// One page an Artifact was seen on.
-///
-/// The crate's `OnionSource` and `FaviconSource` don't implement `PartialEq`,
-/// and issue 03 replaces both with a single type. Converting both to this
-/// local type keeps the pinned expectations independent of that change.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Sighting {
-    pub page_url: String,
-    pub date: String,
-    pub archive: String,
-}
-
-impl Sighting {
-    pub fn new(page_url: &str, date: &str, archive: &str) -> Self {
-        Self {
-            page_url: page_url.to_string(),
-            date: date.to_string(),
-            archive: archive.to_string(),
-        }
-    }
-}
-
-impl From<OnionSource> for Sighting {
-    fn from(source: OnionSource) -> Self {
-        Self {
-            page_url: source.url,
-            date: source.date,
-            archive: source.archive,
-        }
-    }
-}
-
-impl From<FaviconSource> for Sighting {
-    fn from(source: FaviconSource) -> Self {
-        Self {
-            page_url: source.page_url,
-            date: source.date,
-            archive: source.archive,
-        }
-    }
-}
-
-/// Convert a list of library sources, keeping their order.
-///
-/// Generic over any `T` that converts into a `Sighting`, so the same
-/// function serves both `OnionSource` and `FaviconSource`.
-fn sightings<T: Into<Sighting>>(sources: Vec<T>) -> Vec<Sighting> {
-    sources.into_iter().map(Into::into).collect()
-}
-
-/// A `ParseResult` in a form that can be compared with `==` and printed.
+/// What one `parse_archive` run found, in a form that can be compared with
+/// `==` and printed.
 ///
 /// `BTreeMap` instead of `HashMap`: same equality, but `Debug` prints keys in
 /// sorted order, so two failing runs print the same diff.
-///
-/// Inline favicons are keyed by their decoded bytes, not by the crate's
-/// hash key: that key comes from `DefaultHasher`, whose algorithm the
-/// standard library may change between Rust releases.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub onions: BTreeMap<String, Vec<Sighting>>,
     pub favicon_urls: BTreeMap<String, Vec<Sighting>>,
-    pub inline_favicons: BTreeMap<Vec<u8>, Vec<Sighting>>,
 }
 
-impl From<ParseResult> for Snapshot {
-    fn from(result: ParseResult) -> Self {
-        Self {
-            onions: result
-                .onions
-                .into_iter()
-                .map(|(onion, sources)| (onion, sightings(sources)))
-                .collect(),
-            favicon_urls: result
-                .favicon_urls
-                .into_iter()
-                .map(|(url, sources)| (url, sightings(sources)))
-                .collect(),
-            inline_favicons: result
-                .inline_favicons
-                .into_values()
-                .map(|(bytes, sources)| (bytes, sightings(sources)))
-                .collect(),
-        }
+/// Parse one Archive with both extractors and collect what they found.
+pub fn parse(transport: Transport, shard: &Shard, onion_engine: OnionEngine) -> Snapshot {
+    let mut extractors: Vec<Box<dyn Extractor>> = vec![
+        Box::new(OnionExtractor::new(onion_engine)),
+        Box::new(FaviconExtractor::new()),
+    ];
+    parse_archive(transport, shard, &mut extractors)
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+
+    let mut snapshot = Snapshot {
+        onions: BTreeMap::new(),
+        favicon_urls: BTreeMap::new(),
+    };
+    for extractor in extractors {
+        // A new Artifact kind makes this `match` non-exhaustive, so the
+        // compiler asks where its results belong.
+        let found = match extractor.kind() {
+            ArtifactKind::Onion => &mut snapshot.onions,
+            ArtifactKind::Favicon => &mut snapshot.favicon_urls,
+        };
+        found.extend(extractor.into_sightings());
     }
+    snapshot
 }
 
-/// The onion pattern `main.rs` compiles and passes to the baseline `parse_warc`.
-const ONION_PATTERN: &str = r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b";
-
-type ParseOutcome = Result<ParseResult, Box<dyn Error + Send + Sync>>;
-
-/// Parse one Archive with each of the six public parse functions.
+/// Parse one Archive with every Transport and both onion engines.
 ///
-/// The first entry, `memchr`, is the default strategy and the reference
-/// `assert_all_agree` compares the others against. The in-memory variants
-/// read the file only when their turn comes, so a real ~1 GB Archive is
-/// held in RAM once at a time.
-pub fn parse_with_every_function(path: &Path) -> Vec<(&'static str, Snapshot)> {
-    let archive_name = path.file_name().unwrap().to_string_lossy().into_owned();
-    let onion_re = Regex::new(ONION_PATTERN).unwrap();
-    let read = || fs::read(path).unwrap();
+/// The first entry, `disk/memchr`, is the default and the reference
+/// `assert_all_agree` compares the others against. The `memory` runs read
+/// the file only when their turn comes, so a real ~1 GB Archive is held in
+/// RAM once at a time.
+pub fn parse_with_every_combination(path: &Path) -> Vec<(String, Snapshot)> {
+    let archive_name = path.file_name().unwrap().to_string_lossy();
+    let shard = Shard::from_archive_name(&archive_name);
 
-    // `vec![...]` evaluates its elements in order, so the six parses run
-    // one after another.
-    vec![
-        timed("memchr", || parse_warc_memchr(path)),
-        timed("bytes", || parse_warc_bytes(path)),
-        timed("mmap", || parse_warc_mmap(path)),
-        timed("memchr/memory", || {
-            parse_warc_memchr_from_memory(read(), &archive_name)
-        }),
-        timed("bytes/memory", || {
-            parse_warc_bytes_from_memory(read(), &archive_name)
-        }),
-        timed("baseline", || parse_warc(path, &onion_re)),
-    ]
+    let mut results = Vec::new();
+    for (engine, engine_name) in [
+        (OnionEngine::Memchr, "memchr"),
+        (OnionEngine::Regex, "regex"),
+    ] {
+        results.push(timed(format!("disk/{engine_name}"), || {
+            parse(Transport::Disk(path.to_path_buf()), &shard, engine)
+        }));
+        results.push(timed(format!("memory/{engine_name}"), || {
+            parse(Transport::Memory(fs::read(path).unwrap()), &shard, engine)
+        }));
+        results.push(timed(format!("mmap/{engine_name}"), || {
+            parse(Transport::Mmap(path.to_path_buf()), &shard, engine)
+        }));
+    }
+    results
 }
 
-/// Run one parse function, report its counts and duration on stderr.
+/// Run one parse, report its counts and duration on stderr.
 ///
 /// The test harness captures stderr unless run with `-- --nocapture`.
-fn timed(name: &'static str, parse: impl FnOnce() -> ParseOutcome) -> (&'static str, Snapshot) {
+fn timed(name: String, parse: impl FnOnce() -> Snapshot) -> (String, Snapshot) {
     let start = Instant::now();
-    let result = parse().unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+    let snapshot = parse();
     eprintln!(
-        "{name:>14}: {} onion(s), {} favicon URL(s), {} inline favicon(s) in {:.1?}",
-        result.onions.len(),
-        result.favicon_urls.len(),
-        result.inline_favicons.len(),
+        "{name:>13}: {} onion(s), {} favicon URL(s) in {:.1?}",
+        snapshot.onions.len(),
+        snapshot.favicon_urls.len(),
         start.elapsed()
     );
-    (name, Snapshot::from(result))
+    (name, snapshot)
 }
 
 /// Panic unless every Snapshot equals the first one.
@@ -328,7 +267,7 @@ fn timed(name: &'static str, parse: impl FnOnce() -> ParseOutcome) -> (&'static 
 /// On a real Archive the maps hold tens of thousands of entries, so instead
 /// of `assert_eq!` dumping all of them, the message lists only the first few
 /// differing keys of each map.
-pub fn assert_all_agree(results: &[(&str, Snapshot)]) {
+pub fn assert_all_agree(results: &[(String, Snapshot)]) {
     let (reference_name, reference) = &results[0];
     let report: String = results[1..]
         .iter()
@@ -342,42 +281,35 @@ pub fn assert_all_agree(results: &[(&str, Snapshot)]) {
                 &snapshot.favicon_urls,
                 &mut section,
             );
-            diff_map(
-                "inline_favicons",
-                &reference.inline_favicons,
-                &snapshot.inline_favicons,
-                &mut section,
-            );
             section
         })
         .collect();
-    assert!(report.is_empty(), "parse functions disagree:\n{report}");
+    assert!(report.is_empty(), "parse runs disagree:\n{report}");
 }
 
 /// How many differing keys per map `assert_all_agree` prints.
 const MAX_EXAMPLES: usize = 5;
 
 /// Append the keys whose sightings differ between `expected` and `actual`.
-fn diff_map<K: Ord + Debug>(
+fn diff_map(
     field: &str,
-    expected: &BTreeMap<K, Vec<Sighting>>,
-    actual: &BTreeMap<K, Vec<Sighting>>,
+    expected: &BTreeMap<String, Vec<Sighting>>,
+    actual: &BTreeMap<String, Vec<Sighting>>,
     out: &mut String,
 ) {
-    let keys: BTreeSet<&K> = expected.keys().chain(actual.keys()).collect();
-    let differing: Vec<&K> = keys
+    let keys: BTreeSet<&String> = expected.keys().chain(actual.keys()).collect();
+    let differing: Vec<&String> = keys
         .into_iter()
-        .filter(|key| expected.get(key) != actual.get(key))
+        .filter(|key| expected.get(*key) != actual.get(*key))
         .collect();
 
     // `writeln!` into a `String` (via `fmt::Write`) cannot fail, hence `unwrap`.
     for key in differing.iter().take(MAX_EXAMPLES) {
         writeln!(
             out,
-            "  {field} {}\n    expected: {}\n    actual:   {}",
-            shorten(key),
-            shorten(&expected.get(key)),
-            shorten(&actual.get(key)),
+            "  {field} {key}\n    expected: {}\n    actual:   {}",
+            shorten(&expected.get(*key)),
+            shorten(&actual.get(*key)),
         )
         .unwrap();
     }
@@ -391,7 +323,8 @@ fn diff_map<K: Ord + Debug>(
     }
 }
 
-/// Longest `Debug` text `shorten` keeps (favicon bytes can be KBs).
+/// Longest `Debug` text `shorten` keeps (a popular favicon has thousands of
+/// Sightings).
 const MAX_DEBUG_CHARS: usize = 200;
 
 /// `Debug`-format a value, cut to `MAX_DEBUG_CHARS` characters.

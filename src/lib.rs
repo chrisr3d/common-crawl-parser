@@ -1,80 +1,45 @@
 // onion-crawler library — download, parsing, and state management
 //
-// This module contains all the feature-specific code:
+// This module ties the pieces together:
 //   - Downloading WARC archives from Common Crawl (async with reqwest)
-//   - Parsing WARC records and extracting .onion addresses (multiple strategies)
+//   - `parse_archive`: reading every record of an Archive once and handing
+//     it to each extractor
 //   - Persistent state: processed log and results JSON
 //
-// ## Parsing strategies (ripgrep-inspired optimization layers)
+// ## Three independent choices
 //
-// Four strategies are available, selectable at runtime via `--strategy`:
-//   - Baseline: original `warc` crate + `regex::Regex` on UTF-8 strings
-//   - Bytes:    custom WARC parser + `regex::bytes::Regex` on raw &[u8]
-//   - Memchr:   custom parser + SIMD `memmem` literal search (no regex)
-//   - Mmap:     decompress to temp file → mmap → zero-copy memchr search
+// Parsing an Archive combines three things that vary independently:
+//   - Transport: how the compressed bytes arrive (a file on disk, a buffer
+//     in memory, or a decompressed copy that is memory-mapped), see
+//     `Transport` below
+//   - Format: how records are read; WARC only for now (`warc_parser`,
+//     `page_record`)
+//   - Artifact kind: what is extracted, one `Extractor` per kind
+//     (`extractor`, `artifact`)
+//
+// `parse_archive` only connects them: a new kind needs its own `Extractor`
+// (and its output file), but the parsing loop stays as it is.
 
+pub mod artifact;
+pub mod extractor;
 pub mod favicon_search;
 pub mod onion_search;
+pub mod page_record;
 pub mod warc_parser;
 
-use std::collections::{HashMap, HashSet};
+// Re-exports: the types callers need most, importable from the crate root
+// (`onion_crawler::Sighting` rather than `onion_crawler::artifact::Sighting`).
+pub use artifact::{ArtifactKind, Shard, Sighting, Sightings, merge_sightings};
+pub use extractor::{Extractor, FaviconExtractor, OnionEngine, OnionExtractor};
+pub use page_record::{PageRecord, WarcResponse};
+
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, Cursor, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::MultiGzDecoder;
-use memchr::memmem;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use warc::{RecordType, WarcReader};
-
-// ---------------------------------------------------------------------------
-// Data Types
-// ---------------------------------------------------------------------------
-
-/// Metadata about where an .onion address was found.
-///
-/// Each .onion address maps to a list of `OnionSource` entries, one for each
-/// distinct (URL, archive) pair where it appeared. This gives us rich context:
-/// not just "which archive" but "which specific clearnet page, when".
-///
-/// `Serialize` and `Deserialize` are derived for JSON persistence via `serde`.
-/// `Clone` is needed because the same source may be referenced across multiple
-/// search calls within a single record (rare, but possible with duplicates).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OnionSource {
-    pub url: String,
-    pub date: String,
-    pub archive: String,
-}
-
-/// Metadata about a favicon found on a crawled page.
-///
-/// Each favicon URL maps to a list of `FaviconSource` entries — the pages
-/// that reference it. An inline favicon (base64 `data:` URI) is stored
-/// with the decoded bytes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FaviconSource {
-    /// The page URL where this favicon reference was found.
-    pub page_url: String,
-    /// Crawl timestamp from the WARC record.
-    pub date: String,
-    /// Which WARC archive contained this page.
-    pub archive: String,
-}
-
-/// Combined result from parsing a single WARC archive.
-///
-/// Holds both `.onion` addresses and favicon references found during
-/// a single pass over the archive. Returned by all `parse_warc_*` functions.
-pub struct ParseResult {
-    pub onions: HashMap<String, Vec<OnionSource>>,
-    /// Favicon URLs → list of pages that reference them.
-    pub favicon_urls: HashMap<String, Vec<FaviconSource>>,
-    /// Inline (base64) favicons: SHA-256 hex hash → (decoded bytes, sources).
-    pub inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)>,
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -100,112 +65,6 @@ pub const PROCESSED_FILE: &str = "output/processed.log";
 
 /// JSON file storing extracted .onion addresses and their source archives.
 pub const RESULTS_FILE: &str = "output/onions.json";
-
-// ---------------------------------------------------------------------------
-// HTTP Response Helpers
-// ---------------------------------------------------------------------------
-
-/// Split a WARC response body into HTTP headers and HTTP body.
-///
-/// WARC "response" records contain the full HTTP response:
-/// ```text
-/// HTTP/1.1 200 OK\r\n
-/// Content-Type: text/html\r\n
-/// \r\n
-/// <html>...</html>
-/// ```
-///
-/// We need the HTTP body (the HTML) for favicon extraction, and the
-/// HTTP headers to check Content-Type. Returns `None` if no `\r\n\r\n`
-/// separator is found (malformed response).
-fn split_http_response(data: &[u8]) -> Option<(&[u8], &[u8])> {
-    let separator = memmem::find(data, b"\r\n\r\n")?;
-    Some((&data[..separator], &data[separator + 4..]))
-}
-
-/// Check if HTTP headers indicate an HTML content type.
-///
-/// Looks for `Content-Type:` header containing `text/html` or `application/xhtml`.
-/// Case-insensitive to handle the variety of web servers in the wild.
-fn is_html_content(http_headers: &[u8]) -> bool {
-    // Search for "content-type:" case-insensitively by scanning lines.
-    for line in http_headers.split(|&b| b == b'\n') {
-        let trimmed = if line.last() == Some(&b'\r') {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
-        if trimmed.len() > 13
-            && trimmed[..13].eq_ignore_ascii_case(b"content-type:")
-        {
-            let value = &trimmed[13..];
-            // Check for text/html or application/xhtml anywhere in the value
-            // (it may include charset, e.g. "text/html; charset=utf-8").
-            let lower: Vec<u8> = value.iter().map(|b| b.to_ascii_lowercase()).collect();
-            return lower.windows(9).any(|w| w == b"text/html")
-                || lower.windows(16).any(|w| w == b"application/xhtml");
-        }
-    }
-    false
-}
-
-/// Run favicon extraction on a WARC response body, if it's HTML.
-///
-/// Splits the HTTP response, checks Content-Type, and runs the favicon
-/// scanner on the HTML body. Collects results into the provided maps.
-fn extract_favicons_from_record(
-    warc_body: &[u8],
-    page_url: &str,
-    favicon_source: &FaviconSource,
-    favicon_urls: &mut HashMap<String, Vec<FaviconSource>>,
-    inline_favicons: &mut HashMap<String, (Vec<u8>, Vec<FaviconSource>)>,
-) {
-    let Some((http_headers, http_body)) = split_http_response(warc_body) else {
-        return;
-    };
-
-    if !is_html_content(http_headers) {
-        return;
-    }
-
-    let result = favicon_search::extract_favicons(http_body, page_url);
-
-    // Collect favicon URLs
-    for url in result.urls {
-        let sources = favicon_urls.entry(url).or_default();
-        if !sources.iter().any(|s| s.page_url == favicon_source.page_url && s.archive == favicon_source.archive) {
-            sources.push(favicon_source.clone());
-        }
-    }
-
-    // Collect inline favicons, keyed by content hash for deduplication.
-    for data in result.inline_favicons {
-        let hex = hash_bytes_hex(&data);
-        let entry = inline_favicons.entry(hex).or_insert_with(|| (data, Vec::new()));
-        if !entry.1.iter().any(|s| s.page_url == favicon_source.page_url && s.archive == favicon_source.archive) {
-            entry.1.push(favicon_source.clone());
-        }
-    }
-}
-
-/// Compute a hex digest of a byte slice for deduplication.
-///
-/// Uses `DefaultHasher` (SipHash) — not cryptographic, but sufficient
-/// for deduplicating inline favicons within a crawl. We avoid adding
-/// a SHA-256 crate dependency for this single use case.
-fn hash_bytes_hex(data: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    let h1 = hasher.finish();
-    // Double-hash for a 128-bit key to reduce collision risk.
-    let mut hasher2 = DefaultHasher::new();
-    h1.hash(&mut hasher2);
-    data.len().hash(&mut hasher2);
-    let h2 = hasher2.finish();
-    format!("{:016x}{:016x}", h1, h2)
-}
 
 // ---------------------------------------------------------------------------
 // Download Logic
@@ -410,325 +269,105 @@ pub async fn download_warc_to_memory(
 }
 
 // ---------------------------------------------------------------------------
-// WARC Parsing & .onion Extraction
+// Parsing an Archive
 // ---------------------------------------------------------------------------
 
-/// Parse a WARC archive and extract unique .onion addresses.
+/// How the compressed bytes of an Archive reach the parser.
 ///
-/// This function is **synchronous** — the `warc` crate uses blocking I/O
-/// internally (decompressing gzip, reading record boundaries). We don't
-/// rewrite it as async because:
+/// ## Enums with data
 ///
-/// 1. The `warc` crate doesn't support async — we'd need a different library
-/// 2. Parsing is CPU-bound (decompression + regex matching), not I/O-bound
-/// 3. Async shines for I/O waits (network, slow disk); for CPU work it just
-///    adds overhead
-///
-/// Instead, we call this from `spawn_blocking` (see the pipeline in `main`),
-/// which runs it on Tokio's dedicated blocking thread pool. This is the
-/// idiomatic way to mix sync CPU work with async I/O in Tokio.
-pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<ParseResult, Box<dyn Error + Send + Sync>> {
-    let reader = WarcReader::from_path_gzip(path)?;
-    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
-    let mut favicon_urls: HashMap<String, Vec<FaviconSource>> = HashMap::new();
-    let mut inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)> = HashMap::new();
-    let mut records_scanned: u64 = 0;
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let archive = filename.to_string();
-
-    for result in reader.iter_records() {
-        let record = match result {
-            Ok(r) => r,
-            Err(_) => continue
-        };
-
-        if *record.warc_type() != RecordType::Response {
-            continue;
-        }
-
-        records_scanned += 1;
-
-        // Extract metadata from the warc crate's parsed headers.
-        let target_uri = record.header(warc::WarcHeader::TargetURI)
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let date = record.header(warc::WarcHeader::Date)
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let source = OnionSource {
-            url: target_uri.clone(),
-            date: date.clone(),
-            archive: archive.clone()
-        };
-
-        let body = record.body();
-
-        // Onion search
-        let body_str = String::from_utf8_lossy(body);
-        for m in onion_re.find_iter(&body_str) {
-            let key = m.as_str().to_lowercase();
-            let sources = onions.entry(key).or_default();
-            if !sources.iter().any(|s| s.url == source.url && s.archive == source.archive) {
-                sources.push(source.clone());
-            }
-        }
-
-        // Favicon extraction
-        let fav_source = FaviconSource {
-            page_url: target_uri,
-            date,
-            archive: archive.clone(),
-        };
-        extract_favicons_from_record(body, &fav_source.page_url, &fav_source, &mut favicon_urls, &mut inline_favicons);
-
-        if records_scanned % 10_000 == 0 {
-            eprint!(
-                "\r  [{}] Scanning: {} records, {} onion(s), {} favicon(s)",
-                filename, records_scanned, onions.len(), favicon_urls.len()
-            );
-        }
-    }
-
-    if records_scanned >= 10_000 {
-        eprintln!();
-    }
-
-    Ok(ParseResult { onions, favicon_urls, inline_favicons })
+/// Each variant carries what that way of reading needs: a path for the two
+/// file-based Transports, the downloaded bytes themselves for `Memory`. A
+/// `Memory` value without bytes, or a `Disk` value without a path, can't be
+/// built, so `parse_archive` never has to handle one.
+pub enum Transport {
+    /// Stream-decompress a `.warc.gz` file on disk.
+    Disk(PathBuf),
+    /// Stream-decompress a `.warc.gz` already downloaded into memory.
+    Memory(Vec<u8>),
+    /// Decompress a `.warc.gz` file to a temporary `.warc` next to it, then
+    /// memory-map that copy and read records straight from the mapping.
+    Mmap(PathBuf),
 }
 
-/// Parse a WARC archive using the custom byte-level parser + `regex::bytes`.
+/// Progress is reported every this many records.
+const PROGRESS_EVERY: u64 = 10_000;
+
+/// Read every record of one Archive once and hand it to every extractor.
 ///
-/// ## What's different from the baseline
+/// When this returns, each extractor holds what it found in the Archive;
+/// `Extractor::into_sightings` hands that over. The function itself never
+/// looks at which Artifact kinds it is feeding.
 ///
-/// 1. **Custom WARC parser** — skips non-response record bodies entirely
-///    (the `warc` crate reads every body, even ones we discard)
-/// 2. **`regex::bytes::Regex`** — searches `&[u8]` directly, no UTF-8 conversion
-///    (eliminates `String::from_utf8_lossy` allocation per record)
-/// 3. **`flate2` decompression** — wraps zlib for faster gzip decoding
+/// ## Synchronous on purpose
 ///
-/// Expected ~1.5-2x speedup over baseline.
-pub fn parse_warc_bytes(path: &Path) -> Result<ParseResult, Box<dyn Error + Send + Sync>> {
-    let file = fs::File::open(path)?;
-    let decoder = MultiGzDecoder::new(file);
-    let buf_reader = BufReader::new(decoder);
-    let iter = warc_parser::WarcRecordIter::new(buf_reader);
+/// Parsing is CPU-bound (gzip decompression + searching), not I/O-bound.
+/// Async shines for I/O waits (network, slow disk); for CPU work it just
+/// adds overhead. The pipeline in `main` calls this from `spawn_blocking`,
+/// which runs it on Tokio's dedicated blocking thread pool: the idiomatic
+/// way to mix sync CPU work with async I/O in Tokio.
+///
+/// ## `Transport::Memory`: ownership transfer
+///
+/// The `Vec<u8>` inside `Transport::Memory` is *moved* in. When called from
+/// `spawn_blocking(move || ...)`, the ~800 MB buffer changes owner without
+/// being copied, and the compiler prevents the async task from using it
+/// afterwards.
+pub fn parse_archive(
+    transport: Transport,
+    shard: &Shard,
+    extractors: &mut [Box<dyn Extractor>],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let records_scanned = match transport {
+        // `File` and `Cursor<Vec<u8>>` both implement `Read`, so one
+        // streaming loop serves both.
+        Transport::Disk(path) => parse_stream(fs::File::open(path)?, shard, extractors)?,
+        Transport::Memory(data) => parse_stream(Cursor::new(data), shard, extractors)?,
+        Transport::Mmap(path) => parse_mmap(&path, shard, extractors)?,
+    };
 
-    let onion_re = regex::bytes::Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")?;
-    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
-    let mut favicon_urls: HashMap<String, Vec<FaviconSource>> = HashMap::new();
-    let mut inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)> = HashMap::new();
-    let mut records_scanned: u64 = 0;
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let archive = filename.to_string();
-
-    for result in iter {
-        let record = result?;
-        records_scanned += 1;
-
-        let source = OnionSource {
-            url: record.target_uri.clone(),
-            date: record.date.clone(),
-            archive: archive.clone()
-        };
-        onion_search::search_regex_bytes(&record.body, &onion_re, &source, &mut onions);
-
-        let fav_source = FaviconSource {
-            page_url: record.target_uri,
-            date: record.date,
-            archive: archive.clone(),
-        };
-        extract_favicons_from_record(&record.body, &fav_source.page_url, &fav_source, &mut favicon_urls, &mut inline_favicons);
-
-        if records_scanned % 10_000 == 0 {
-            eprint!(
-                "\r  [{}] Scanning (bytes): {} records, {} onion(s), {} favicon(s)",
-                filename, records_scanned, onions.len(), favicon_urls.len()
-            );
-        }
+    if records_scanned >= PROGRESS_EVERY {
+        eprintln!(); // End the `\r` progress line.
     }
-
-    if records_scanned >= 10_000 {
-        eprintln!();
-    }
-
-    Ok(ParseResult { onions, favicon_urls, inline_favicons })
+    Ok(())
 }
 
-/// Parse a WARC archive using the custom parser + SIMD `memmem` literal search.
-///
-/// ## The ripgrep technique
-///
-/// Instead of running a regex engine on every byte, we:
-/// 1. Use `memmem::Finder` (SIMD-accelerated) to jump to ".onion" literals
-/// 2. Validate surrounding bytes with cheap comparisons
-///
-/// `memmem` scans 16-32 bytes per CPU cycle via SIMD. Since ".onion" is
-/// rare in typical web content, the validator almost never runs. This is
-/// dramatically faster than the regex NFA which must track state for every byte.
-///
-/// Expected ~3-5x speedup over baseline.
-pub fn parse_warc_memchr(path: &Path) -> Result<ParseResult, Box<dyn Error + Send + Sync>> {
-    let file = fs::File::open(path)?;
-    let decoder = MultiGzDecoder::new(file);
-    let buf_reader = BufReader::new(decoder);
-    let iter = warc_parser::WarcRecordIter::new(buf_reader);
-
-    let finder = memmem::Finder::new(b".onion");
-    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
-    let mut favicon_urls: HashMap<String, Vec<FaviconSource>> = HashMap::new();
-    let mut inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)> = HashMap::new();
-    let mut records_scanned: u64 = 0;
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let archive = filename.to_string();
-
-    for result in iter {
-        let record = result?;
-        records_scanned += 1;
-
-        let source = OnionSource {
-            url: record.target_uri.clone(),
-            date: record.date.clone(),
-            archive: archive.clone()
-        };
-        onion_search::search_memchr(&record.body, &finder, &source, &mut onions);
-
-        let fav_source = FaviconSource {
-            page_url: record.target_uri,
-            date: record.date,
-            archive: archive.clone(),
-        };
-        extract_favicons_from_record(&record.body, &fav_source.page_url, &fav_source, &mut favicon_urls, &mut inline_favicons);
-
-        if records_scanned % 10_000 == 0 {
-            eprint!(
-                "\r  [{}] Scanning (memchr): {} records, {} onion(s), {} favicon(s)",
-                filename, records_scanned, onions.len(), favicon_urls.len()
-            );
-        }
-    }
-
-    if records_scanned >= 10_000 {
-        eprintln!();
-    }
-
-    Ok(ParseResult { onions, favicon_urls, inline_favicons })
-}
-
-/// Parse a WARC archive from an in-memory buffer using `regex::bytes`.
+/// Parse a gzipped WARC stream with the streaming record parser.
 ///
 /// ## `std::io::Cursor` — the adapter pattern
 ///
 /// `Cursor<Vec<u8>>` wraps a byte vector and implements the `Read` trait,
-/// making it interchangeable with a `File`. This is Rust's adapter pattern:
-/// `MultiGzDecoder` doesn't care whether its inner `Read` is a file on disk
-/// or bytes in memory — it just calls `.read()`. Same interface, different
-/// backing store.
+/// making it interchangeable with a `File`. `MultiGzDecoder` doesn't care
+/// whether its inner `Read` is a file on disk or bytes in memory — it just
+/// calls `.read()`. Same interface, different backing store.
 ///
-/// ## Ownership transfer
-///
-/// The `data: Vec<u8>` parameter takes ownership of the buffer. When this
-/// function is called from `spawn_blocking(move || ...)`, the ~800 MB
-/// buffer is *moved* (zero-copy) from the async task to the blocking thread.
-/// After the move, the async task no longer owns the buffer, and the compiler
-/// prevents use-after-move at compile time.
-pub fn parse_warc_bytes_from_memory(data: Vec<u8>, archive_name: &str) -> Result<ParseResult, Box<dyn Error + Send + Sync>> {
-    let cursor = Cursor::new(data);
-    let decoder = MultiGzDecoder::new(cursor);
-    let buf_reader = BufReader::new(decoder);
-    let iter = warc_parser::WarcRecordIter::new(buf_reader);
+/// `MultiGzDecoder` (not `GzDecoder`) because Common Crawl gzips every
+/// record as its own gzip member; `GzDecoder` would stop after the first.
+fn parse_stream<R: Read>(
+    compressed: R,
+    shard: &Shard,
+    extractors: &mut [Box<dyn Extractor>],
+) -> io::Result<u64> {
+    let decoder = MultiGzDecoder::new(compressed);
+    let records = warc_parser::WarcRecordIter::new(BufReader::new(decoder));
+    let mut records_scanned = 0;
 
-    let onion_re = regex::bytes::Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")?;
-    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
-    let mut favicon_urls: HashMap<String, Vec<FaviconSource>> = HashMap::new();
-    let mut inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)> = HashMap::new();
-    let mut records_scanned: u64 = 0;
-    let archive = archive_name.to_string();
-
-    for result in iter {
-        let record = result?;
-        records_scanned += 1;
-
-        let source = OnionSource {
-            url: record.target_uri.clone(),
-            date: record.date.clone(),
-            archive: archive.clone()
-        };
-        onion_search::search_regex_bytes(&record.body, &onion_re, &source, &mut onions);
-
-        let fav_source = FaviconSource {
-            page_url: record.target_uri,
-            date: record.date,
-            archive: archive.clone(),
-        };
-        extract_favicons_from_record(&record.body, &fav_source.page_url, &fav_source, &mut favicon_urls, &mut inline_favicons);
-
-        if records_scanned % 10_000 == 0 {
-            eprint!(
-                "\r  [{}] Scanning (bytes/stream): {} records, {} onion(s), {} favicon(s)",
-                archive_name, records_scanned, onions.len(), favicon_urls.len()
-            );
-        }
+    for record in records {
+        let record = record?;
+        // The `PageRecord` borrows the record's own buffers: nothing is
+        // copied, and it is dropped before the next record is read.
+        let page = PageRecord::Warc(WarcResponse {
+            page_url: &record.target_uri,
+            date: &record.date,
+            http_response: &record.body,
+        });
+        hand_over(&page, shard, extractors, &mut records_scanned);
     }
 
-    if records_scanned >= 10_000 {
-        eprintln!();
-    }
-
-    Ok(ParseResult { onions, favicon_urls, inline_favicons })
+    Ok(records_scanned)
 }
 
-/// Parse a WARC archive from an in-memory buffer using SIMD `memmem` search.
-///
-/// Same as `parse_warc_memchr` but reads from `Cursor<Vec<u8>>` instead of
-/// a file on disk. See `parse_warc_bytes_from_memory` for the `Cursor`
-/// explanation.
-pub fn parse_warc_memchr_from_memory(data: Vec<u8>, archive_name: &str) -> Result<ParseResult, Box<dyn Error + Send + Sync>> {
-    let cursor = Cursor::new(data);
-    let decoder = MultiGzDecoder::new(cursor);
-    let buf_reader = BufReader::new(decoder);
-    let iter = warc_parser::WarcRecordIter::new(buf_reader);
-
-    let finder = memmem::Finder::new(b".onion");
-    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
-    let mut favicon_urls: HashMap<String, Vec<FaviconSource>> = HashMap::new();
-    let mut inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)> = HashMap::new();
-    let mut records_scanned: u64 = 0;
-    let archive = archive_name.to_string();
-
-    for result in iter {
-        let record = result?;
-        records_scanned += 1;
-
-        let source = OnionSource {
-            url: record.target_uri.clone(),
-            date: record.date.clone(),
-            archive: archive.clone()
-        };
-        onion_search::search_memchr(&record.body, &finder, &source, &mut onions);
-
-        let fav_source = FaviconSource {
-            page_url: record.target_uri,
-            date: record.date,
-            archive: archive.clone(),
-        };
-        extract_favicons_from_record(&record.body, &fav_source.page_url, &fav_source, &mut favicon_urls, &mut inline_favicons);
-
-        if records_scanned % 10_000 == 0 {
-            eprint!(
-                "\r  [{}] Scanning (memchr/stream): {} records, {} onion(s), {} favicon(s)",
-                archive_name, records_scanned, onions.len(), favicon_urls.len()
-            );
-        }
-    }
-
-    if records_scanned >= 10_000 {
-        eprintln!();
-    }
-
-    Ok(ParseResult { onions, favicon_urls, inline_favicons })
-}
-
-/// Parse a WARC archive using memory-mapped I/O + SIMD literal search.
+/// Parse a WARC Archive through memory-mapped I/O.
 ///
 /// ## How mmap works here
 ///
@@ -746,13 +385,13 @@ pub fn parse_warc_memchr_from_memory(data: Vec<u8>, archive_name: &str) -> Resul
 ///   by the kernel's virtual memory system
 ///
 /// The trade-off is disk space: a 1GB compressed archive decompresses to
-/// ~3-5GB on disk. For machines with enough disk space, this is the
-/// fastest approach.
-///
-/// Expected ~3-6x speedup over baseline.
-pub fn parse_warc_mmap(path: &Path) -> Result<ParseResult, Box<dyn Error + Send + Sync>> {
+/// ~3-5GB on disk.
+fn parse_mmap(
+    path: &Path,
+    shard: &Shard,
+    extractors: &mut [Box<dyn Extractor>],
+) -> Result<u64, Box<dyn Error + Send + Sync>> {
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let archive = filename.to_string();
 
     let tmp_path = path.with_extension("warc");
     eprintln!("  [{}] Decompressing to temp file for mmap...", filename);
@@ -771,43 +410,21 @@ pub fn parse_warc_mmap(path: &Path) -> Result<ParseResult, Box<dyn Error + Send 
 
     let tmp_file = fs::File::open(&tmp_path)?;
     let mmap = unsafe { memmap2::Mmap::map(&tmp_file)? };
+    let mut records_scanned = 0;
 
-    let iter = warc_parser::WarcSliceIter::new(&mmap);
-    let finder = memmem::Finder::new(b".onion");
-    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
-    let mut favicon_urls: HashMap<String, Vec<FaviconSource>> = HashMap::new();
-    let mut inline_favicons: HashMap<String, (Vec<u8>, Vec<FaviconSource>)> = HashMap::new();
-    let mut records_scanned: u64 = 0;
-
-    for record in iter {
-        records_scanned += 1;
-
-        let uri = String::from_utf8_lossy(record.target_uri).to_string();
-        let date = String::from_utf8_lossy(record.date).to_string();
-        let source = OnionSource {
-            url: uri.clone(),
-            date: date.clone(),
-            archive: archive.clone()
-        };
-        onion_search::search_memchr(record.body, &finder, &source, &mut onions);
-
-        let fav_source = FaviconSource {
-            page_url: uri,
-            date,
-            archive: archive.clone(),
-        };
-        extract_favicons_from_record(record.body, &fav_source.page_url, &fav_source, &mut favicon_urls, &mut inline_favicons);
-
-        if records_scanned % 10_000 == 0 {
-            eprint!(
-                "\r  [{}] Scanning (mmap): {} records, {} onion(s), {} favicon(s)",
-                filename, records_scanned, onions.len(), favicon_urls.len()
-            );
-        }
-    }
-
-    if records_scanned >= 10_000 {
-        eprintln!();
+    for record in warc_parser::WarcSliceIter::new(&mmap) {
+        // The slice parser returns raw header bytes; extractors want `&str`.
+        // `from_utf8_lossy` returns a `Cow`: it borrows when the bytes are
+        // valid UTF-8 (the usual case) and allocates only to replace
+        // invalid ones.
+        let page_url = String::from_utf8_lossy(record.target_uri);
+        let date = String::from_utf8_lossy(record.date);
+        let page = PageRecord::Warc(WarcResponse {
+            page_url: &page_url,
+            date: &date,
+            http_response: record.body,
+        });
+        hand_over(&page, shard, extractors, &mut records_scanned);
     }
 
     drop(mmap);
@@ -816,7 +433,36 @@ pub fn parse_warc_mmap(path: &Path) -> Result<ParseResult, Box<dyn Error + Send 
         eprintln!("  [{}] Warning: could not remove temp file: {}", filename, e);
     }
 
-    Ok(ParseResult { onions, favicon_urls, inline_favicons })
+    Ok(records_scanned)
+}
+
+/// Hand one record to every extractor and report progress now and then.
+///
+/// The loop sees extractors only through the `Extractor` trait, so it works
+/// unchanged for any set of Artifact kinds.
+fn hand_over(
+    record: &PageRecord<'_>,
+    shard: &Shard,
+    extractors: &mut [Box<dyn Extractor>],
+    records_scanned: &mut u64,
+) {
+    for extractor in extractors.iter_mut() {
+        extractor.extract(record, shard);
+    }
+
+    *records_scanned += 1;
+    if records_scanned.is_multiple_of(PROGRESS_EVERY) {
+        let found: Vec<String> = extractors
+            .iter()
+            .map(|e| format!("{} {}(s)", e.artifact_count(), e.kind()))
+            .collect();
+        eprint!(
+            "\r  [{}] Scanning: {} records, {}",
+            shard,
+            records_scanned,
+            found.join(", ")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -869,32 +515,46 @@ pub fn mark_processed_in(filename: &str, output_dir: &str) -> io::Result<()> {
 }
 
 /// Load existing results from the JSON file.
-///
-/// Supports both the new format (`HashMap<String, Vec<OnionSource>>`) and
-/// falls back to an empty map if the file contains the old format or is invalid.
-pub fn load_results() -> HashMap<String, Vec<OnionSource>> {
+pub fn load_results() -> Result<Sightings, Box<dyn Error>> {
     load_results_from(DEFAULT_OUTPUT_DIR)
 }
 
 /// Load results from a custom output directory.
-pub fn load_results_from(output_dir: &str) -> HashMap<String, Vec<OnionSource>> {
-    let path = Path::new(output_dir).join(RESULTS_FILENAME);
-    if !path.exists() {
-        return HashMap::new();
-    }
+pub fn load_results_from(output_dir: &str) -> Result<Sightings, Box<dyn Error>> {
+    load_sightings(&Path::new(output_dir).join(RESULTS_FILENAME))
+}
 
-    let content = fs::read_to_string(path).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or_default()
+/// Load one kind's saved Sightings; a missing file means none yet.
+///
+/// ## Why an unreadable file is an error, not an empty map
+///
+/// The crawl merges new Sightings into what this returns and saves the
+/// result over the same file. Returning an empty map for a file it can't
+/// read (corrupt, or written in an older format such as `url` / `archive`
+/// instead of `page_url` / `shard`) would make that save silently replace
+/// the file's contents. Failing here stops the run before anything is
+/// written.
+fn load_sightings(path: &Path) -> Result<Sightings, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(Sightings::new());
+    }
+    // `map_err` adds the path to the message: serde's error alone says
+    // "missing field `page_url` at line 4" without naming the file.
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {}", path.display(), err))?;
+    let sightings = serde_json::from_str(&content)
+        .map_err(|err| format!("cannot load {}: {}", path.display(), err))?;
+    Ok(sightings)
 }
 
 /// Save the results map to the JSON file.
-pub fn save_results(results: &HashMap<String, Vec<OnionSource>>) -> Result<(), Box<dyn Error>> {
+pub fn save_results(results: &Sightings) -> Result<(), Box<dyn Error>> {
     save_results_to(results, DEFAULT_OUTPUT_DIR)
 }
 
 /// Save results to a custom output directory.
 pub fn save_results_to(
-    results: &HashMap<String, Vec<OnionSource>>,
+    results: &Sightings,
     output_dir: &str,
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(output_dir)?;
@@ -910,12 +570,12 @@ pub fn save_results_to(
 ///
 /// After a SLURM array job completes, each task has produced its own
 /// `onions.json` in a separate output directory. This function reads all
-/// of them and merges into a single map, deduplicating on `(url, archive)`
-/// pairs — the same logic used during per-archive merging in `main`.
+/// of them and merges into a single map, deduplicating on `(page_url, shard)`
+/// pairs — the same `merge_sightings` used during per-archive merging in `main`.
 pub fn merge_results(
     input_dirs: &[PathBuf],
-) -> HashMap<String, Vec<OnionSource>> {
-    let mut merged: HashMap<String, Vec<OnionSource>> = HashMap::new();
+) -> Sightings {
+    let mut merged: Sightings = Sightings::new();
 
     for dir in input_dirs {
         let path = dir.join(RESULTS_FILENAME);
@@ -930,7 +590,7 @@ pub fn merge_results(
                 continue;
             }
         };
-        let partial: HashMap<String, Vec<OnionSource>> =
+        let partial: Sightings =
             match serde_json::from_str(&content) {
                 Ok(m) => m,
                 Err(err) => {
@@ -939,14 +599,7 @@ pub fn merge_results(
                 }
             };
 
-        for (onion, sources) in partial {
-            let existing = merged.entry(onion).or_default();
-            for source in sources {
-                if !existing.iter().any(|s| s.url == source.url && s.archive == source.archive) {
-                    existing.push(source);
-                }
-            }
-        }
+        merge_sightings(&mut merged, partial);
     }
 
     merged
@@ -957,18 +610,13 @@ pub fn merge_results(
 // ---------------------------------------------------------------------------
 
 /// Load existing favicon results from a custom output directory.
-pub fn load_favicons_from(output_dir: &str) -> HashMap<String, Vec<FaviconSource>> {
-    let path = Path::new(output_dir).join(FAVICONS_FILENAME);
-    if !path.exists() {
-        return HashMap::new();
-    }
-    let content = fs::read_to_string(path).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or_default()
+pub fn load_favicons_from(output_dir: &str) -> Result<Sightings, Box<dyn Error>> {
+    load_sightings(&Path::new(output_dir).join(FAVICONS_FILENAME))
 }
 
 /// Save favicon URL results to a custom output directory.
 pub fn save_favicons_to(
-    favicons: &HashMap<String, Vec<FaviconSource>>,
+    favicons: &Sightings,
     output_dir: &str,
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(output_dir)?;
@@ -979,8 +627,8 @@ pub fn save_favicons_to(
 }
 
 /// Merge favicon results from multiple output directories.
-pub fn merge_favicons(input_dirs: &[PathBuf]) -> HashMap<String, Vec<FaviconSource>> {
-    let mut merged: HashMap<String, Vec<FaviconSource>> = HashMap::new();
+pub fn merge_favicons(input_dirs: &[PathBuf]) -> Sightings {
+    let mut merged: Sightings = Sightings::new();
 
     for dir in input_dirs {
         let path = dir.join(FAVICONS_FILENAME);
@@ -994,7 +642,7 @@ pub fn merge_favicons(input_dirs: &[PathBuf]) -> HashMap<String, Vec<FaviconSour
                 continue;
             }
         };
-        let partial: HashMap<String, Vec<FaviconSource>> =
+        let partial: Sightings =
             match serde_json::from_str(&content) {
                 Ok(m) => m,
                 Err(err) => {
@@ -1003,14 +651,7 @@ pub fn merge_favicons(input_dirs: &[PathBuf]) -> HashMap<String, Vec<FaviconSour
                 }
             };
 
-        for (url, sources) in partial {
-            let existing = merged.entry(url).or_default();
-            for source in sources {
-                if !existing.iter().any(|s| s.page_url == source.page_url && s.archive == source.archive) {
-                    existing.push(source);
-                }
-            }
-        }
+        merge_sightings(&mut merged, partial);
     }
 
     merged

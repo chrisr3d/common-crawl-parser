@@ -12,26 +12,23 @@
 // New concepts: async/await, Tokio runtime, reqwest streaming, spawn_blocking,
 // bounded concurrency with buffer_unordered, Arc for shared ownership.
 
-use std::collections::HashMap;
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
-use regex::Regex;
 
 use onion_crawler::{
     download_warc_async, download_warc_to_memory, filename_from_uri,
     load_favicons_from, load_processed_from, load_results_from,
-    mark_processed_in, merge_favicons, merge_results,
-    parse_warc, parse_warc_bytes, parse_warc_bytes_from_memory, parse_warc_memchr,
-    parse_warc_memchr_from_memory, parse_warc_mmap, save_favicons_to, save_results_to,
-    FaviconSource, OnionSource,
-    DEFAULT_OUTPUT_DIR, FAVICONS_FILENAME, RESULTS_FILENAME,
+    mark_processed_in, merge_favicons, merge_results, merge_sightings,
+    parse_archive, save_favicons_to, save_results_to,
+    ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor, Shard, Sightings,
+    Transport, DEFAULT_OUTPUT_DIR, FAVICONS_FILENAME, RESULTS_FILENAME,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,16 +38,18 @@ use onion_crawler::{
 /// Parsing strategy — selects which optimization layer to use.
 ///
 /// Each strategy produces identical results but uses different techniques,
-/// inspired by how ripgrep achieves its speed. Run all four on the same
-/// archive to benchmark the impact of each optimization.
+/// inspired by how ripgrep achieves its speed. Run all three on the same
+/// archive to benchmark the impact of each optimization; the original
+/// `warc`-crate approach lives on as `cargo run --example baseline`.
+///
+/// Each strategy is a Transport + onion engine pair for `parse_archive`
+/// (see `run_crawl`); `--transport` and `--onion-engine` will replace it.
 ///
 /// `ValueEnum` derive lets `clap` parse the strategy name from the CLI
 /// (e.g., `--strategy memchr`). It auto-generates the list of valid values
 /// for `--help` output.
 #[derive(Clone, Copy, ValueEnum)]
 enum Strategy {
-    /// Original: warc crate + regex::Regex on UTF-8 strings
-    Baseline,
     /// Custom parser + regex::bytes::Regex on raw &[u8] (no UTF-8 conversion)
     Bytes,
     /// Custom parser + SIMD memmem literal search (no regex engine)
@@ -224,7 +223,7 @@ struct Config {
     #[arg(short, long)]
     delete: bool,
 
-    /// Parsing strategy: baseline, bytes, memchr, or mmap
+    /// Parsing strategy: bytes, memchr, or mmap
     #[arg(short, long, value_enum, default_value_t = Strategy::Memchr)]
     strategy: Strategy,
 
@@ -272,8 +271,8 @@ enum Command {
 /// mutate shared state. Instead, each task returns its results and the
 /// main task merges them sequentially — no locks needed.
 struct ArchiveResult {
-    onions: HashMap<String, Vec<OnionSource>>,
-    favicon_urls: HashMap<String, Vec<FaviconSource>>,
+    /// What each extractor found, tagged with its Artifact kind.
+    found: Vec<(ArtifactKind, Sightings)>,
     download_time: Duration,
     parse_time: Duration
 }
@@ -365,6 +364,22 @@ fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
     }
 }
 
+/// Unwrap loaded results, or stop the run before anything is saved.
+///
+/// Every finished archive saves the results files again, so carrying on
+/// with an empty map would overwrite a file that merely failed to load.
+fn load_or_exit(loaded: Result<Sightings, Box<dyn Error>>) -> Sightings {
+    loaded.unwrap_or_else(|err| {
+        eprintln!("Error: {}", err);
+        eprintln!(
+            "Stopping so the file is not overwritten. Files written before the \
+             `page_url` / `shard` format are not converted: move the file away or \
+             use another --output-dir."
+        );
+        process::exit(1);
+    })
+}
+
 /// Main crawl pipeline — download and parse WARC archives.
 async fn run_crawl(input: String, config: Config) {
     let limit_display = match config.limit {
@@ -372,7 +387,6 @@ async fn run_crawl(input: String, config: Config) {
         None => "all".to_string()
     };
     let strategy_name = match config.strategy {
-        Strategy::Baseline => "baseline (warc crate + regex)",
         Strategy::Bytes => "bytes (custom parser + regex::bytes)",
         Strategy::Memchr => "memchr (custom parser + SIMD memmem)",
         Strategy::Mmap => "mmap (decompress + mmap + SIMD memmem)"
@@ -388,13 +402,6 @@ async fn run_crawl(input: String, config: Config) {
     // refusing to run.
     let stream_enabled = if config.stream {
         match config.strategy {
-            Strategy::Baseline => {
-                eprintln!(
-                    "Warning: --stream is not compatible with 'baseline' strategy \
-                     (warc crate requires a file path). Falling back to disk mode."
-                );
-                false
-            }
             Strategy::Mmap => {
                 eprintln!(
                     "Warning: --stream is not compatible with 'mmap' strategy \
@@ -482,7 +489,7 @@ async fn run_crawl(input: String, config: Config) {
     // --- Open and read the paths file ---
     // Supports both plain text and gzip-compressed (.gz) paths files.
     // Common Crawl distributes warc.paths.gz — we decompress transparently
-    // using `libflate`, which is already in the dependency tree via the `warc` crate.
+    // using `libflate`.
     let file = File::open(&input).unwrap_or_else(|err| {
         eprintln!("Error: cannot open '{}': {}", input, err);
         process::exit(1);
@@ -522,8 +529,8 @@ async fn run_crawl(input: String, config: Config) {
 
     // --- Load persistent state ---
     let processed = load_processed_from(&config.output_dir);
-    let mut results = load_results_from(&config.output_dir);
-    let mut favicon_results = load_favicons_from(&config.output_dir);
+    let mut results = load_or_exit(load_results_from(&config.output_dir));
+    let mut favicon_results = load_or_exit(load_favicons_from(&config.output_dir));
 
     eprintln!(
         "State: {} already processed, {} onion(s), {} favicon URL(s) in results\n",
@@ -596,29 +603,14 @@ async fn run_crawl(input: String, config: Config) {
 
     eprintln!("Processing {} archive(s) with {} concurrent job(s)\n", work_items.len(), effective_jobs);
 
-    // --- Compile the .onion regex once, wrapped in Arc for sharing ---
-    //
-    // ## `Arc` — atomic reference counting for shared ownership
-    //
-    // Each concurrent task needs access to the compiled regex. We can't
-    // pass a `&Regex` reference because async tasks may outlive the current
-    // scope (Tokio needs `'static` lifetimes for spawned tasks).
-    //
-    // `Arc` (Atomic Reference Count) solves this: it's a thread-safe smart
-    // pointer that keeps the inner value alive as long as any clone exists.
-    // Cloning an `Arc` just increments a counter — the regex itself is
-    // never copied. This is Rust's standard pattern for sharing immutable
-    // data across threads.
-    //
-    // Only the Baseline strategy uses this regex — the others use either
-    // `regex::bytes::Regex` (compiled per-call) or `memmem::Finder`.
-    // We still compile it unconditionally to keep the code simple.
-    let onion_re = Arc::new(
-        Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")
-            .expect("Invalid regex")
-    );
-
     let strategy = config.strategy;
+
+    // The onion engine each strategy stands for. The Transport also
+    // depends on where the download went, so it is chosen per task below.
+    let onion_engine = match strategy {
+        Strategy::Bytes => OnionEngine::Regex,
+        Strategy::Memchr | Strategy::Mmap => OnionEngine::Memchr,
+    };
 
     // --- Create a shared HTTP client ---
     //
@@ -651,10 +643,10 @@ async fn run_crawl(input: String, config: Config) {
     // waiting for a slow download just because it started earlier.
     let archive_stream = stream::iter(work_items)
         .map(|(idx, uri)| {
-            // Clone shared resources for this task. `Arc::clone` is cheap
-            // (just increments a reference count).
+            // Clone the shared client for this task. `reqwest::Client` is
+            // an `Arc` inside, so the clone is cheap (just increments a
+            // reference count) and shares the connection pool.
             let client = client.clone();
-            let onion_re = Arc::clone(&onion_re);
 
             async move {
                 let filename = match filename_from_uri(&uri) {
@@ -708,7 +700,7 @@ async fn run_crawl(input: String, config: Config) {
                 //
                 // ## `spawn_blocking` — bridging sync and async
                 //
-                // `parse_warc` is CPU-bound (gzip decompression + regex).
+                // `parse_archive` is CPU-bound (gzip decompression + search).
                 // Running it directly on an async task would block the Tokio
                 // worker thread, starving other async tasks (downloads).
                 //
@@ -723,39 +715,41 @@ async fn run_crawl(input: String, config: Config) {
                 // (no data copying). After the move, the async task no longer
                 // owns the buffer, and the compiler prevents use-after-move.
                 let strategy_label = match strategy {
-                    Strategy::Baseline => "baseline",
                     Strategy::Bytes => if stream_enabled { "bytes/stream" } else { "bytes" },
                     Strategy::Memchr => if stream_enabled { "memchr/stream" } else { "memchr" },
                     Strategy::Mmap => "mmap"
                 };
                 eprintln!("  [{}] Parsing ({})...", filename, strategy_label);
-                let parse_path = local_path.clone();
-                let parse_re = Arc::clone(&onion_re);
-                let parse_filename = filename.clone();
+                let transport = match (strategy, memory_buffer) {
+                    (Strategy::Mmap, _) => Transport::Mmap(local_path.clone()),
+                    // Stream mode: parse from the in-memory buffer
+                    (_, Some(data)) => Transport::Memory(data),
+                    // Disk mode: parse from the downloaded file
+                    (_, None) => Transport::Disk(local_path.clone()),
+                };
+                let shard = Shard::from_archive_name(&filename);
 
                 let parse_start = Instant::now();
-                let parse_result = tokio::task::spawn_blocking(move || {
-                    match (strategy, memory_buffer) {
-                        // Stream mode: parse from in-memory buffer
-                        (Strategy::Bytes, Some(data)) => {
-                            parse_warc_bytes_from_memory(data, &parse_filename)
-                        }
-                        (Strategy::Memchr, Some(data)) => {
-                            parse_warc_memchr_from_memory(data, &parse_filename)
-                        }
-                        // Disk mode: parse from file (existing behavior)
-                        (Strategy::Baseline, _) => parse_warc(&parse_path, &parse_re),
-                        (Strategy::Bytes, None) => parse_warc_bytes(&parse_path),
-                        (Strategy::Memchr, None) => parse_warc_memchr(&parse_path),
-                        (Strategy::Mmap, _) => parse_warc_mmap(&parse_path)
-                    }
-                })
+                let parse_result = tokio::task::spawn_blocking(
+                    move || -> Result<Vec<(ArtifactKind, Sightings)>, Box<dyn Error + Send + Sync>> {
+                        // One boxed extractor per Artifact kind for this Shard.
+                        let mut extractors: Vec<Box<dyn Extractor>> = vec![
+                            Box::new(OnionExtractor::new(onion_engine)),
+                            Box::new(FaviconExtractor::new()),
+                        ];
+                        parse_archive(transport, &shard, &mut extractors)?;
+                        Ok(extractors
+                            .into_iter()
+                            .map(|extractor| (extractor.kind(), extractor.into_sightings()))
+                            .collect())
+                    },
+                )
                 .await;
                 let parse_time = parse_start.elapsed();
 
                 // `spawn_blocking` returns a `JoinHandle` — unwrap the
                 // outer Result (task panic) then the inner Result (parse error).
-                let parsed = match parse_result {
+                let found = match parse_result {
                     Ok(Ok(result)) => result,
                     Ok(Err(err)) => {
                         eprintln!("  [{}] Parse error: {}", filename, err);
@@ -768,14 +762,14 @@ async fn run_crawl(input: String, config: Config) {
                 };
 
                 eprintln!("  [{}] Parsing time: {:.1}s", filename, parse_time.as_secs_f64());
-                eprintln!(
-                    "  [{}] Found {} unique .onion address(es), {} favicon URL(s)",
-                    filename, parsed.onions.len(), parsed.favicon_urls.len()
-                );
+                let counts: Vec<String> = found
+                    .iter()
+                    .map(|(kind, sightings)| format!("{} {}(s)", sightings.len(), kind))
+                    .collect();
+                eprintln!("  [{}] Found {}", filename, counts.join(", "));
 
                 Ok((idx, filename, local_path, ArchiveResult {
-                    onions: parsed.onions,
-                    favicon_urls: parsed.favicon_urls,
+                    found,
                     download_time,
                     parse_time
                 }))
@@ -809,29 +803,16 @@ async fn run_crawl(input: String, config: Config) {
                 total_download += archive.download_time;
                 total_parse += archive.parse_time;
 
-                // Merge onion results
-                let count_before = results.len();
-                for (onion, sources) in archive.onions {
-                    let existing = results.entry(onion).or_default();
-                    for source in sources {
-                        if !existing.iter().any(|s| s.url == source.url && s.archive == source.archive) {
-                            existing.push(source);
-                        }
-                    }
+                // Merge each kind's results into its accumulated map
+                for (kind, sightings) in archive.found {
+                    let (all, new_count) = match kind {
+                        ArtifactKind::Onion => (&mut results, &mut new_onions),
+                        ArtifactKind::Favicon => (&mut favicon_results, &mut new_favicons),
+                    };
+                    let count_before = all.len();
+                    merge_sightings(all, sightings);
+                    *new_count += all.len() - count_before;
                 }
-                new_onions += results.len() - count_before;
-
-                // Merge favicon results
-                let fav_count_before = favicon_results.len();
-                for (url, sources) in archive.favicon_urls {
-                    let existing = favicon_results.entry(url).or_default();
-                    for source in sources {
-                        if !existing.iter().any(|s| s.page_url == source.page_url && s.archive == source.archive) {
-                            existing.push(source);
-                        }
-                    }
-                }
-                new_favicons += favicon_results.len() - fav_count_before;
 
                 if let Err(err) = mark_processed_in(&filename, &output_dir) {
                     eprintln!("  Warning: couldn't mark as processed: {}", err);

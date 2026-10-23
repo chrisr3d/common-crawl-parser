@@ -15,19 +15,21 @@
 //    - ".onion" is rare in web content, so the validator rarely runs
 //    - No NFA/DFA state tracking — just literal comparison + byte checks
 //
-// Both functions have the same signature and produce identical results.
-// This lets you benchmark the technique itself in isolation.
-//
-// Each match is associated with metadata (source URL, crawl date, archive name)
-// from the WARC record headers, so the output maps each .onion address to the
-// specific clearnet pages where it was found.
-
-use std::collections::HashMap;
+// Both functions return the addresses found, in order, duplicates included,
+// and produce identical results. This lets you benchmark the technique
+// itself in isolation. Recording *where* each address was seen is the
+// caller's job (`extractor::OnionExtractor`).
 
 use memchr::memmem;
 use regex::bytes::Regex;
 
-use crate::OnionSource;
+/// The .onion pattern: 16 (v2) or 56 (v3) base32 characters, then `.onion`.
+///
+/// `(?-u:\b)` is an ASCII word boundary: only `[0-9A-Za-z_]` count as word
+/// characters, exactly like `is_word_boundary_byte` in the memchr engine.
+/// A plain `\b` is Unicode-aware, so it treats `é` as a word character and
+/// rejects `café3g2upl4pq6kufc4m.onion`, which the memchr engine accepts.
+pub const ONION_PATTERN: &str = r"(?-u:\b)([a-z2-7]{16}|[a-z2-7]{56})\.onion(?-u:\b)";
 
 // ---------------------------------------------------------------------------
 // Strategy A: regex::bytes — same regex, no UTF-8 conversion
@@ -42,26 +44,14 @@ use crate::OnionSource;
 /// ripgrep uses `regex::bytes` exclusively because real-world files contain
 /// invalid UTF-8 (binary data, mixed encodings). By searching `&[u8]`
 /// directly, we skip the `String::from_utf8_lossy()` allocation that
-/// the baseline strategy makes for every record body.
-///
-/// When a match is found, it's associated with the WARC metadata (source URL
-/// and crawl date) from the record that contained it.
-pub fn search_regex_bytes(
-    body: &[u8],
-    onion_re: &Regex,
-    source: &OnionSource,
-    results: &mut HashMap<String, Vec<OnionSource>>,
-) {
-    for m in onion_re.find_iter(body) {
-        // Only the matched bytes (22 or 62 bytes) are converted to a String.
-        // Compare this to the baseline which converts the ENTIRE body
-        // (potentially hundreds of KB) to a String via from_utf8_lossy.
-        let matched = String::from_utf8_lossy(m.as_bytes()).to_lowercase();
-        let sources = results.entry(matched).or_default();
-        if !sources.iter().any(|s| s.url == source.url && s.archive == source.archive) {
-            sources.push(source.clone());
-        }
-    }
+/// the baseline (`examples/baseline.rs`) makes for every record body.
+pub fn search_regex_bytes(body: &[u8], onion_re: &Regex) -> Vec<String> {
+    onion_re
+        .find_iter(body)
+        // Only the matched bytes (22 or 62 bytes) are converted to a String,
+        // not the ENTIRE body (potentially hundreds of KB).
+        .map(|m| String::from_utf8_lossy(m.as_bytes()).to_lowercase())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -116,14 +106,10 @@ fn is_word_boundary_byte(b: u8) -> bool {
 /// The SIMD scan processes the entire body in microseconds, and the
 /// validator only runs at those 0-2 positions. Compare this to the regex
 /// engine which must track NFA states for every byte.
-pub fn search_memchr(
-    body: &[u8],
-    finder: &memmem::Finder<'_>,
-    source: &OnionSource,
-    results: &mut HashMap<String, Vec<OnionSource>>,
-) {
+pub fn search_memchr(body: &[u8], finder: &memmem::Finder<'_>) -> Vec<String> {
     let needle_len = 6; // ".onion".len()
     let mut search_start = 0;
+    let mut found = Vec::new();
 
     while search_start < body.len() {
         // Phase 1: SIMD scan — find the next ".onion" literal.
@@ -172,17 +158,15 @@ pub fn search_memchr(
             // We still lowercase for consistency (the prefix is already lowercase,
             // but being explicit about it is clearer).
             if let Ok(s) = std::str::from_utf8(address_bytes) {
-                let key = s.to_lowercase();
-                let sources = results.entry(key).or_default();
-                if !sources.iter().any(|s| s.url == source.url && s.archive == source.archive) {
-                    sources.push(source.clone());
-                }
+                found.push(s.to_lowercase());
             }
         }
 
         // Advance past this ".onion" to find the next one.
         search_start = dot_pos + needle_len;
     }
+
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -194,47 +178,32 @@ mod tests {
     use super::*;
 
     fn make_regex() -> Regex {
-        Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b").unwrap()
+        Regex::new(ONION_PATTERN).unwrap()
     }
 
     fn make_finder() -> memmem::Finder<'static> {
         memmem::Finder::new(b".onion")
     }
 
-    fn test_source() -> OnionSource {
-        OnionSource {
-            url: "https://example.com/page".to_string(),
-            date: "2025-10-01T12:00:00Z".to_string(),
-            archive: "test-archive.warc.gz".to_string(),
-        }
-    }
-
-    /// Helper: extract just the set of .onion address keys from results.
-    fn keys(results: &HashMap<String, Vec<OnionSource>>) -> std::collections::HashSet<String> {
-        results.keys().cloned().collect()
+    /// Run both engines on `body`, assert they agree, return what they found.
+    fn search_both(body: &[u8]) -> Vec<String> {
+        let regex_found = search_regex_bytes(body, &make_regex());
+        let memchr_found = search_memchr(body, &make_finder());
+        assert_eq!(
+            regex_found,
+            memchr_found,
+            "Strategies disagree on input: {:?}",
+            String::from_utf8_lossy(body)
+        );
+        regex_found
     }
 
     // -- v2 (16-char) addresses --
 
     #[test]
     fn detects_v2_onion_address() {
-        let body = b"visit http://abcdefghijklmnop.onion for info";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
-        assert!(regex_results.contains_key("abcdefghijklmnop.onion"));
-        // Verify metadata is attached
-        let sources = &regex_results["abcdefghijklmnop.onion"];
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].url, "https://example.com/page");
-        assert_eq!(sources[0].date, "2025-10-01T12:00:00Z");
+        let found = search_both(b"visit http://abcdefghijklmnop.onion for info");
+        assert_eq!(found, ["abcdefghijklmnop.onion"]);
     }
 
     // -- v3 (56-char) addresses --
@@ -245,153 +214,71 @@ mod tests {
         let v3 = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx";
         assert_eq!(v3.len(), 56);
         let body = format!("link: {}.onion is here", v3);
-        let body = body.as_bytes();
 
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
-        assert_eq!(regex_results.len(), 1);
+        let found = search_both(body.as_bytes());
+        assert_eq!(found, [format!("{v3}.onion")]);
     }
 
     // -- Word boundary tests --
 
     #[test]
     fn no_match_when_no_word_boundary() {
-        let body = b"visit abcdefghijklmnop.onions for info";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert!(regex_results.is_empty(), "Should not match with trailing 's'");
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+        let found = search_both(b"visit abcdefghijklmnop.onions for info");
+        assert!(found.is_empty(), "Should not match with trailing 's'");
     }
 
     #[test]
     fn no_match_with_wrong_prefix_length() {
-        let body = b"visit abcdefghij.onion for info";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert!(regex_results.is_empty());
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+        assert!(search_both(b"visit abcdefghij.onion for info").is_empty());
     }
 
     #[test]
     fn no_match_with_invalid_chars_in_prefix() {
-        let body = b"visit abcdefgh89klmnop.onion for info";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
+        assert!(search_both(b"visit abcdefgh89klmnop.onion for info").is_empty());
+    }
 
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert!(regex_results.is_empty());
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+    #[test]
+    fn non_ascii_letter_before_address_is_a_boundary() {
+        // `é` is two bytes (0xC3 0xA9), neither an ASCII word character.
+        let found = search_both("café3g2upl4pq6kufc4m.onion".as_bytes());
+        assert_eq!(found, ["3g2upl4pq6kufc4m.onion"]);
     }
 
     // -- Multiple matches --
 
     #[test]
     fn finds_multiple_addresses() {
-        let body = b"first: abcdefghijklmnop.onion second: qrstuvwxyzabcdef.onion done";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
+        let found =
+            search_both(b"first: abcdefghijklmnop.onion second: qrstuvwxyzabcdef.onion done");
+        assert_eq!(found, ["abcdefghijklmnop.onion", "qrstuvwxyzabcdef.onion"]);
+    }
 
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert_eq!(regex_results.len(), 2);
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+    #[test]
+    fn repeated_address_is_returned_each_time() {
+        let found = search_both(b"abcdefghijklmnop.onion and again abcdefghijklmnop.onion");
+        assert_eq!(found, ["abcdefghijklmnop.onion", "abcdefghijklmnop.onion"]);
     }
 
     // -- Edge cases --
 
     #[test]
     fn address_at_start_of_input() {
-        let body = b"abcdefghijklmnop.onion is at the start";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert_eq!(regex_results.len(), 1);
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+        assert_eq!(search_both(b"abcdefghijklmnop.onion is at the start").len(), 1);
     }
 
     #[test]
     fn address_at_end_of_input() {
-        let body = b"ends with abcdefghijklmnop.onion";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert_eq!(regex_results.len(), 1);
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+        assert_eq!(search_both(b"ends with abcdefghijklmnop.onion").len(), 1);
     }
 
     #[test]
     fn no_false_positive_from_opinion() {
-        let body = b"in my opinion this is fine";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert!(regex_results.is_empty());
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+        assert!(search_both(b"in my opinion this is fine").is_empty());
     }
 
     #[test]
     fn empty_body() {
-        let body = b"";
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
-        let mut regex_results = HashMap::new();
-        let mut memchr_results = HashMap::new();
-        search_regex_bytes(body, &re, &source, &mut regex_results);
-        search_memchr(body, &finder, &source, &mut memchr_results);
-
-        assert!(regex_results.is_empty());
-        assert_eq!(keys(&regex_results), keys(&memchr_results));
+        assert!(search_both(b"").is_empty());
     }
 
     // -- Cross-validation: both strategies always agree --
@@ -409,17 +296,8 @@ mod tests {
             b"\x00\xff binary abcdefghijklmnop.onion data \x80\x90",
         ];
 
-        let re = make_regex();
-        let finder = make_finder();
-        let source = test_source();
-
         for input in inputs {
-            let mut regex_results = HashMap::new();
-            let mut memchr_results = HashMap::new();
-            search_regex_bytes(input, &re, &source, &mut regex_results);
-            search_memchr(input, &finder, &source, &mut memchr_results);
-            assert_eq!(keys(&regex_results), keys(&memchr_results),
-                "Strategies disagree on input: {:?}", String::from_utf8_lossy(input));
+            search_both(input);
         }
     }
 }

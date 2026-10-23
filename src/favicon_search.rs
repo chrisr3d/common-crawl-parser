@@ -14,7 +14,9 @@
 // 4. `<link rel="apple-touch-icon" href="...">` — iOS Safari
 // 5. `<meta name="msapplication-TileImage" content="...">` — Edge/IE
 // 6. Inline `data:` URIs in any of the above → decoded as base64 favicons
-// 7. Fallback: `{scheme}://{domain}/favicon.ico` when no tags found
+//
+// Unlike AIL, we don't add a guessed `{scheme}://{domain}/favicon.ico` for
+// every page: only favicons a page declares are recorded (ADR-0003).
 //
 // ## Why not use an HTML parsing crate?
 //
@@ -56,8 +58,7 @@ pub struct FaviconResult {
 /// Extract favicon references from an HTML byte slice.
 ///
 /// `page_url` is the WARC-Target-URI of the page — used to resolve relative
-/// favicon URLs into absolute ones and to construct the fallback
-/// `{scheme}://{domain}/favicon.ico`.
+/// favicon URLs into absolute ones.
 ///
 /// ## How it works
 ///
@@ -88,17 +89,6 @@ pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
 
     scan_meta_tags(body, &meta_finder, page_url, &mut result);
     scan_meta_tags(body, &meta_finder_upper, page_url, &mut result);
-
-    // --- Fallback: add {scheme}://{domain}/favicon.ico ---
-    //
-    // AIL always adds the root favicon.ico — it's the default location
-    // browsers check when no <link> tag is present. We add it regardless
-    // (as AIL does), so downstream can decide whether to fetch it.
-    if let Some(root_favicon) = build_root_favicon_url(page_url) {
-        if !result.urls.iter().any(|u| u == &root_favicon) {
-            result.urls.push(root_favicon);
-        }
-    }
 
     result
 }
@@ -464,16 +454,6 @@ fn resolve_url(base_url: &str, relative: &str) -> String {
     }
 }
 
-/// Build the default `{scheme}://{domain}/favicon.ico` URL.
-fn build_root_favicon_url(page_url: &str) -> Option<String> {
-    let (scheme, after_scheme) = page_url.split_once("://")?;
-    let host = match after_scheme.find('/') {
-        Some(pos) => &after_scheme[..pos],
-        None => after_scheme,
-    };
-    Some(format!("{scheme}://{host}/favicon.ico"))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -518,18 +498,17 @@ mod tests {
     }
 
     #[test]
-    fn fallback_favicon_ico_always_present() {
+    fn no_root_favicon_guess_without_tags() {
         let html = b"<html><head><title>No icons</title></head></html>";
         let result = extract_favicons(html, "https://example.com/page/deep");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/favicon.ico"));
+        assert!(result.urls.is_empty(), "only declared favicons (ADR-0003)");
     }
 
     #[test]
-    fn fallback_not_duplicated_when_explicit() {
+    fn declared_root_favicon_is_kept() {
         let html = br#"<link rel="icon" href="/favicon.ico">"#;
         let result = extract_favicons(html, "https://example.com/");
-        let count = result.urls.iter().filter(|u| u.as_str() == "https://example.com/favicon.ico").count();
-        assert_eq!(count, 1, "favicon.ico should not be duplicated");
+        assert_eq!(result.urls, ["https://example.com/favicon.ico"]);
     }
 
     #[test]
@@ -577,8 +556,7 @@ mod tests {
             <meta name="msapplication-TileImage" content="/icon3.png">
         "#;
         let result = extract_favicons(html, "https://example.com/");
-        // 3 explicit + 1 fallback favicon.ico
-        assert!(result.urls.len() >= 3);
+        assert_eq!(result.urls.len(), 3);
         assert!(result.urls.iter().any(|u| u.ends_with("icon1.png")));
         assert!(result.urls.iter().any(|u| u.ends_with("icon2.png")));
         assert!(result.urls.iter().any(|u| u.ends_with("icon3.png")));
@@ -591,16 +569,13 @@ mod tests {
             <link rel="canonical" href="https://example.com/">
         "#;
         let result = extract_favicons(html, "https://example.com/");
-        // Only the fallback favicon.ico
-        assert_eq!(result.urls.len(), 1);
-        assert!(result.urls[0].ends_with("/favicon.ico"));
+        assert!(result.urls.is_empty());
     }
 
     #[test]
     fn empty_body() {
         let result = extract_favicons(b"", "https://example.com/");
-        assert_eq!(result.urls.len(), 1); // Just the fallback
-        assert!(result.urls[0].ends_with("/favicon.ico"));
+        assert!(result.urls.is_empty());
     }
 
     #[test]
