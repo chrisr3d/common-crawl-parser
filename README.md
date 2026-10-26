@@ -23,7 +23,7 @@ The project was built incrementally and now features the following:
 9. **In-memory parsing** — Parse from memory with `--transport memory` to skip disk I/O entirely
 10. **Resource guards** — Layered concurrency caps (CPU cores, available RAM) prevent oversubscription and OOM
 11. **Incremental extraction** — Pick Artifact kinds with `-e`; a later run adds kinds without redoing the ones already done
-12. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them); today every kind still reads WARC
+12. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them): on CC-MAIN, `onion` and `favicon` read WAT + WET (~240 MB) instead of WARC (~1 GB), `favicon` alone WAT only
 
 Additional features:
 
@@ -130,9 +130,11 @@ without its Format suffix, such as `.warc.gz`):
 ```
 
 Sighting metadata is extracted from WARC headers (`WARC-Target-URI`, `WARC-Date`) during
-parsing. Results are deduplicated on `(page_url, shard)` pairs. Files written before this
-shape (with `url` / `archive` fields) are not converted: a run that finds one in its output
-directory stops with an error instead of overwriting it.
+parsing; in WAT, whose own `WARC-Date` is when the WAT was generated, the crawl date is
+read from the JSON (`Envelope.WARC-Header-Metadata.WARC-Date`). Results are deduplicated
+on `(page_url, shard)` pairs. Files written before this shape (with `url` / `archive`
+fields) are not converted: a run that finds one in its output directory stops with an
+error instead of overwriting it.
 
 `output/processed.log` records which (Shard, Artifact kind) pairs are done, one
 `<shard> <kind>` line each, such as `CC-NEWS-20251001064107-04363 onion`. A run only extracts the

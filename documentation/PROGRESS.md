@@ -1540,3 +1540,143 @@ A map can be built from an array of `(key, value)` tuples in one expression, as 
 test does for its expected Sightings: `BTreeMap::from([(k1, v1), (k2, v2)])`. The
 standard library implements `From<[(K, V); N]>` for every array length `N`, one generic
 `impl` over a *const generic* parameter, rather than one `impl` per length.
+
+## Step 16: Reading WAT Archives; WAT + WET Plans
+
+### What we built
+
+WAT Archives can now be read, and with them the Plans of ADR-0001 come into force: on
+CC-MAIN, the default `-e onion,favicon` downloads WAT + WET (~240 MB per Shard) instead of
+WARC (~1 GB), `onion` reading both and `favicon` WAT only; `-e favicon` downloads WAT only.
+WARC is still read for CC-NEWS, or when forced with `--formats warc`.
+
+A WAT Archive is a WARC file of `metadata` records, one per record of the matching WARC
+Archive, so three per page (made from its `request`, `response` and `metadata` records).
+Each is a JSON document written by ia-web-commons: the WARC record's headers, its HTTP
+headers and, for an HTML page, the `<link>` and `<meta>` tags of its `<head>` and every link
+with its text. The record's own `WARC-Date` is when the WAT was generated; the crawl date is
+inside the JSON.
+
+- **`PageRecord::Wat(WatMetadata { page_url, date, json, head })`**: the third variant.
+  `WatMetadata::parse` first looks for `"WARC-Type":"response"` with a SIMD `memmem`
+  search, which drops the two records out of three not made from a `response` without
+  parsing them; then parses the JSON once, into structs that declare only the path down to
+  `Head`. `date` is `Envelope.WARC-Header-Metadata.WARC-Date`. A record whose JSON can't be
+  read is skipped: it has no crawl date to give a Sighting.
+- **Onions** are searched in the raw JSON bytes, like the WARC HTTP response: an address is
+  made of `[a-z2-7.]`, which ia-web-commons doesn't escape, and is surrounded by `"`, `/`,
+  `:` or spaces, so the addresses WAT kept are found as in WARC. Three differences: onions
+  only in the page's plain text are gone (WET has them); one right after an escape such as
+  `\n` or `\u2003` is missed, the escape's last character reading as part of the address;
+  and one in the page URL itself is found, as the JSON repeats the WARC headers.
+- **Favicons** come from `Head`: `<link>` entries whose `rel` is a favicon value, `<meta>`
+  entries named `msapplication-TileImage`, resolved against `<base href>` when the page has
+  one, else against the page URL (the WARC scanner ignores `<base>`, so the two differ on
+  such pages). `data:` URLs are skipped: ia-web-commons cuts them after the first comma,
+  so the image is gone. `favicon_search::favicons_in_head` shares the `rel` and `name`
+  checks with the HTML scanner (`is_favicon_rel`, `is_tile_image_name`, case-insensitive:
+  WAT keeps attribute values as written).
+- **Requirements**: `onion` accepts WARC or WAT + WET, `favicon` WARC or WAT. The planner
+  needed no change.
+- **Tests**: `tests/wat_archive.rs` writes the same two pages as a WARC, a WAT and a WET
+  Archive (`WarcBuilder::wat_metadata`, and `wat_response_json` / `wat_request_json` in
+  `tests/common` building the JSON with `serde_json::json!`). On those pages WAT + WET find
+  exactly what WARC finds, with the crawl dates; WAT alone misses only the onion in plain text; every
+  Transport and engine agrees. Smaller tests cover `<base href>`, escaped JSON strings and
+  a record cut short. `tests/crawl_cli.rs` runs the binary on the default kinds (it reads
+  `wat,wet` and saves what a WARC run saves) and on `-e favicon` (it reads `wat`); the test
+  about adding a kind later now forces `--formats warc`.
+
+### Rust concepts introduced
+
+**Partial deserialization, skipping unknown fields**
+A WAT record about an HTML page is a few kilobytes of JSON, most of it the page's links.
+The `Deserialize` structs in `page_record.rs` declare only what is read:
+
+```rust
+#[derive(Deserialize)]
+struct WatJson<'a> {
+    #[serde(rename = "Envelope", borrow)]
+    envelope: Envelope<'a>,
+}
+```
+
+Every key a struct doesn't declare (`Container`, `Links`, `Headers`, `Title`, ...) is
+skipped: `serde_json` still checks that its value is valid JSON, but builds no value from
+it, so the large `Links` array costs a scan, not a `Vec` of links. Skipping is serde's default;
+`#[serde(deny_unknown_fields)]` would turn it into an error. `#[serde(rename = "...")]` maps
+JSON keys such as `WARC-Header-Metadata`, which are not Rust identifiers. A level that may
+be absent is an `Option` (a missing key gives `None`), so a non-HTML response, whose record
+has no `HTML-Metadata`, still parses, with `head: None`.
+
+**Borrowing from the input, and `Cow<'a, str>`**
+`serde_json::from_slice(json)` can give back strings that point into `json` instead of
+copying them: the structs carry a lifetime `'a` tied to the record's bytes, and the
+compiler stops them from outliving the record. A JSON string with an escape (`\/`,
+`\u00e9`) can't be borrowed, though: its decoded text is not in the input as such and must
+be built in a new `String`. A `&'a str` field would then fail the whole parse.
+`Cow<'a, str>` (*clone on write*) holds either: `Cow::Borrowed(&'a str)` for the usual
+unescaped string, `Cow::Owned(String)` for an escaped one. Both deref to `&str`, so the
+code reading them doesn't care which it got.
+
+**`#[serde(borrow)]`, and the `Option<Cow>` pitfall**
+A `Cow` field only borrows when marked `#[serde(borrow)]`; without it, it always
+deserializes as `Owned`. On a field whose type has a lifetime (`Envelope<'a>`), the same
+attribute passes the borrow down. The borrowing only works on a `Cow<'a, str>` field
+itself: inside an `Option`, `Option<Cow<'a, str>>` always allocates, because serde's
+special case for `Cow` looks at the field's type, not inside it. Optional strings (`rel`,
+`url`, `Base`) are therefore plain `Cow`s with `#[serde(default)]`: a missing key reads as
+`""` (`Cow::default()`, an empty `String`, which allocates nothing), and an empty string is
+never a favicon `rel`.
+
+**`Cow` for a value computed only sometimes**
+`favicons_in_head` resolves URLs against the page's `<base href>` when there is one:
+
+```rust
+let base: Cow<'_, str> = match head.base.trim() {
+    "" => Cow::Borrowed(page_url),
+    base_href => Cow::Owned(resolve_url(page_url, base_href)),
+};
+```
+
+Most pages have no `<base>`, and pay nothing; only those with one build a `String`.
+
+**A method returning a reference shorter than `'a`**
+`PageRecord::page_url(&self) -> &'a str` hands out the borrowed URL for the record's whole
+lifetime `'a`. `date` can't: a WAT date is a `Cow` that may own its `String`, and an owned
+string lives only as long as the `WatMetadata` holding it. So `date(&self) -> &str` borrows
+from `self` (lifetime elision ties the result to `&self`). Callers only copy it into a
+`Sighting`, so the shorter borrow is enough.
+
+**`LazyLock`: a `static` built on first use**
+The `memmem::Finder` for `"WARC-Type":"response"` should be built once, not once per
+record, but a `static` must be built at compile time and `Finder::new` can't be (it chooses
+a search algorithm at runtime). `std::sync::LazyLock` runs its closure the first time the
+value is used and keeps the result; it is thread-safe, so the parse tasks on Tokio's
+blocking threads share one `Finder`:
+
+```rust
+static RESPONSE_TYPE: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(br#""WARC-Type":"response""#));
+```
+
+**`const fn`**
+`ArtifactKind::format_requirement` is now `const fn`: a `match` returning constant slices
+needs nothing from the running program, so it can also be called where a value must be
+known at compile time. The planner tests use it to define their requirement constants from
+the real table (`const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();`)
+instead of copying it.
+
+**Let chains, again**
+Both HTML tag scanners now test a tag with three nested `if`s (`scan_link_tags` did not
+before: a `let` between them kept them apart), which Clippy flags as collapsible. Edition
+2024 let chains write them as one condition:
+
+```rust
+if let Some(rel_value) = extract_attribute(tag_bytes, b"rel")
+    && is_favicon_rel(rel_value)
+    && let Some(href) = extract_attribute(tag_bytes, b"href")
+{
+    process_favicon_value(href, page_url, result);
+}
+```
