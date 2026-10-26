@@ -1,7 +1,7 @@
 // cc-extract library — download, parsing, and state management
 //
 // This module ties the pieces together:
-//   - Downloading WARC archives from Common Crawl (async with reqwest)
+//   - Downloading Archives from Common Crawl (async with reqwest)
 //   - `parse_archive`: reading every record of an Archive once and handing
 //     it to each extractor
 //   - Persistent state: processed log and results JSON
@@ -19,18 +19,26 @@
 //
 // `parse_archive` only connects them: a new kind needs its own `Extractor`
 // (and its output file), but the parsing loop stays as it is.
+//
+// Which Formats are read for a Shard is the planner's choice (`plan`): the
+// cheapest Archives that serve every requested kind (`format` says what
+// Common Crawl publishes and where).
 
 pub mod artifact;
 pub mod extractor;
 pub mod favicon_search;
+pub mod format;
 pub mod onion_search;
 pub mod page_record;
+pub mod plan;
 pub mod warc_parser;
 
 // Re-exports: the types callers need most, importable from the crate root
 // (`cc_extract::Sighting` rather than `cc_extract::artifact::Sighting`).
 pub use artifact::{ArtifactKind, Shard, Sighting, Sightings, merge_sightings};
 pub use extractor::{Extractor, FaviconExtractor, OnionEngine, OnionExtractor};
+pub use format::{ArchivePath, Dataset, Format, FormatSet};
+pub use plan::{FormatRequirement, Plan, PlanError};
 pub use page_record::{PageRecord, WarcResponse};
 
 use std::collections::HashSet;
@@ -59,16 +67,7 @@ pub const PROCESSED_FILENAME: &str = "processed.log";
 // Download Logic
 // ---------------------------------------------------------------------------
 
-/// Extract the filename component from a WARC URI path.
-///
-/// e.g. `crawl-data/CC-NEWS/.../CC-NEWS-20251001.warc.gz` → `CC-NEWS-20251001.warc.gz`
-pub fn filename_from_uri(uri: &str) -> Result<&str, &'static str> {
-    uri.rsplit('/')
-        .next()
-        .ok_or("URI has no filename component")
-}
-
-/// Download a single WARC archive from Common Crawl using async I/O.
+/// Download one Archive from Common Crawl to `download/` using async I/O.
 ///
 /// ## Why `reqwest` instead of `ureq`
 ///
@@ -87,14 +86,12 @@ pub fn filename_from_uri(uri: &str) -> Result<&str, &'static str> {
 /// buffering the entire archive (hundreds of MB) in memory. Each chunk is
 /// written to disk immediately. This keeps memory usage constant regardless
 /// of archive size.
-pub async fn download_warc_async(
+pub async fn download_archive(
     client: &reqwest::Client,
-    uri: &str,
+    archive: &ArchivePath,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let url = format!("{}{}", COMMONCRAWL_BASE, uri);
-    let filename = filename_from_uri(uri).map_err(|e| -> Box<dyn Error + Send + Sync> {
-        e.into()
-    })?;
+    let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
+    let filename = archive.file_name();
     let local_path: PathBuf = Path::new("download").join(filename);
 
     if local_path.exists() {
@@ -169,7 +166,7 @@ pub async fn download_warc_async(
     Ok(true)
 }
 
-/// Download a WARC archive into memory instead of to disk.
+/// Download one Archive into memory instead of to disk.
 ///
 /// ## Why in-memory?
 ///

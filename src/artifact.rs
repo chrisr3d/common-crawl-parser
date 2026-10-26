@@ -17,7 +17,9 @@ use std::str::FromStr;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::format::Format;
 use crate::page_record::PageRecord;
+use crate::plan::FormatRequirement;
 
 // ---------------------------------------------------------------------------
 // Artifact kinds
@@ -62,6 +64,28 @@ impl ArtifactKind {
             ArtifactKind::Favicon => "favicons.json",
         }
     }
+
+    /// The Format combinations this kind can be extracted from (ADR-0001),
+    /// among which the planner chooses (`plan`).
+    ///
+    /// ## A static table as a `match`
+    ///
+    /// The table could be a `HashMap` built at startup, but then a new kind
+    /// without an entry would only fail when looked up, at runtime. A
+    /// `match` on `self` must cover every variant, so a new kind without a
+    /// requirement doesn't compile. The slices are written inline:
+    /// `&[&[Format::Warc]]` is built from constants only, so the compiler
+    /// stores it once in the binary (*constant promotion*) and the
+    /// reference lives for `'static`.
+    pub fn format_requirement(self) -> FormatRequirement {
+        match self {
+            // Only WARC can be read so far. Once the WET and WAT readers
+            // exist, `onion` also accepts WAT + WET and `favicon` WAT
+            // (ADR-0001).
+            ArtifactKind::Onion => &[&[Format::Warc]],
+            ArtifactKind::Favicon => &[&[Format::Warc]],
+        }
+    }
 }
 
 /// `Display` gives the CLI name, used in progress output and
@@ -96,8 +120,8 @@ impl FromStr for ArtifactKind {
 /// `CC-MAIN-20260305070756-20260305100756-00000`.
 ///
 /// Common Crawl publishes each Shard as one Archive per Format
-/// (`<shard>.warc.gz`, later `.warc.wat.gz` and `.warc.wet.gz`), so the
-/// Shard is what those Archives have in common.
+/// (`<shard>.warc.gz`, `<shard>.warc.wat.gz`, `<shard>.warc.wet.gz`), so
+/// the Shard is what those Archives have in common.
 ///
 /// ## The newtype pattern
 ///
@@ -112,10 +136,14 @@ pub struct Shard(String);
 
 impl Shard {
     /// The Shard an Archive belongs to: its file name without the Format
-    /// suffix (`X.warc.gz` → `X`). A name without that suffix is kept whole.
+    /// suffix (`X.warc.gz`, `X.warc.wat.gz` or `X.warc.wet.gz` → `X`). A
+    /// name without one of these suffixes is kept whole.
     pub fn from_archive_name(archive_name: &str) -> Self {
-        let id = archive_name
-            .strip_suffix(".warc.gz")
+        // `find_map` returns the first `Some` the closure gives: the name
+        // stripped of the first suffix it ends with.
+        let id = Format::all()
+            .iter()
+            .find_map(|format| archive_name.strip_suffix(format.suffix()))
             .unwrap_or(archive_name);
         Shard(id.to_string())
     }
