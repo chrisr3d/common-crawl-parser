@@ -209,11 +209,10 @@ mod tests {
     use crate::format::Dataset;
     use Format::{Warc, Wat, Wet};
 
-    // Requirement tables as ADR-0001 describes them. The real table
-    // (`ArtifactKind::format_requirement`) only lists WARC until the WAT and
-    // WET readers exist, so the planner is tested against these.
-    const ONION: FormatRequirement = &[&[Warc], &[Wat, Wet]];
-    const FAVICON: FormatRequirement = &[&[Warc], &[Wat]];
+    // The real requirement tables (ADR-0001), and the one `inline-favicon`
+    // will have once it exists.
+    const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();
+    const FAVICON: FormatRequirement = ArtifactKind::Favicon.format_requirement();
     const INLINE_FAVICON: FormatRequirement = &[&[Warc]];
 
     fn cc_main() -> FormatSet {
@@ -273,6 +272,25 @@ mod tests {
     }
 
     // `Plan::new` and `Plan::within` use the real requirement table.
+
+    #[test]
+    fn default_kinds_read_wat_and_wet_on_cc_main() {
+        let plan = Plan::new(
+            Dataset::CcMain,
+            &[ArtifactKind::Onion, ArtifactKind::Favicon],
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.formats(), FormatSet::of(&[Wat, Wet]));
+        assert_eq!(
+            plan.kinds_reading(Wat),
+            [ArtifactKind::Onion, ArtifactKind::Favicon]
+        );
+        assert_eq!(plan.kinds_reading(Wet), [ArtifactKind::Onion]);
+
+        let plan = Plan::new(Dataset::CcMain, &[ArtifactKind::Favicon], None).unwrap();
+        assert_eq!(plan.formats(), FormatSet::of(&[Wat]));
+    }
 
     #[test]
     fn forced_formats_must_serve_every_kind() {

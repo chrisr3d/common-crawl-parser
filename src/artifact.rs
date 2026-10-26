@@ -77,13 +77,18 @@ impl ArtifactKind {
     /// `&[&[Format::Warc]]` is built from constants only, so the compiler
     /// stores it once in the binary (*constant promotion*) and the
     /// reference lives for `'static`.
-    pub fn format_requirement(self) -> FormatRequirement {
+    ///
+    /// `const fn`: nothing here needs the program to run, so the function
+    /// can also be called where a value must be known at compile time, such
+    /// as a `const` item.
+    pub const fn format_requirement(self) -> FormatRequirement {
         match self {
-            // WARC and WET can be read so far, but WET alone misses most
-            // onions. Once the WAT reader exists, `onion` also accepts
-            // WAT + WET and `favicon` WAT (ADR-0001).
-            ArtifactKind::Onion => &[&[Format::Warc]],
-            ArtifactKind::Favicon => &[&[Format::Warc]],
+            // WAT keeps the HTTP headers, links and `<meta>` contents, WET
+            // the visible text: either alone misses onions, the two
+            // together missed none in the sample (`RESEARCH-warc-wat-wet.md`).
+            ArtifactKind::Onion => &[&[Format::Warc], &[Format::Wat, Format::Wet]],
+            // WAT lists every `<link>` and `<meta>` tag of the `<head>`.
+            ArtifactKind::Favicon => &[&[Format::Warc], &[Format::Wat]],
         }
     }
 }
@@ -168,7 +173,7 @@ impl fmt::Display for Shard {
 pub struct Sighting {
     /// URL of the crawled page (`WARC-Target-URI`).
     pub page_url: String,
-    /// When the page was crawled (`WARC-Date`).
+    /// When the page was crawled: the response's `WARC-Date`.
     pub date: String,
     /// The Shard the page was read from.
     pub shard: Shard,
