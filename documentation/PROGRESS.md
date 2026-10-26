@@ -1341,3 +1341,139 @@ byte for byte.
 Each test crate compiles its own copy of `common`, so the helpers it doesn't use would
 each raise a dead-code warning; the attribute on the `mod` line silences them for that
 crate only.
+
+---
+
+## Step 14: Planner — Formats, Datasets, Multi-Archive Shards
+
+### What we built
+
+Each Shard is now planned before it is downloaded: the program picks the cheapest Formats
+that serve every requested kind (ADR-0001), downloads one Archive per Format in that
+Plan, and hands each Archive to the kinds that read its Format. Only WARC can be read so
+far, so every kind's Format requirement is still `{WARC}` and every Plan is WARC: the
+behaviour on a WARC paths file is unchanged. The WET and WAT readers, in the next steps,
+only have to add their entries to the table.
+
+- **`src/format.rs`**: `Format { Warc, Wat, Wet }` with its file suffix (`.warc.gz`,
+  `.warc.wat.gz`, `.warc.wet.gz`), directory (`warc`, `wat`, `wet`) and estimated size
+  (1 GB, 170 MB, 70 MB); `FormatSet`, a set of Formats; `Dataset { CcMain, CcNews }`,
+  detected from the path prefix, with the Formats it publishes (CC-MAIN all three, CC-NEWS
+  WARC only, written from memory and marked unverified in the code).
+- **`ArchivePath`**: one line of a paths file. The three Archives of a Shard differ only in
+  the last directory and the suffix, so any of them locates the others:
+
+  ```text
+  crawl-data/CC-MAIN-2025-01/segments/1735000000000.00/wat/CC-MAIN-…-00000.warc.wat.gz
+  crawl-data/CC-MAIN-2025-01/segments/1735000000000.00/warc/CC-MAIN-…-00000.warc.gz
+  ```
+
+  The input can now be a WARC, WAT or WET paths file. `Shard::from_archive_name` strips any
+  of the three suffixes.
+- **`src/plan.rs`**: `cheapest_fit(requirement, inside)` is the cheapest of a kind's
+  accepted combinations made only of Formats in `inside`; `cheapest_plan(available,
+  requirements)` tries every non-empty subset of the Dataset's Formats, keeps those where
+  every kind has a fit, and returns the cheapest. `Plan` holds what each kind reads; its
+  `formats()` are the Archives to download.
+- **`--formats warc,wat,wet`** forces the Plan. It is rejected at startup if it can't serve
+  a requested kind, and when a Shard is planned if its Dataset doesn't publish one of the
+  Formats:
+
+  ```text
+  $ cc-extract warc.paths --formats wet -e favicon
+  Error: cannot extract favicon from wet: it needs warc
+  ```
+
+  A forced Format no kind reads is not downloaded.
+- **Pipeline per Shard**: each task downloads every Archive of its Shard's Plan, then
+  parses each one with new extractors for the kinds reading its Format, and unions their
+  Sightings. A (Shard, kind) pair is saved and marked only if every Archive that kind
+  reads parsed (`Plan::split_done`, with `Iterator::partition`); a failed download no
+  longer stops the kinds that don't need that Archive. `-d` deletes every Archive of the
+  Shard that parsed. `download_warc_async` and `download_warc_to_memory` are now
+  `download_archive` and `download_archive_to_memory`, and take an `ArchivePath`, which
+  replaces `filename_from_uri`.
+- **RAM guard**: with `-t memory`, a job holds every Archive of its Plan at once, so the
+  available RAM is divided by the largest estimated Plan among the scheduled Shards instead
+  of a flat 1 GB. With WARC Plans this is the same 1 GB as before.
+
+The planner is tested with the requirement tables of ADR-0001 (`onion` = WARC or WAT + WET,
+`favicon` = WARC or WAT, `inline-favicon` = WARC): `onion` + `favicon` plan WAT + WET with
+`onion` reading both and `favicon` WAT only, `favicon` alone plans WAT, anything with
+`inline-favicon` plans WARC, CC-NEWS always plans WARC.
+
+### Rust concepts introduced
+
+**Modelling a static table with `match`**
+`ArtifactKind::format_requirement` returns each kind's accepted combinations:
+
+```rust
+match self {
+    ArtifactKind::Onion => &[&[Format::Warc]],
+    ArtifactKind::Favicon => &[&[Format::Warc]],
+}
+```
+
+A `HashMap<ArtifactKind, …>` built at startup would work too, but a kind added without an
+entry would only fail when looked up, at runtime. A `match` must cover every variant, so a
+new kind without a requirement doesn't compile. `Format::suffix`, `directory` and
+`estimated_size` are tables of the same shape. The return type is `&'static [&'static
+[Format]]`: the slices are built from constants only, so the compiler stores them once in
+the binary and the reference lives for the whole program (*constant promotion*), with no
+`static` item to declare.
+
+**Bitmasks as small sets**
+`FormatSet(u8)` gives each Format one bit (`1 << format as u8`: `as u8` turns a fieldless
+variant into its position in the declaration). A set is the OR of its members' bits, so
+WAT + WET is `0b110`, and set operations are single integer operations: union is `a | b`,
+"`a` is inside `b`" is `a & !b == 0` (no bit of `a` outside `b`). The struct wraps the `u8`
+(newtype) so a set can't be mixed up with any other number.
+
+**Enumerating subsets with a bitmask**
+Every subset of a set only clears bits, so its value is at most the set's own. Counting
+from 1 (the smallest non-empty set) up to the set's value visits every non-empty subset;
+numbers with a bit outside the set are filtered out:
+
+```rust
+(1..=self.0).map(FormatSet).filter(move |subset| subset.is_subset_of(self))
+```
+
+With three Formats that is at most seven candidates, so trying them all is simpler than
+any clever search. `.map(FormatSet)` passes the tuple struct's constructor as a function:
+`FormatSet` is also a `fn(u8) -> FormatSet`.
+
+**`Iterator::min_by_key`**
+`min_by_key(|plan| plan.estimated_size())` returns the item with the smallest key, or
+`None` if the iterator is empty. Both planner functions end with it, so "nothing fits"
+needs no separate check. The key comes from a closure, so `FormatSet` needs no `Ord` (sets
+have no natural order). On a tie it keeps the first item.
+
+**`FromIterator`: making a type a `collect()` target**
+`collect()` builds its result through the `FromIterator` trait. Implementing
+`FromIterator<Format> for FormatSet` lets the pipeline write
+`parsed.iter().map(ArchivePath::format).collect::<FormatSet>()`, the same way it would
+collect into a `Vec`. `ArchivePath::format` is passed as a function path, without a closure.
+
+**Collecting into `Result` and `Option`**
+`Plan::within` maps each kind to a `Result` and collects into `Result<Vec<_>, _>`: the
+first `Err` stops the iteration and is returned, otherwise all the values come back in a
+`Vec`. The scheduling loop does the same with `Option<Vec<ArchivePath>>`: `None` as soon as
+one Format's path can't be derived.
+
+**A typed error: `enum PlanError` and an empty `impl Error`**
+`PlanError` has one variant per reason (`Unavailable`, `Unserved`) carrying the facts, and
+`Display` writes the message. Tests compare variants, so rewording a message breaks none of
+them. `impl Error for PlanError {}` is empty: `Error` only requires `Debug` and `Display`,
+and implementing it lets `?` turn a `PlanError` into a `Box<dyn Error>`.
+
+**Let chains: `if let … && let …`**
+Edition 2024 allows several `let` patterns joined by `&&` in one `if`:
+
+```rust
+if let Some(forced) = forced
+    && let Err(err) = Plan::within(forced, &kinds)
+{
+```
+
+The body runs only if both match, and `forced` is in scope for the second pattern. Before,
+this needed two nested `if let`s.

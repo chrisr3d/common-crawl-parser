@@ -12,7 +12,7 @@ Common Crawl provides petabytes of web archive data stored as WARC (Web ARChive)
 
 The project was built incrementally and now features the following:
 
-1. **Read WARC paths** — Parse an input file listing WARC archive URIs (plain text or `.gz`)
+1. **Read paths files** — Parse an input file listing WARC, WAT or WET archive URIs (plain text or `.gz`); the other Formats' paths are derived from it
 2. **HTTP download** — Fetch WARC archives from Common Crawl servers
 3. **WARC parsing** — Decompress gzip-compressed archives and parse WARC records
 4. **Onion extraction** — Use regex to find `.onion` addresses in page content
@@ -23,11 +23,12 @@ The project was built incrementally and now features the following:
 9. **In-memory parsing** — Parse from memory with `--transport memory` to skip disk I/O entirely
 10. **Resource guards** — Layered concurrency caps (CPU cores, available RAM) prevent oversubscription and OOM
 11. **Incremental extraction** — Pick Artifact kinds with `-e`; a later run adds kinds without redoing the ones already done
+12. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them); today every kind still reads WARC
 
 Additional features:
 
 - **CLI with `clap`** — Short flags (`-l`, `-o`, `-j`, `-d`, `-e`, `-t`), auto `--help`, required input file
-- **Timing** — Per-archive download/parse duration and averages in summary
+- **Timing** — Per-Shard download/parse duration and averages in summary
 
 ## Rust Concepts Covered
 
@@ -60,11 +61,13 @@ cargo build                                    # compile (debug)
 cargo build --release                          # compile (optimized — ~5.6s per 864MB archive)
 cargo run -- warc.paths                        # download & parse all archives
 cargo run -- warc.paths.gz                     # same, from gzipped paths file
-cargo run -- warc.paths -l 3                   # process up to 3 archives
+cargo run -- warc.paths -l 3                   # process up to 3 Shards
 cargo run -- warc.paths -j 2                   # 2 concurrent downloads (default: CPU cores)
-cargo run -- warc.paths -d                     # delete archive after parsing
+cargo run -- warc.paths -d                     # delete each Shard's Archives after parsing
 cargo run -- warc.paths -e onion               # extract onions only (default: onion,favicon)
 cargo run -- warc.paths -e onion,favicon       # later: adds favicons, skips the onion work done
+cargo run -- wat.paths.gz                      # any Format's paths file: Shards are the same
+cargo run -- warc.paths --formats warc         # force the Formats downloaded per Shard
 cargo run -- warc.paths -t disk                # parse from the downloaded file (default)
 cargo run -- warc.paths -t memory              # parse from memory (no disk I/O)
 cargo run -- warc.paths -t mmap                # decompress + mmap (needs disk space)
@@ -101,9 +104,10 @@ kept as a benchmark: `cargo run --release --example baseline -- <archive.warc.gz
 Key optimizations: custom WARC parser skips non-response bodies (~60% of data), SIMD
 literal search replaces the regex engine, `zlib-ng` backend for faster gzip decompression.
 
-The `memory` Transport costs ~800 MB per archive × concurrent jobs. Layered resource guards
-automatically cap concurrency: jobs are limited to 2× CPU cores, and with `--transport
-memory`, further limited by available RAM (queried at startup on macOS and Linux) to
+The `memory` Transport holds every Archive of a Shard's Plan in RAM (~1 GB for WARC) ×
+concurrent jobs. Layered resource guards automatically cap concurrency: jobs are limited to
+2× CPU cores, and with `--transport memory`, further limited by available RAM (queried on
+macOS and Linux) divided by the largest estimated Plan among the scheduled Shards, to
 prevent OOM.
 
 ## Output Format
@@ -111,7 +115,7 @@ prevent OOM.
 Each Artifact kind has its own file: `output/onions.json` and `output/favicons.json`, as
 nested JSON. Each Artifact (a `.onion` address, a favicon URL) maps to a list of Sightings:
 the clearnet page where it was found, the crawl date, and the Shard (the Archive file name
-without `.warc.gz`):
+without its Format suffix, such as `.warc.gz`):
 
 ```json
 {

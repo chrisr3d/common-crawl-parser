@@ -16,29 +16,32 @@ cargo test --lib               # run only library tests (skip integration tests)
 cargo clippy                   # lint
 cargo fmt                      # format
 cargo fmt -- --check           # check formatting without modifying
-cargo run -- warc.paths -l 3   # process 3 archives (needs warc.paths file)
+cargo run -- warc.paths -l 3   # process 3 Shards (needs warc.paths file)
 cargo run -- warc.paths -e onion -t memory  # onions only, parsed from memory
+cargo run -- wat.paths.gz --formats warc    # any Format's paths file; force the Formats downloaded
 cargo run -- merge output/1 output/2        # merge several --output-dir runs into output/
 cargo run -- --help            # show all CLI options
 cargo run --release --example baseline -- <archive.warc.gz>  # original warc-crate parser, as a benchmark
 ```
 
-Key CLI flags: `-l` (limit archives), `-o` (offset), `-j` (concurrent jobs), `-d` (delete after parse), `-e` (Artifact kinds, comma-separated, default `onion,favicon`), `-t` (Transport: disk/memory/mmap), `--onion-engine` (memchr/regex), `--output-dir`.
+Key CLI flags: `-l` (limit Shards), `-o` (offset), `-j` (concurrent jobs), `-d` (delete a Shard's Archives after parse), `-e` (Artifact kinds, comma-separated, default `onion,favicon`), `--formats` (force the Plan, comma-separated `warc,wat,wet`), `-t` (Transport: disk/memory/mmap), `--onion-engine` (memchr/regex), `--output-dir`.
 
 ## Architecture
 
-Parsing separates three independent choices: Transport (how bytes arrive), Format (how records are read, WARC only for now), Artifact kind (what is extracted). Vocabulary in `GLOSSARY.md`.
+Parsing separates three independent choices: Transport (how bytes arrive), Format (how records are read, WARC only for now), Artifact kind (what is extracted). Which Formats a Shard downloads is the planner's choice (ADR-0001). Vocabulary in `GLOSSARY.md`.
 
-- **`src/main.rs`** -- CLI parsing (`clap` derive), scheduling (per Shard, the requested kinds not yet done), pipeline orchestration, concurrent task dispatch via `buffer_unordered`. Maps `-t` (fieldless `TransportChoice`) to a `Transport` per task and builds one extractor per missing kind (`new_extractor`). `merge` subcommand loops over every `ArtifactKind`. Contains platform-specific `get_available_memory()` behind `#[cfg(target_os)]`.
-- **`src/lib.rs`** -- `Transport { Disk(PathBuf), Memory(Vec<u8>), Mmap(PathBuf) }` and `parse_archive(transport, &shard, &mut extractors)`, the one parsing loop; async download (`reqwest`); state management per kind: `load_processed_from` (`HashSet<(Shard, ArtifactKind)>` from `<shard> <kind>` lines in `output/processed.log`), `load_sightings_from` / `save_sightings_to` / `merge_sightings_from`, and `save_then_mark` (save the kind's file, then append the line: the only way to mark a pair done). Re-exports the main types at the crate root.
-- **`src/artifact.rs`** -- `ArtifactKind` (clap `ValueEnum`: one name for CLI, `Display` and `processed.log`; `output_filename()`), `Shard` (Archive name without `.warc.gz`), `Sighting { page_url, date, shard }`, `Sightings` map, and the only dedup logic (`add_sightings`, `merge_sightings`).
-- **`src/extractor.rs`** -- `trait Extractor` (one boxed extractor per kind per Shard), `OnionExtractor` (engine `Memchr | Regex`), `FaviconExtractor`. The parsing loop never names a kind.
+- **`src/main.rs`** -- CLI parsing (`clap` derive), scheduling (per Shard, the requested kinds not yet done, their `Plan` and the Plan's `ArchivePath`s), pipeline orchestration, concurrent task dispatch via `buffer_unordered` (one task per Shard: `fetch` each Archive, then `parse_archives` in `spawn_blocking`). Maps `-t` (fieldless `TransportChoice`) to a `Transport` per Archive and builds, per Archive, one extractor per kind reading its Format (`new_extractor`). `merge` subcommand loops over every `ArtifactKind`. Contains platform-specific `get_available_memory()` behind `#[cfg(target_os)]`.
+- **`src/lib.rs`** -- `Transport { Disk(PathBuf), Memory(Vec<u8>), Mmap(PathBuf) }` and `parse_archive(transport, &shard, &mut extractors)`, the one parsing loop; async download (`reqwest`: `download_archive`, `download_archive_to_memory`); state management per kind: `load_processed_from` (`HashSet<(Shard, ArtifactKind)>` from `<shard> <kind>` lines in `output/processed.log`), `load_sightings_from` / `save_sightings_to` / `merge_sightings_from`, and `save_then_mark` (save the kind's file, then append the line: the only way to mark a pair done). Re-exports the main types at the crate root.
+- **`src/artifact.rs`** -- `ArtifactKind` (clap `ValueEnum`: one name for CLI, `Display` and `processed.log`; `output_filename()`; `format_requirement()`, the static table of accepted Format combinations), `Shard` (Archive name without its Format suffix), `Sighting { page_url, date, shard }`, `Sightings` map, and the only dedup logic (`add_sightings`, `merge_sightings`).
+- **`src/format.rs`** -- `Format { Warc, Wat, Wet }` (clap `ValueEnum`; suffix, directory, estimated size), `FormatSet` (bitmask set of Formats, `subsets()`), `Dataset { CcMain, CcNews }` (from the path prefix; available Formats), `ArchivePath` (one paths file line; `in_format` derives the other Formats' paths).
+- **`src/plan.rs`** -- the planner: `cheapest_fit` (a kind's cheapest combination inside some Formats), `cheapest_plan` (cheapest subset of the Dataset's Formats serving every kind), `Plan` (what each kind reads; `new` with optional `--formats`, `within`, `kinds_reading`, `split_done` for the done rule of ADR-0002), `PlanError`.
+- **`src/extractor.rs`** -- `trait Extractor` (one boxed extractor per kind per Archive; a kind reading several Archives has its Sightings unioned), `OnionExtractor` (engine `Memchr | Regex`), `FaviconExtractor`. The parsing loop never names a kind.
 - **`src/page_record.rs`** -- `PageRecord<'a>` (one variant per Format, `Warc(WarcResponse)` today) borrowing the parser's bytes; HTML detection via `WarcResponse::html_body()`.
 - **`src/warc_parser.rs`** -- Custom byte-level WARC record parser. `WarcRecordIter<R: BufRead>` for streaming, `WarcSliceIter<'a>` for mmap. Skips non-response record bodies for performance.
 - **`src/onion_search.rs`** -- `ONION_PATTERN` (ASCII word boundaries) and the two engines: `search_regex_bytes()` (regex::bytes) and `search_memchr()` (SIMD memmem). Both return `Vec<String>`.
 - **`src/favicon_search.rs`** -- Byte-level `<link>`/`<meta>` favicon scanner. Declared favicons only, no root `/favicon.ico` guess (ADR-0003).
 
-**Data flow**: Read paths file -> schedule each Shard with its requested kinds not yet done -> concurrent download (async) -> `spawn_blocking` parse (CPU-bound) -> merge results sequentially -> per kind: save JSON, then mark `<shard> <kind>` done.
+**Data flow**: Read paths file (WARC, WAT or WET) -> schedule each Shard with its requested kinds not yet done -> plan its Formats, derive the Plan's Archive paths -> concurrent per-Shard tasks: download each Archive (async), then `spawn_blocking` parse each with the extractors of the kinds reading its Format (CPU-bound) -> merge results sequentially -> per kind whose Archives all parsed: save JSON, then mark `<shard> <kind>` done.
 
 **Transports and onion engines**: `-t disk` (default), `-t memory`, `-t mmap`; `--onion-engine memchr` (default) or `regex`. All combinations give identical results. The original `warc`-crate parser lives in `examples/baseline.rs` (`warc` is a dev-dependency).
 
@@ -49,7 +52,7 @@ Parsing separates three independent choices: Transport (how bytes arrive), Forma
 - `[profile.dev.package."*"] opt-level = 2` optimizes dependencies in debug builds
 - Regex must be case-sensitive -- `(?i)` with `\b` causes 1000x+ slowdown
 - `flate2` uses `zlib-ng` backend for SIMD gzip decompression
-- Resource guards cap concurrency at `min(requested_jobs, 2x CPU cores, available_RAM / 1GB)` (the RAM cap only with `-t memory`)
+- Resource guards cap concurrency at `min(requested_jobs, 2x CPU cores, available_RAM / largest estimated Plan)` (the RAM cap only with `-t memory`; estimates: WARC 1 GB, WAT 170 MB, WET 70 MB)
 
 ## Agent skills
 
