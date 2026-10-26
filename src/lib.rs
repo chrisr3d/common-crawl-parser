@@ -184,18 +184,16 @@ pub async fn download_archive(
 ///
 /// ## Trade-off: memory vs disk
 ///
-/// Each archive is ~800 MB compressed. With `-j 4`, that's ~3.2 GB of RAM.
+/// A WARC Archive is ~1 GB compressed. With `-j 4`, that's ~4 GB of RAM.
 /// This is acceptable for modern machines and comparable to what the `mmap`
 /// Transport uses in virtual memory. The benefit is zero disk usage in the
 /// `download/` directory.
-pub async fn download_warc_to_memory(
+pub async fn download_archive_to_memory(
     client: &reqwest::Client,
-    uri: &str
+    archive: &ArchivePath,
 ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    let url = format!("{}{}", COMMONCRAWL_BASE, uri);
-    let filename = filename_from_uri(uri).map_err(|e| -> Box<dyn Error + Send + Sync> {
-        e.into()
-    })?;
+    let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
+    let filename = archive.file_name();
 
     eprintln!("  [{}] Downloading to memory...", filename);
     eprintln!("  [{}] URL: {}", filename, url);

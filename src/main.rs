@@ -24,10 +24,10 @@ use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 
 use cc_extract::{
-    download_warc_async, download_warc_to_memory, filename_from_uri, load_processed_from,
-    load_sightings_from, merge_sightings, merge_sightings_from, parse_archive, save_sightings_to,
-    save_then_mark, ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor,
-    Shard, Sightings, Transport, DEFAULT_OUTPUT_DIR,
+    download_archive, download_archive_to_memory, load_processed_from, load_sightings_from,
+    merge_sightings, merge_sightings_from, parse_archive, save_sightings_to, save_then_mark,
+    ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Format, FormatSet, OnionEngine,
+    OnionExtractor, Plan, Shard, Sightings, Transport, DEFAULT_OUTPUT_DIR,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,10 +223,13 @@ fn get_available_memory() -> Option<u64> {
 #[command(name = "cc-extract")]
 #[command(about = "Extract artifacts, such as .onion addresses and favicon URLs, from Common Crawl archives")]
 struct Config {
-    /// Path to the WARC-paths file (supports .gz) — omit when using `merge`
+    /// Path to a WARC, WAT or WET paths file (supports .gz) — omit when using `merge`
+    ///
+    /// Any of the three locates every Format of each Shard, so the paths
+    /// file doesn't decide which Formats are downloaded (see --formats).
     input: Option<String>,
 
-    /// Maximum number of archives to process (default: all)
+    /// Maximum number of Shards to process (default: all)
     #[arg(short, long)]
     limit: Option<usize>,
 
@@ -242,7 +245,7 @@ struct Config {
     #[arg(short, long, default_value_t = default_jobs())]
     jobs: usize,
 
-    /// Delete archive files after parsing
+    /// Delete each Shard's Archives once parsed
     #[arg(short, long)]
     delete: bool,
 
@@ -260,6 +263,19 @@ struct Config {
     // `--help` shows `[default: onion,favicon]`.
     #[arg(short, long, value_enum, value_delimiter = ',', default_value = "onion,favicon")]
     extract: Vec<ArtifactKind>,
+
+    /// Formats to download for every Shard, comma-separated (default: the
+    /// cheapest ones serving every kind)
+    ///
+    /// Rejected if they can't serve a requested kind, or if a Shard's
+    /// Dataset doesn't publish one of them. Each kind still reads the
+    /// cheapest Formats it accepts among these; one no kind reads is not
+    /// downloaded.
+    //
+    // `Option<Vec<_>>`: `None` when the flag is absent, so "not given" is
+    // told apart from any list of values.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    formats: Option<Vec<Format>>,
 
     /// How downloaded archives reach the parser
     #[arg(short, long, value_enum, default_value_t = TransportChoice::Disk)]
@@ -299,30 +315,119 @@ enum Command {
 }
 
 // ---------------------------------------------------------------------------
-// Per-archive task input and result
+// Per-Shard task input and result
 // ---------------------------------------------------------------------------
 
-/// One Archive to process, and the requested kinds not yet done for its
-/// Shard. Only those kinds' extractors run on it.
-struct ScheduledArchive {
+/// One Shard to process: the Plan for the requested kinds not yet done for
+/// it, and where the Plan's Archives are. Only those kinds' extractors run.
+struct ScheduledShard {
     /// 1-based position among the paths after `--offset`, for log messages.
     index: usize,
-    uri: String,
-    kinds: Vec<ArtifactKind>,
+    shard: Shard,
+    plan: Plan,
+    /// One Archive per Format in the Plan.
+    archives: Vec<ArchivePath>,
 }
 
-/// The outcome of processing a single archive — passed back from each
+/// The outcome of processing a single Shard — passed back from each
 /// concurrent task to the main task for merging.
 ///
 /// We need this struct because each task runs independently and can't
 /// mutate shared state. Instead, each task returns its results and the
 /// main task merges them sequentially — no locks needed.
-struct ArchiveResult {
+struct ShardResult {
     shard: Shard,
-    /// What each extractor found, tagged with its Artifact kind.
+    /// What each kind found, for the kinds whose Archives all parsed.
     found: Vec<(ArtifactKind, Sightings)>,
+    /// The kinds left undone because one of their Archives failed.
+    undone: Vec<ArtifactKind>,
+    /// The Archives that were downloaded and parsed.
+    parsed: Vec<ArchivePath>,
     download_time: Duration,
     parse_time: Duration
+}
+
+/// Where the disk and mmap Transports keep a downloaded Archive.
+fn local_path(archive: &ArchivePath) -> PathBuf {
+    Path::new("download").join(archive.file_name())
+}
+
+/// Download one Archive, unless the file Transports find it already in
+/// `download/`, and return the `Transport` the parser reads it from.
+///
+/// With the memory Transport, the Archive is downloaded to memory
+/// (`Vec<u8>`) instead of disk: the compressed bytes stay in RAM and are
+/// passed directly to the parser.
+async fn fetch(
+    client: &reqwest::Client,
+    archive: &ArchivePath,
+    transport_choice: TransportChoice,
+) -> Result<Transport, Box<dyn Error + Send + Sync>> {
+    match transport_choice {
+        TransportChoice::Memory => Ok(Transport::Memory(
+            download_archive_to_memory(client, archive).await?,
+        )),
+        TransportChoice::Disk | TransportChoice::Mmap => {
+            let local_path = local_path(archive);
+            if local_path.exists() {
+                eprintln!("  [{}] Already downloaded", archive.file_name());
+            } else {
+                download_archive(client, archive).await?;
+            }
+            Ok(if transport_choice == TransportChoice::Mmap {
+                Transport::Mmap(local_path)
+            } else {
+                Transport::Disk(local_path)
+            })
+        }
+    }
+}
+
+/// Parse each downloaded Archive of one Shard with the extractors of the
+/// kinds that read its Format.
+///
+/// Returns what each kind found, merged over the Archives it reads, and the
+/// Archives that parsed. Sightings from different Archives are unioned
+/// (`merge_sightings`), never joined record by record. An Archive that
+/// fails to parse contributes nothing: its extractors, and what they found
+/// before the error, are dropped.
+fn parse_archives(
+    downloaded: Vec<(ArchivePath, Transport)>,
+    shard: &Shard,
+    plan: &Plan,
+    onion_engine: OnionEngine,
+    transport_choice: TransportChoice,
+) -> (BTreeMap<ArtifactKind, Sightings>, Vec<ArchivePath>) {
+    let mut found: BTreeMap<ArtifactKind, Sightings> = BTreeMap::new();
+    let mut parsed = Vec::new();
+
+    for (archive, transport) in downloaded {
+        // One boxed extractor per kind reading this Archive's Format.
+        let kinds = plan.kinds_reading(archive.format());
+        let mut extractors: Vec<Box<dyn Extractor>> = kinds
+            .iter()
+            .map(|&kind| new_extractor(kind, onion_engine))
+            .collect();
+        eprintln!(
+            "  [{}] Parsing ({}) for {}...",
+            archive.file_name(),
+            cli_name(&transport_choice),
+            kind_list(&kinds)
+        );
+
+        match parse_archive(transport, shard, &mut extractors) {
+            Ok(()) => {
+                for extractor in extractors {
+                    let kind = extractor.kind();
+                    merge_sightings(found.entry(kind).or_default(), extractor.into_sightings());
+                }
+                parsed.push(archive);
+            }
+            Err(err) => eprintln!("  [{}] Parse error: {}", archive.file_name(), err),
+        }
+    }
+
+    (found, parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +467,7 @@ async fn main() {
     let input = match config.input {
         Some(ref path) => path.clone(),
         None => {
-            eprintln!("Error: missing required argument <INPUT> (path to WARC-paths file)");
+            eprintln!("Error: missing required argument <INPUT> (path to a paths file)");
             eprintln!("Usage: cc-extract <INPUT> [OPTIONS]");
             eprintln!("       cc-extract merge <INPUT_DIRS>...");
             process::exit(1);
@@ -412,7 +517,7 @@ fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
 
 /// Unwrap loaded results, or stop the run before anything is saved.
 ///
-/// Every finished archive saves the results files again, so carrying on
+/// Every finished Shard saves the results files again, so carrying on
 /// with an empty map would overwrite a file that merely failed to load.
 fn load_or_exit(loaded: Result<Sightings, Box<dyn Error>>) -> Sightings {
     loaded.unwrap_or_else(|err| {
@@ -439,7 +544,7 @@ fn save_all(results: &BTreeMap<ArtifactKind, Sightings>, output_dir: &str) {
     }
 }
 
-/// Main crawl pipeline — download and parse WARC archives.
+/// Main crawl pipeline — download and parse each Shard's Archives.
 async fn run_crawl(input: String, config: Config) {
     let limit_display = match config.limit {
         Some(n) => format!("{}", n),
@@ -455,6 +560,23 @@ async fn run_crawl(input: String, config: Config) {
 
     let transport_choice = config.transport;
     let onion_engine = config.onion_engine;
+
+    // --- Check forced Formats against the requested kinds ---
+    //
+    // Done before reading anything: whether `--formats` can serve a kind
+    // doesn't depend on the Shard. Whether each Shard's Dataset publishes
+    // those Formats is checked when it is planned, still before any
+    // download.
+    //
+    // `if let … && let …` (a *let chain*, edition 2024) matches both
+    // patterns in one condition, instead of two nested `if let`s.
+    let forced = config.formats.as_deref().map(FormatSet::of);
+    if let Some(forced) = forced
+        && let Err(err) = Plan::within(forced, &kinds)
+    {
+        eprintln!("Error: {}", err);
+        process::exit(1);
+    }
 
     // --- Cap jobs at 2× CPU cores ---
     //
@@ -476,41 +598,10 @@ async fn run_crawl(input: String, config: Config) {
         config.jobs
     };
 
-    // --- Cap concurrent jobs based on available RAM (memory Transport only) ---
-    //
-    // ## Defensive resource management
-    //
-    // With `--transport memory`, each concurrent job holds an entire archive
-    // in memory (~800 MB–1 GB). Without a cap, a 16-core machine with 8 GB
-    // of RAM would try to hold 16 archives simultaneously — guaranteed OOM.
-    //
-    // We query available RAM once at startup and compute the maximum safe
-    // number of concurrent in-memory jobs. `buffer_unordered` then provides
-    // natural backpressure: when a job finishes and frees its buffer, the
-    // next one starts and allocates a new buffer.
-    let effective_jobs = if transport_choice == TransportChoice::Memory {
-        const MAX_ARCHIVE_SIZE: u64 = 1_073_741_824; // 1 GB worst case
-        if let Some(available) = get_available_memory() {
-            let max_jobs = (available / MAX_ARCHIVE_SIZE).max(1) as usize;
-            if max_jobs < capped_jobs {
-                eprintln!(
-                    "Warning: available RAM ({:.1} GB) limits in-memory jobs to {} \
-                     (requested {}). Use --transport disk or free memory for more concurrency.",
-                    available as f64 / 1_073_741_824.0,
-                    max_jobs,
-                    capped_jobs,
-                );
-                max_jobs
-            } else {
-                capped_jobs
-            }
-        } else {
-            capped_jobs // Can't detect RAM — proceed with CPU-capped jobs
-        }
-    } else {
-        capped_jobs // Archives go to disk — no memory concern
+    let formats_display = match forced {
+        Some(forced) => format!(", formats: {}", forced),
+        None => String::new(),
     };
-
     let offset_display = if config.offset > 0 {
         format!(", offset: {}", config.offset)
     } else {
@@ -522,16 +613,16 @@ async fn run_crawl(input: String, config: Config) {
         String::new()
     };
     eprintln!(
-        "Reading WARC paths from '{}' (extract: {}, limit: {}{}, jobs: {}, delete after: {}, \
+        "Reading paths from '{}' (extract: {}{}, limit: {}{}, jobs: {}, delete after: {}, \
          transport: {}, onion engine: {}{})",
-        input, kind_list(&kinds), limit_display, offset_display, effective_jobs,
+        input, kind_list(&kinds), formats_display, limit_display, offset_display, capped_jobs,
         config.delete, cli_name(&transport_choice), cli_name(&onion_engine), output_dir_display
     );
 
     // --- Open and read the paths file ---
     // Supports both plain text and gzip-compressed (.gz) paths files.
-    // Common Crawl distributes warc.paths.gz — we decompress transparently
-    // using `libflate`.
+    // Common Crawl distributes `warc.paths.gz`, `wat.paths.gz` and
+    // `wet.paths.gz` — we decompress transparently using `libflate`.
     let file = File::open(&input).unwrap_or_else(|err| {
         eprintln!("Error: cannot open '{}': {}", input, err);
         process::exit(1);
@@ -588,23 +679,23 @@ async fn run_crawl(input: String, config: Config) {
 
     // --- Schedule: the requested kinds still missing for each Shard ---
     //
-    // We do this upfront so we know exactly which archives to process
-    // concurrently. An Archive whose Shard is done for every requested kind
-    // is skipped and doesn't count toward the limit; any other is scheduled
-    // with only its missing kinds.
-    let mut work_items: Vec<ScheduledArchive> = Vec::new();
+    // We do this upfront so we know exactly which Shards to process
+    // concurrently. A Shard done for every requested kind is skipped and
+    // doesn't count toward the limit; any other is planned for its missing
+    // kinds only, and its Plan's Archive paths are derived from the line.
+    let mut work_items: Vec<ScheduledShard> = Vec::new();
     let mut skip_count: usize = 0;
 
     for (i, uri) in uris.iter().enumerate() {
-        let filename = match filename_from_uri(uri) {
-            Ok(f) => f,
+        let path = match ArchivePath::parse(uri) {
+            Ok(path) => path,
             Err(err) => {
                 eprintln!("[{}] {}: {}", i + 1, uri, err);
                 continue;
             }
         };
 
-        let shard = Shard::from_archive_name(filename);
+        let shard = path.shard();
         let missing: Vec<ArtifactKind> = kinds
             .iter()
             .copied()
@@ -612,7 +703,7 @@ async fn run_crawl(input: String, config: Config) {
             .collect();
 
         if missing.is_empty() {
-            eprintln!("[{}] {} — already processed, skipping", i + 1, filename);
+            eprintln!("[{}] {} — already processed, skipping", i + 1, shard);
             skip_count += 1;
             continue;
         }
@@ -624,13 +715,33 @@ async fn run_crawl(input: String, config: Config) {
             }
         }
 
-        work_items.push(ScheduledArchive { index: i + 1, uri: uri.clone(), kinds: missing });
+        // A Plan fails only on a configuration no Shard of this Dataset can
+        // meet (such as `--formats wat` on CC-NEWS), so the run stops here,
+        // before anything is downloaded.
+        let plan = Plan::new(path.dataset(), &missing, forced).unwrap_or_else(|err| {
+            eprintln!("Error: [{}] {}: {}", i + 1, shard, err);
+            process::exit(1);
+        });
+
+        // `collect` into `Option<Vec<_>>` gives `None` if any Format's path
+        // can't be derived.
+        let archives: Option<Vec<ArchivePath>> =
+            plan.formats().iter().map(|format| path.in_format(format)).collect();
+        let Some(archives) = archives else {
+            eprintln!(
+                "[{}] {}: cannot derive the paths of {} from it",
+                i + 1, uri, plan.formats()
+            );
+            continue;
+        };
+
+        work_items.push(ScheduledShard { index: i + 1, shard, plan, archives });
     }
 
     let output_dir = config.output_dir;
 
     if work_items.is_empty() {
-        eprintln!("No archives to process.");
+        eprintln!("No Shards to process.");
         save_all(&results, &output_dir);
         eprintln!(
             "\nSummary: 0 processed, {} skipped, 0 failed",
@@ -643,7 +754,51 @@ async fn run_crawl(input: String, config: Config) {
         return;
     }
 
-    eprintln!("Processing {} archive(s) with {} concurrent job(s)\n", work_items.len(), effective_jobs);
+    // --- Cap concurrent jobs based on available RAM (memory Transport only) ---
+    //
+    // ## Defensive resource management
+    //
+    // With `--transport memory`, each concurrent job holds every Archive of
+    // its Shard's Plan in memory (~1 GB for WARC, less for WAT + WET).
+    // Without a cap, a 16-core machine with 8 GB of RAM would try to hold
+    // 16 Plans simultaneously — guaranteed OOM.
+    //
+    // We query available RAM once, after scheduling, and divide it by the
+    // largest estimated Plan among the scheduled Shards: the worst case of
+    // what one job can hold. `buffer_unordered` then provides natural
+    // backpressure: when a job finishes and frees its buffers, the next one
+    // starts and allocates new ones.
+    let effective_jobs = if transport_choice == TransportChoice::Memory {
+        let largest_plan = work_items
+            .iter()
+            .map(|item| item.plan.formats().estimated_size())
+            .max()
+            .unwrap_or(1)
+            .max(1); // never divide by zero
+        if let Some(available) = get_available_memory() {
+            let max_jobs = (available / largest_plan).max(1) as usize;
+            if max_jobs < capped_jobs {
+                eprintln!(
+                    "Warning: available RAM ({:.1} GB) limits in-memory jobs to {} \
+                     (requested {}, up to {:.1} GB per Shard). Use --transport disk or \
+                     free memory for more concurrency.",
+                    available as f64 / 1_073_741_824.0,
+                    max_jobs,
+                    capped_jobs,
+                    largest_plan as f64 / 1_073_741_824.0,
+                );
+                max_jobs
+            } else {
+                capped_jobs
+            }
+        } else {
+            capped_jobs // Can't detect RAM — proceed with CPU-capped jobs
+        }
+    } else {
+        capped_jobs // Archives go to disk — no memory concern
+    };
+
+    eprintln!("Processing {} Shard(s) with {} concurrent job(s)\n", work_items.len(), effective_jobs);
 
     // --- Create a shared HTTP client ---
     //
@@ -662,9 +817,9 @@ async fn run_crawl(input: String, config: Config) {
     //
     // ## How the pipeline works
     //
-    // `stream::iter(work_items)` creates a stream of scheduled archives.
+    // `stream::iter(work_items)` creates a stream of scheduled Shards.
     // `.map(|item| async { ... })` transforms each into a future that
-    // downloads + parses one archive.
+    // downloads + parses one Shard's Archives.
     //
     // `.buffer_unordered(jobs)` is the concurrency controller:
     // - It polls up to `jobs` futures simultaneously
@@ -672,66 +827,49 @@ async fn run_crawl(input: String, config: Config) {
     // - When one completes, the next pending future starts
     //
     // This gives us bounded concurrency without manual semaphore management.
-    // "Unordered" means faster archives finish first — we don't block
+    // "Unordered" means faster Shards finish first — we don't block
     // waiting for a slow download just because it started earlier.
-    let archive_stream = stream::iter(work_items)
-        .map(|ScheduledArchive { index: idx, uri, kinds }| {
+    let shard_stream = stream::iter(work_items)
+        .map(|ScheduledShard { index: idx, shard, plan, archives }| {
             // Clone the shared client for this task. `reqwest::Client` is
             // an `Arc` inside, so the clone is cheap (just increments a
             // reference count) and shares the connection pool.
             let client = client.clone();
 
             async move {
-                let filename = match filename_from_uri(&uri) {
-                    Ok(f) => f.to_string(),
-                    Err(err) => {
-                        eprintln!("[{}] {}: {}", idx, uri, err);
-                        return Err(format!("{}: {}", uri, err));
-                    }
-                };
-
-                eprintln!("[{}] {}: extracting {}", idx, filename, kind_list(&kinds));
+                let kinds = plan.kinds();
+                eprintln!(
+                    "[{}] {}: extracting {} from {}",
+                    idx, shard, kind_list(&kinds), plan.formats()
+                );
 
                 // --- Download phase ---
                 //
-                // With the memory Transport, we download to memory
-                // (`Vec<u8>`) instead of disk. The compressed bytes stay in
-                // RAM and are passed directly to the parser. The other two
-                // write to `download/<filename>` first, unless the file is
-                // already there. Either way the result is the `Transport`
-                // the parser reads from.
-                let local_path: PathBuf = Path::new("download").join(&filename);
+                // Every Archive of the Plan, one after the other (Shards
+                // already download concurrently). A failed download is
+                // reported and the Shard carries on: the kinds that don't
+                // read that Archive can still finish.
                 let download_start = Instant::now();
-
-                let transport = match transport_choice {
-                    TransportChoice::Memory => {
-                        match download_warc_to_memory(&client, &uri).await {
-                            Ok(data) => Transport::Memory(data),
-                            Err(err) => {
-                                eprintln!("  [{}] Download error: {}", filename, err);
-                                return Err(format!("{}: download error: {}", filename, err));
-                            }
-                        }
+                let mut downloaded: Vec<(ArchivePath, Transport)> = Vec::new();
+                for archive in archives {
+                    match fetch(&client, &archive, transport_choice).await {
+                        Ok(transport) => downloaded.push((archive, transport)),
+                        Err(err) => eprintln!("  [{}] Download error: {}", archive.file_name(), err),
                     }
-                    TransportChoice::Disk | TransportChoice::Mmap => {
-                        if !local_path.exists() {
-                            if let Err(err) = download_warc_async(&client, &uri).await {
-                                eprintln!("  [{}] Download error: {}", filename, err);
-                                return Err(format!("{}: download error: {}", filename, err));
-                            }
-                        } else {
-                            eprintln!("  [{}] Already downloaded", filename);
-                        }
-                        if transport_choice == TransportChoice::Mmap {
-                            Transport::Mmap(local_path.clone())
-                        } else {
-                            Transport::Disk(local_path.clone())
-                        }
-                    }
-                };
-
+                }
                 let download_time = download_start.elapsed();
-                eprintln!("  [{}] Download time: {:.1}s", filename, download_time.as_secs_f64());
+                eprintln!("  [{}] Download time: {:.1}s", shard, download_time.as_secs_f64());
+
+                if downloaded.is_empty() {
+                    return ShardResult {
+                        shard,
+                        found: Vec::new(),
+                        undone: kinds,
+                        parsed: Vec::new(),
+                        download_time,
+                        parse_time: Duration::ZERO
+                    };
+                }
 
                 // --- Parse on the blocking thread pool ---
                 //
@@ -747,62 +885,57 @@ async fn run_crawl(input: String, config: Config) {
                 // async task until the blocking work finishes, freeing the
                 // worker thread for other downloads.
                 //
-                // With the memory Transport, the `Vec<u8>` inside
+                // With the memory Transport, the `Vec<u8>` inside each
                 // `Transport::Memory` is *moved* into the blocking closure —
                 // a zero-cost ownership transfer (no data copying). After the
-                // move, the async task no longer owns the buffer, and the
+                // move, the async task no longer owns the buffers, and the
                 // compiler prevents use-after-move.
-                eprintln!("  [{}] Parsing ({})...", filename, cli_name(&transport_choice));
-                let shard = Shard::from_archive_name(&filename);
-                // The closure takes ownership of what it captures; the clone
-                // keeps a `shard` here for the result.
+                //
+                // The closure takes ownership of what it captures; the
+                // clones keep a `shard` and a `plan` here for the result.
                 let parse_shard = shard.clone();
+                let parse_plan = plan.clone();
 
                 let parse_start = Instant::now();
-                let parse_result = tokio::task::spawn_blocking(
-                    move || -> Result<Vec<(ArtifactKind, Sightings)>, Box<dyn Error + Send + Sync>> {
-                        // One boxed extractor per kind still missing for this Shard.
-                        let mut extractors: Vec<Box<dyn Extractor>> = kinds
-                            .iter()
-                            .map(|&kind| new_extractor(kind, onion_engine))
-                            .collect();
-                        parse_archive(transport, &parse_shard, &mut extractors)?;
-                        Ok(extractors
-                            .into_iter()
-                            .map(|extractor| (extractor.kind(), extractor.into_sightings()))
-                            .collect())
-                    },
-                )
+                let parse_result = tokio::task::spawn_blocking(move || {
+                    parse_archives(downloaded, &parse_shard, &parse_plan, onion_engine, transport_choice)
+                })
                 .await;
                 let parse_time = parse_start.elapsed();
 
-                // `spawn_blocking` returns a `JoinHandle` — unwrap the
-                // outer Result (task panic) then the inner Result (parse error).
-                let found = match parse_result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(err)) => {
-                        eprintln!("  [{}] Parse error: {}", filename, err);
-                        return Err(format!("{}: parse error: {}", filename, err));
-                    }
-                    Err(err) => {
-                        eprintln!("  [{}] Task panic: {}", filename, err);
-                        return Err(format!("{}: task panic: {}", filename, err));
-                    }
-                };
+                // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
+                // the task panicked: then no Archive counts as parsed.
+                let (mut by_kind, parsed) = parse_result.unwrap_or_else(|err| {
+                    eprintln!("  [{}] Task panic: {}", shard, err);
+                    (BTreeMap::new(), Vec::new())
+                });
+                eprintln!("  [{}] Parsing time: {:.1}s", shard, parse_time.as_secs_f64());
 
-                eprintln!("  [{}] Parsing time: {:.1}s", filename, parse_time.as_secs_f64());
-                eprintln!(
-                    "  [{}] Found {}",
-                    filename,
-                    count_list(found.iter().map(|(kind, sightings)| (*kind, sightings.len())))
-                );
+                // A kind is done only if every Archive it reads parsed
+                // (ADR-0002); the others' partial Sightings are dropped.
+                let parsed_formats: FormatSet = parsed.iter().map(ArchivePath::format).collect();
+                let (done, undone) = plan.split_done(parsed_formats);
+                let found: Vec<(ArtifactKind, Sightings)> = done
+                    .into_iter()
+                    .map(|kind| (kind, by_kind.remove(&kind).unwrap_or_default()))
+                    .collect();
 
-                Ok((filename, local_path, ArchiveResult {
+                if !found.is_empty() {
+                    eprintln!(
+                        "  [{}] Found {}",
+                        shard,
+                        count_list(found.iter().map(|(kind, sightings)| (*kind, sightings.len())))
+                    );
+                }
+
+                ShardResult {
                     shard,
                     found,
+                    undone,
+                    parsed,
                     download_time,
                     parse_time
-                }))
+                }
             }
         })
         .buffer_unordered(effective_jobs);
@@ -825,56 +958,59 @@ async fn run_crawl(input: String, config: Config) {
     // `pin_mut!` pins the stream to the stack so we can poll it.
     // This is needed because `buffer_unordered` returns a stream that
     // must be pinned to be polled (a Rust async trait requirement).
-    futures::pin_mut!(archive_stream);
+    futures::pin_mut!(shard_stream);
 
-    while let Some(task_result) = archive_stream.next().await {
-        match task_result {
-            Ok((filename, local_path, archive)) => {
-                total_download += archive.download_time;
-                total_parse += archive.parse_time;
+    while let Some(result) = shard_stream.next().await {
+        // For each done kind: merge, save its file, *then* mark the pair
+        // done. A crash or failed write in between leaves the pair
+        // unmarked, never marked with its Sightings unsaved (see
+        // `save_then_mark`).
+        for (kind, sightings) in result.found {
+            // Extractors only run for requested kinds, and every
+            // requested kind was loaded. Inserting an empty map here
+            // instead would overwrite a results file never loaded.
+            let all = results
+                .get_mut(&kind)
+                .expect("results are loaded for every requested kind");
+            let count_before = all.len();
+            merge_sightings(all, sightings);
+            *new_counts.entry(kind).or_default() += all.len() - count_before;
 
-                // For each kind: merge, save its file, *then* mark the pair
-                // done. A crash or failed write in between leaves the pair
-                // unmarked, never marked with its Sightings unsaved (see
-                // `save_then_mark`).
-                for (kind, sightings) in archive.found {
-                    // Extractors only run for requested kinds, and every
-                    // requested kind was loaded. Inserting an empty map here
-                    // instead would overwrite a results file never loaded.
-                    let all = results
-                        .get_mut(&kind)
-                        .expect("results are loaded for every requested kind");
-                    let count_before = all.len();
-                    merge_sightings(all, sightings);
-                    *new_counts.entry(kind).or_default() += all.len() - count_before;
-
-                    if let Err(err) = save_then_mark(kind, all, &archive.shard, &output_dir) {
-                        eprintln!(
-                            "  [{}] Warning: {} will be extracted again next run: {}",
-                            filename, kind, err
-                        );
-                    }
-                }
-
-                process_count += 1;
-
-                // With the memory Transport there is no local file to
-                // delete — the data was parsed from memory and already dropped.
-                if delete && transport_choice != TransportChoice::Memory {
-                    match fs::remove_file(&local_path) {
-                        Ok(()) => eprintln!("  [{}] Deleted {}", filename, local_path.display()),
-                        Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", filename, err)
-                    }
-                }
-
-                eprintln!();
-            }
-            Err(err) => {
-                eprintln!("  Error: {}", err);
-                fail_count += 1;
-                eprintln!();
+            if let Err(err) = save_then_mark(kind, all, &result.shard, &output_dir) {
+                eprintln!(
+                    "  [{}] Warning: {} will be extracted again next run: {}",
+                    result.shard, kind, err
+                );
             }
         }
+
+        if result.undone.is_empty() {
+            process_count += 1;
+            total_download += result.download_time;
+            total_parse += result.parse_time;
+        } else {
+            eprintln!(
+                "  [{}] Error: {} will be extracted again next run",
+                result.shard,
+                kind_list(&result.undone)
+            );
+            fail_count += 1;
+        }
+
+        // With the memory Transport there is no local file to delete — the
+        // data was parsed from memory and already dropped. An Archive that
+        // failed to parse is kept.
+        if delete && transport_choice != TransportChoice::Memory {
+            for archive in &result.parsed {
+                let local_path = local_path(archive);
+                match fs::remove_file(&local_path) {
+                    Ok(()) => eprintln!("  [{}] Deleted {}", result.shard, local_path.display()),
+                    Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", result.shard, err)
+                }
+            }
+        }
+
+        eprintln!();
     }
 
     // --- Final save (safety net) ---
@@ -896,7 +1032,7 @@ async fn run_crawl(input: String, config: Config) {
         let avg_dl = total_download.as_secs_f64() / process_count as f64;
         let avg_parse = total_parse.as_secs_f64() / process_count as f64;
         eprintln!(
-            "Avg per archive: {:.1}s download, {:.1}s parsing",
+            "Avg per Shard: {:.1}s download, {:.1}s parsing",
             avg_dl, avg_parse
         );
     }

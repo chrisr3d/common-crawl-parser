@@ -25,6 +25,9 @@ use common::{WarcBuilder, http_response};
 /// File name of the fixture Archive.
 const ARCHIVE_NAME: &str = "CC-MAIN-20250101000000-20250101010101-00000.warc.gz";
 
+/// The Shard the fixture Archive belongs to.
+const SHARD: &str = "CC-MAIN-20250101000000-20250101010101-00000";
+
 /// The paths file line for the fixture. Only its file name is used: the
 /// Archive is already in `download/`.
 const ARCHIVE_URI: &str = "crawl-data/CC-MAIN-2025-01/segments/1735000000000.00/warc/\
@@ -55,12 +58,17 @@ fn workspace(test_name: &str) -> PathBuf {
     dir
 }
 
+/// The binary, set to run in `workspace` on its `warc.paths`.
+fn cc_extract(workspace: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cc-extract"));
+    command.current_dir(workspace).arg("warc.paths");
+    command
+}
+
 /// Run the binary in `workspace` on its `warc.paths` with `args`, and
 /// return what it printed on stderr. Panics if it fails.
 fn crawl(workspace: &Path, args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_cc-extract"))
-        .current_dir(workspace)
-        .arg("warc.paths")
+    let output = cc_extract(workspace)
         .args(["--jobs", "1"])
         .args(args)
         .output()
@@ -102,11 +110,34 @@ fn adding_a_kind_later_runs_only_that_kind() {
     crawl(&dir, &["-e", "onion,favicon", "--output-dir", "at_once"]);
 
     assert!(
-        second_run.contains(&format!("{ARCHIVE_NAME}: extracting favicon\n")),
+        second_run.contains(&format!("{SHARD}: extracting favicon from warc\n")),
         "second run should extract favicon only:\n{second_run}"
     );
     let stepwise = saved_state(&dir.join("stepwise"));
     assert_eq!(stepwise, saved_state(&dir.join("at_once")));
     // The fixture's onion and favicon really were found.
     assert!(stepwise.0.iter().all(|sightings| sightings.len() == 1));
+}
+
+/// `--formats` that can't serve a requested kind stop the run at startup,
+/// before anything is downloaded or written.
+#[test]
+fn formats_that_cannot_serve_a_kind_are_rejected() {
+    let dir = workspace("formats_that_cannot_serve_a_kind_are_rejected");
+
+    let output = cc_extract(&dir)
+        .args(["--formats", "wet", "-e", "favicon"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "cc-extract should fail:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cannot extract favicon from wet"),
+        "the message should name the kind and the Formats:\n{stderr}"
+    );
+    assert!(!dir.join("output").exists());
 }
