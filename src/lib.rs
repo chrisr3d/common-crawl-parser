@@ -12,7 +12,7 @@
 //   - Transport: how the compressed bytes arrive (a file on disk, a buffer
 //     in memory, or a decompressed copy that is memory-mapped), see
 //     `Transport` below
-//   - Format: how records are read; WARC and WET for now (`warc_parser`,
+//   - Format: how records are read: WARC, WAT or WET (`warc_parser`,
 //     `page_record`)
 //   - Artifact kind: what is extracted, one `Extractor` per kind
 //     (`extractor`, `artifact`)
@@ -39,7 +39,7 @@ pub use artifact::{ArtifactKind, Shard, Sighting, Sightings, merge_sightings};
 pub use extractor::{Extractor, FaviconExtractor, OnionEngine, OnionExtractor};
 pub use format::{ArchivePath, Dataset, Format, FormatSet};
 pub use plan::{FormatRequirement, Plan, PlanError};
-pub use page_record::{PageRecord, WarcResponse, WetConversion};
+pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -284,9 +284,6 @@ const PROGRESS_EVERY: u64 = 10_000;
 /// `Extractor::into_sightings` hands that over. The function itself never
 /// looks at which Artifact kinds it is feeding.
 ///
-/// WAT Archives can't be read yet: they are rejected before any byte is
-/// read.
-///
 /// ## Synchronous on purpose
 ///
 /// Parsing is CPU-bound (gzip decompression + searching), not I/O-bound.
@@ -307,10 +304,6 @@ pub fn parse_archive(
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if format == Format::Wat {
-        return Err("WAT Archives can't be read yet".into());
-    }
-
     let records_scanned = match transport {
         // `File` and `Cursor<Vec<u8>>` both implement `Read`, so one
         // streaming loop serves both.
@@ -350,8 +343,9 @@ fn parse_stream<R: Read>(
         let record = record?;
         // The `PageRecord` borrows the record's own buffers: nothing is
         // copied, and it is dropped before the next record is read.
-        let page = to_page_record(format, &record.target_uri, &record.date, &record.body);
-        hand_over(&page, shard, extractors, &mut records_scanned);
+        if let Some(page) = to_page_record(format, &record.target_uri, &record.date, &record.body) {
+            hand_over(&page, shard, extractors, &mut records_scanned);
+        }
     }
 
     Ok(records_scanned)
@@ -410,8 +404,9 @@ fn parse_mmap(
         // invalid ones.
         let page_url = String::from_utf8_lossy(record.target_uri);
         let date = String::from_utf8_lossy(record.date);
-        let page = to_page_record(format, &page_url, &date, record.body);
-        hand_over(&page, shard, extractors, &mut records_scanned);
+        if let Some(page) = to_page_record(format, &page_url, &date, record.body) {
+            hand_over(&page, shard, extractors, &mut records_scanned);
+        }
     }
 
     drop(mmap);
@@ -424,26 +419,32 @@ fn parse_mmap(
 }
 
 /// The page one record of a `format` Archive holds: its `body` (the bytes
-/// after the WARC headers) is the HTTP response in WARC, the page's text in
-/// WET.
+/// after the WARC headers) is the HTTP response in WARC, a JSON document in
+/// WAT, the page's text in WET.
+///
+/// `None` for a WAT record that describes no page: one made from a WARC
+/// `request` or `metadata` record, or one whose JSON can't be read. Such a
+/// record has no crawl date to give a Sighting, so it is skipped.
 fn to_page_record<'a>(
     format: Format,
     page_url: &'a str,
     date: &'a str,
     body: &'a [u8],
-) -> PageRecord<'a> {
+) -> Option<PageRecord<'a>> {
     match format {
-        Format::Warc => PageRecord::Warc(WarcResponse {
+        Format::Warc => Some(PageRecord::Warc(WarcResponse {
             page_url,
             date,
             http_response: body,
-        }),
-        Format::Wet => PageRecord::Wet(WetConversion {
+        })),
+        // `date` is when the WAT was generated: the crawl date is read
+        // from the JSON.
+        Format::Wat => WatMetadata::parse(page_url, body).map(PageRecord::Wat),
+        Format::Wet => Some(PageRecord::Wet(WetConversion {
             page_url,
             date,
             text: body,
-        }),
-        Format::Wat => unreachable!("parse_archive rejects WAT Archives"),
+        })),
     }
 }
 

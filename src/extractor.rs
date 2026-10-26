@@ -65,7 +65,7 @@ pub enum OnionEngine {
 }
 
 /// Finds `.onion` addresses anywhere in a page: the whole HTTP response of
-/// a WARC record, the text of a WET record.
+/// a WARC record, the JSON of a WAT record, the text of a WET record.
 pub struct OnionExtractor {
     search: OnionSearch,
     sightings: Sightings,
@@ -103,6 +103,17 @@ impl Extractor for OnionExtractor {
             // The whole response, HTTP headers included: about half of the
             // onions found sit in headers such as `Onion-Location`.
             PageRecord::Warc(response) => response.http_response,
+            // The raw JSON, searched like the HTTP response: an address is
+            // made of `[a-z2-7.]` only, which ia-web-commons doesn't
+            // escape, and the bytes around it (`"`, `/`, `:`, space) are
+            // word boundaries, so the addresses WAT kept are found as in
+            // the WARC record. Three differences: onions only in the
+            // page's plain text are gone (WET has them); one right after
+            // an escape such as `\n` or `\u2003` is missed, the escape's
+            // last character reading as part of the address; and one in
+            // the page URL itself is found, as the JSON repeats the WARC
+            // headers.
+            PageRecord::Wat(metadata) => metadata.json,
             // Only the onions written out as text on the page.
             PageRecord::Wet(conversion) => conversion.text,
         };
@@ -144,19 +155,28 @@ impl Extractor for FaviconExtractor {
     }
 
     fn extract(&mut self, record: &PageRecord<'_>, shard: &Shard) {
-        let html = match record {
-            PageRecord::Warc(response) => response.html_body(),
+        let found = match record {
+            // The scanner also decodes inline `data:` favicons; they are not
+            // kept until they get their own Artifact kind.
+            PageRecord::Warc(response) => response
+                .html_body()
+                .map(|html| favicon_search::extract_favicons(html, response.page_url).urls),
+            // ia-web-commons already parsed the page's `<head>`.
+            PageRecord::Wat(metadata) => metadata
+                .head
+                .as_ref()
+                .map(|head| favicon_search::favicons_in_head(head, metadata.page_url)),
             // WET keeps only the page's text: no `<link>` or `<meta>` tag
             // survives, so there is nothing to find.
             PageRecord::Wet(_) => None,
         };
-        let Some(html) = html else {
-            return;
-        };
-        // The scanner also decodes inline `data:` favicons; they are not
-        // kept until they get their own Artifact kind.
-        let found = favicon_search::extract_favicons(html, record.page_url()).urls;
-        add_sightings(&mut self.sightings, found, record, shard);
+        // `None` (not an HTML page) finds nothing, like an empty list.
+        add_sightings(
+            &mut self.sightings,
+            found.unwrap_or_default(),
+            record,
+            shard,
+        );
     }
 
     fn artifact_count(&self) -> usize {

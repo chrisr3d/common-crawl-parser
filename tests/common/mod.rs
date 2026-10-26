@@ -28,6 +28,7 @@ use cc_extract::{
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Building WARC Archives
@@ -35,8 +36,9 @@ use flate2::write::GzEncoder;
 
 /// Builds a gzipped WARC Archive in memory, one record at a time.
 ///
-/// WET Archives are WARC files too, with other record types, so the same
-/// builder makes them (`warcinfo`, then `conversion` records).
+/// WAT and WET Archives are WARC files too, with other record types, so the
+/// same builder makes them (`warcinfo`, then `metadata` or `conversion`
+/// records).
 ///
 /// Common Crawl compresses every record as its own gzip member and
 /// concatenates the members into one `.warc.gz` file. A plain `GzDecoder`
@@ -160,6 +162,19 @@ impl WarcBuilder {
         )
     }
 
+    /// A `metadata` record as in WAT Archives: the JSON describing one record
+    /// of the matching WARC Archive (`wat_json`). Its `WARC-Date` is when
+    /// the WAT was generated, not when the page was crawled.
+    pub fn wat_metadata(self, target_uri: &str, date: &str, json: &str) -> Self {
+        self.record(
+            "metadata",
+            Some(target_uri),
+            date,
+            "application/json",
+            json.as_bytes(),
+        )
+    }
+
     /// The finished `.warc.gz` bytes.
     pub fn finish(self) -> Vec<u8> {
         self.archive
@@ -177,6 +192,94 @@ pub fn http_response(headers: &[(&str, &str)], body: &str) -> Vec<u8> {
     response
 }
 
+// ---------------------------------------------------------------------------
+// Building WAT JSON
+// ---------------------------------------------------------------------------
+
+/// The JSON of the WAT record made from one WARC record of type `warc_type`
+/// for `page_url`: its WARC headers in `Envelope.WARC-Header-Metadata` (the
+/// crawl date among them) and what was read from its block,
+/// `payload_metadata`.
+///
+/// Common Crawl writes it on one line, without whitespace, as
+/// `Value::to_string` does.
+pub fn wat_json(
+    warc_type: &str,
+    page_url: &str,
+    crawl_date: &str,
+    payload_metadata: Value,
+) -> String {
+    json!({
+        "Envelope": {
+            "Format": "WARC",
+            "WARC-Header-Metadata": {
+                "WARC-Type": warc_type,
+                "WARC-Date": crawl_date,
+                "WARC-Target-URI": page_url,
+            },
+            "Payload-Metadata": payload_metadata,
+        }
+    })
+    .to_string()
+}
+
+/// The JSON of the WAT record made from a `response` record: its HTTP
+/// headers, and for an HTML page the `HTML-Metadata` ia-web-commons parsed
+/// from it (`{"Head": {"Link": .., "Metas": ..}, "Links": ..}`).
+pub fn wat_response_json(
+    page_url: &str,
+    crawl_date: &str,
+    http_headers: &[(&str, &str)],
+    html_metadata: Option<Value>,
+) -> String {
+    let mut http_response = json!({
+        "Response-Message": {"Version": "HTTP/1.1", "Status": "200", "Reason": "OK"},
+        "Headers": headers_object(http_headers),
+    });
+    if let Some(html_metadata) = html_metadata {
+        http_response["HTML-Metadata"] = html_metadata;
+    }
+    wat_json(
+        "response",
+        page_url,
+        crawl_date,
+        json!({
+            "Actual-Content-Type": "application/http; msgtype=response",
+            "HTTP-Response-Metadata": http_response,
+        }),
+    )
+}
+
+/// The JSON of the WAT record made from a `request` record: its HTTP
+/// headers.
+pub fn wat_request_json(page_url: &str, crawl_date: &str, http_headers: &[(&str, &str)]) -> String {
+    wat_json(
+        "request",
+        page_url,
+        crawl_date,
+        json!({
+            "Actual-Content-Type": "application/http; msgtype=request",
+            "HTTP-Request-Metadata": {
+                "Request-Message": {"Method": "GET", "Path": "/", "Version": "HTTP/1.1"},
+                "Headers": headers_object(http_headers),
+            },
+        }),
+    )
+}
+
+/// HTTP headers as WAT writes them: one JSON object, names as sent.
+///
+/// `serde_json::Map` implements `FromIterator<(String, Value)>`, so the
+/// pairs `collect` straight into an object.
+fn headers_object(headers: &[(&str, &str)]) -> Value {
+    Value::Object(
+        headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), Value::from(*value)))
+            .collect(),
+    )
+}
+
 /// Write `bytes` to `<tmp>/<test_name>/<file_name>` and return the path.
 ///
 /// `CARGO_TARGET_TMPDIR` is set by Cargo only when compiling integration
@@ -185,13 +288,27 @@ pub fn http_response(headers: &[(&str, &str)], body: &str) -> Vec<u8> {
 /// own subdirectory; the `Mmap` Transport also writes a decompressed `.warc`
 /// next to the Archive, which must not collide either.
 pub fn write_archive(test_name: &str, file_name: &str, bytes: &[u8]) -> PathBuf {
+    write_archives(test_name, &[(file_name, bytes)]).remove(0)
+}
+
+/// Write several Archives, such as one Shard's in each Format, to
+/// `<tmp>/<test_name>/` and return their paths, in the same order.
+///
+/// `impl AsRef<[u8]>` accepts the bytes as a `Vec<u8>` or a `&[u8]`, so
+/// `write_archive` passes its slice without copying it.
+pub fn write_archives(test_name: &str, archives: &[(&str, impl AsRef<[u8]>)]) -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test_name);
     // Start clean: a previous aborted run may have left files behind.
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(file_name);
-    fs::write(&path, bytes).unwrap();
-    path
+    archives
+        .iter()
+        .map(|(file_name, bytes)| {
+            let path = dir.join(file_name);
+            fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -217,12 +334,25 @@ pub fn parse(
     shard: &Shard,
     onion_engine: OnionEngine,
 ) -> Snapshot {
+    parse_together(vec![(transport, format)], shard, onion_engine)
+}
+
+/// Parse several Archives of one Shard with the same two extractors and
+/// collect what they found: the union of their Sightings, one per page, as
+/// a Plan reading all of them gives.
+pub fn parse_together(
+    archives: Vec<(Transport, Format)>,
+    shard: &Shard,
+    onion_engine: OnionEngine,
+) -> Snapshot {
     let mut extractors: Vec<Box<dyn Extractor>> = vec![
         Box::new(OnionExtractor::new(onion_engine)),
         Box::new(FaviconExtractor::new()),
     ];
-    parse_archive(transport, format, shard, &mut extractors)
-        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    for (transport, format) in archives {
+        parse_archive(transport, format, shard, &mut extractors)
+            .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    }
 
     let mut snapshot = Snapshot {
         onions: BTreeMap::new(),

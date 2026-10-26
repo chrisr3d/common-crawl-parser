@@ -18,6 +18,11 @@
 // Unlike AIL, we don't add a guessed `{scheme}://{domain}/favicon.ico` for
 // every page: only favicons a page declares are recorded (ADR-0003).
 //
+// WAT records need no scanning: ia-web-commons has already listed the
+// page's `<link>` and `<meta>` tags, and `favicons_in_head` applies the
+// same `rel` and `name` rules to that list. It also resolves URLs against
+// the page's `<base href>`, which the HTML scanner ignores.
+//
 // ## Why not use an HTML parsing crate?
 //
 // Full HTML parsers (`scraper`, `html5ever`, `kuchikiki`) build a DOM tree
@@ -27,7 +32,11 @@
 // with memchr is robust against malformed input and processes non-matching
 // pages in microseconds (just the SIMD scan, no allocations).
 
+use std::borrow::Cow;
+
 use memchr::memmem;
+
+use crate::page_record::Head;
 
 /// A favicon reference found in an HTML page.
 ///
@@ -93,6 +102,52 @@ pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
     result
 }
 
+/// The favicon URLs declared in a WAT record's `<head>`, resolved to
+/// absolute URLs against the page's `<base href>` if it has one, else
+/// against `page_url`.
+///
+/// The `<link>` tags whose `rel` is a favicon value give their `url`, the
+/// `msapplication-TileImage` `<meta>` tags their `content`, as in the HTML
+/// scanner. Unlike it, relative URLs honour `<base href>`, so the two give
+/// different URLs for a page with a `<base>`. `data:` URLs are skipped:
+/// WAT cuts every one after its first comma (`trimDataUrl` in
+/// ia-web-commons), so the inline image is gone, and the stub left is no
+/// URL to fetch.
+///
+/// ## `Cow` for a value computed only sometimes
+///
+/// Most pages have no `<base>`, and the base is then `page_url` itself.
+/// `Cow::Borrowed(page_url)` uses it without copying; only a page with a
+/// `<base>` pays for building a new `String` (`Cow::Owned`). Both deref to
+/// `&str`, so the code below doesn't care which one it got.
+pub fn favicons_in_head(head: &Head<'_>, page_url: &str) -> Vec<String> {
+    // `<base href>` may itself be relative to the page.
+    let base: Cow<'_, str> = match head.base.trim() {
+        "" => Cow::Borrowed(page_url),
+        base_href => Cow::Owned(resolve_url(page_url, base_href)),
+    };
+    let link_urls = head
+        .links
+        .iter()
+        .filter(|link| is_favicon_rel(link.rel.as_bytes()))
+        .map(|link| &link.url);
+    let meta_urls = head
+        .metas
+        .iter()
+        .filter(|meta| is_tile_image_name(meta.name.as_bytes()))
+        .map(|meta| &meta.content);
+
+    let mut urls = Vec::new();
+    for value in link_urls.chain(meta_urls) {
+        let value = value.trim();
+        if value.is_empty() || value.starts_with("data:") {
+            continue;
+        }
+        push_resolved(&mut urls, &base, value);
+    }
+    urls
+}
+
 // ---------------------------------------------------------------------------
 // Tag scanners
 // ---------------------------------------------------------------------------
@@ -111,6 +166,18 @@ const FAVICON_REL_VALUES: &[&[u8]] = &[
     b"mask-icon",
     b"apple-touch-icon",
 ];
+
+/// Whether a `<link>`'s `rel` declares a favicon.
+fn is_favicon_rel(rel: &[u8]) -> bool {
+    FAVICON_REL_VALUES
+        .iter()
+        .any(|expected| rel.eq_ignore_ascii_case(expected))
+}
+
+/// Whether a `<meta>`'s `name` declares a Windows tile image.
+fn is_tile_image_name(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"msapplication-TileImage")
+}
 
 /// Scan for `<link` tags with favicon rel values, extract their href.
 fn scan_link_tags(
@@ -135,16 +202,11 @@ fn scan_link_tags(
         let tag_bytes = &body[tag_start..tag_end];
 
         // Check if `rel="..."` matches a favicon value.
-        if let Some(rel_value) = extract_attribute(tag_bytes, b"rel") {
-            let is_favicon_rel = FAVICON_REL_VALUES.iter().any(|expected| {
-                rel_value.eq_ignore_ascii_case(expected)
-            });
-
-            if is_favicon_rel {
-                if let Some(href) = extract_attribute(tag_bytes, b"href") {
-                    process_favicon_value(href, page_url, result);
-                }
-            }
+        if let Some(rel_value) = extract_attribute(tag_bytes, b"rel")
+            && is_favicon_rel(rel_value)
+            && let Some(href) = extract_attribute(tag_bytes, b"href")
+        {
+            process_favicon_value(href, page_url, result);
         }
 
         pos = tag_end;
@@ -173,12 +235,11 @@ fn scan_meta_tags(
         let tag_bytes = &body[tag_start..tag_end];
 
         // Check name="msapplication-TileImage"
-        if let Some(name_value) = extract_attribute(tag_bytes, b"name") {
-            if name_value.eq_ignore_ascii_case(b"msapplication-TileImage") {
-                if let Some(content) = extract_attribute(tag_bytes, b"content") {
-                    process_favicon_value(content, page_url, result);
-                }
-            }
+        if let Some(name_value) = extract_attribute(tag_bytes, b"name")
+            && is_tile_image_name(name_value)
+            && let Some(content) = extract_attribute(tag_bytes, b"content")
+        {
+            process_favicon_value(content, page_url, result);
         }
 
         pos = tag_end;
@@ -344,10 +405,16 @@ fn process_favicon_value(value: &[u8], page_url: &str, result: &mut FaviconResul
         }
     } else {
         // Regular URL — resolve relative to the page URL.
-        let absolute = resolve_url(page_url, value_str);
-        if !result.urls.iter().any(|u| u == &absolute) {
-            result.urls.push(absolute);
-        }
+        push_resolved(&mut result.urls, page_url, value_str);
+    }
+}
+
+/// Resolve `url` against `base` and append it, unless the page already
+/// declared the same favicon.
+fn push_resolved(urls: &mut Vec<String>, base: &str, url: &str) {
+    let absolute = resolve_url(base, url);
+    if !urls.contains(&absolute) {
+        urls.push(absolute);
     }
 }
 
