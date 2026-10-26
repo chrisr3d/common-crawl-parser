@@ -63,13 +63,14 @@ const DATE_A: &str = "2025-01-01T00:00:01Z";
 /// `rel` capitalised).
 const PAGE_B: &str = "https://example.org/";
 const DATE_B: &str = "2025-01-01T00:00:02Z";
-/// Page C, in the single-record WAT Archives of the last tests: deep
-/// enough that a relative URL resolves differently against a `<base>`.
+/// Page C: a relative favicon and a relative `<base>`, the page deep
+/// enough that the URL resolves differently without it. Also the page of
+/// the single-record WAT Archives of the last tests.
 const PAGE_C: &str = "https://example.net/docs/page.html";
 const DATE_C: &str = "2025-01-01T00:00:03Z";
 
-/// The same two pages as a WARC, a WAT and a WET Archive, written the way
-/// Common Crawl derives WAT and WET from WARC.
+/// The same three pages as a WARC, a WAT and a WET Archive, written the
+/// way Common Crawl derives WAT and WET from WARC.
 fn fixture_archives() -> Vec<(&'static str, Vec<u8>)> {
     let page_a_headers = [
         ("Content-Type", "text/html; charset=utf-8"),
@@ -136,6 +137,20 @@ fn fixture_archives() -> Vec<(&'static str, Vec<u8>)> {
         "Links": [],
     });
 
+    let page_c_headers = [("Content-Type", "text/html")];
+    let page_c_html = r#"<html><head>
+<base href="/static/">
+<link rel="icon" href="icons/fav.png">
+</head><body><p>Docs</p></body></html>"#;
+    // ia-web-commons keeps `<base href>` as written.
+    let page_c_html_metadata = json!({
+        "Head": {
+            "Base": "/static/",
+            "Link": [{"path": "LINK@/href", "url": "icons/fav.png", "rel": "icon"}],
+        },
+        "Links": [],
+    });
+
     let warcinfo = "isPartOf: CC-MAIN-2025-01\r\n";
     let crawler_notes = "fetchTimeMs: 12\r\n";
 
@@ -149,6 +164,7 @@ fn fixture_archives() -> Vec<(&'static str, Vec<u8>)> {
         )
         .metadata(PAGE_A, DATE_A, crawler_notes)
         .response(PAGE_B, DATE_B, &http_response(&page_b_headers, page_b_html))
+        .response(PAGE_C, DATE_C, &http_response(&page_c_headers, page_c_html))
         .finish();
 
     let wat = WarcBuilder::new()
@@ -178,12 +194,18 @@ fn fixture_archives() -> Vec<(&'static str, Vec<u8>)> {
             WAT_DATE,
             &wat_response_json(PAGE_B, DATE_B, &page_b_headers, Some(page_b_html_metadata)),
         )
+        .wat_metadata(
+            PAGE_C,
+            WAT_DATE,
+            &wat_response_json(PAGE_C, DATE_C, &page_c_headers, Some(page_c_html_metadata)),
+        )
         .finish();
 
     let wet = WarcBuilder::new()
         .warcinfo(WAT_DATE, warcinfo)
         .conversion(PAGE_A, DATE_A, &page_a_text)
         .conversion(PAGE_B, DATE_B, "Hello\n")
+        .conversion(PAGE_C, DATE_C, "Docs\n")
         .finish();
 
     vec![(WARC_NAME, warc), (WAT_NAME, wat), (WET_NAME, wet)]
@@ -209,6 +231,11 @@ fn expected_snapshot() -> Snapshot {
             (
                 "https://cdn.example.org/touch.png".to_string(),
                 vec![seen_on(PAGE_B, DATE_B)],
+            ),
+            // Not `/docs/icons/fav.png`: the `<base>` applies.
+            (
+                "https://example.net/static/icons/fav.png".to_string(),
+                vec![seen_on(PAGE_C, DATE_C)],
             ),
         ]),
     }
@@ -315,33 +342,6 @@ fn parse_page_c(test_name: &str, records: &[&str]) -> Snapshot {
         &shard(),
         OnionEngine::Memchr,
     )
-}
-
-/// Relative URLs resolve against `<base href>` when the page has one,
-/// itself relative to the page here.
-#[test]
-fn favicons_resolve_against_the_head_base() {
-    let json = wat_response_json(
-        PAGE_C,
-        DATE_C,
-        &[("Content-Type", "text/html")],
-        Some(json!({
-            "Head": {
-                "Base": "/static/",
-                "Link": [{"path": "LINK@/href", "url": "icons/fav.png", "rel": "icon"}],
-            },
-        })),
-    );
-
-    let snapshot = parse_page_c("favicons_resolve_against_the_head_base", &[&json]);
-
-    assert_eq!(
-        snapshot.favicon_urls,
-        BTreeMap::from([(
-            "https://example.net/static/icons/fav.png".to_string(),
-            vec![seen_on(PAGE_C, DATE_C)]
-        )])
-    );
 }
 
 /// JSON may escape any `/` as `\/`. Such strings can't be borrowed from the

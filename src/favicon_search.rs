@@ -18,10 +18,14 @@
 // Unlike AIL, we don't add a guessed `{scheme}://{domain}/favicon.ico` for
 // every page: only favicons a page declares are recorded (ADR-0003).
 //
+// Relative URLs resolve as a browser resolves them: against the page's
+// first `<base href>`, itself resolved against the page URL, else against
+// the page URL (the HTML standard's "document base URL").
+//
 // WAT records need no scanning: ia-web-commons has already listed the
-// page's `<link>` and `<meta>` tags, and `favicons_in_head` applies the
-// same `rel` and `name` rules to that list. It also resolves URLs against
-// the page's `<base href>`, which the HTML scanner ignores.
+// page's `<link>` and `<meta>` tags and its `<base href>`, and
+// `favicons_in_head` applies the same `rel` and `name` rules to that list
+// and resolves against that `<base href>` the same way.
 //
 // ## Why not use an HTML parsing crate?
 //
@@ -33,6 +37,7 @@
 // pages in microseconds (just the SIMD scan, no allocations).
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 
 use memchr::memmem;
 
@@ -67,7 +72,8 @@ pub struct FaviconResult {
 /// Extract favicon references from an HTML byte slice.
 ///
 /// `page_url` is the WARC-Target-URI of the page — used to resolve relative
-/// favicon URLs into absolute ones.
+/// favicon URLs into absolute ones, through the page's `<base href>` if it
+/// has one.
 ///
 /// ## How it works
 ///
@@ -80,8 +86,12 @@ pub struct FaviconResult {
 /// Both scans use `memmem::Finder` (SIMD) to jump directly to candidate
 /// tags, then parse only those few bytes. On a typical 100 KB page with
 /// zero favicon tags, this completes in ~5 μs.
+///
+/// The `<base>` tag is only looked for once a favicon URL is found (see
+/// `DocumentBase`): a page without favicons pays no third scan.
 pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
     let mut result = FaviconResult::default();
+    let base = DocumentBase::new(body, page_url);
 
     // --- Scan <link> tags for favicon rel values ---
     let link_finder = memmem::Finder::new(b"<link ");
@@ -89,15 +99,15 @@ pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
     // We do a case-insensitive scan by checking both finders.
     let link_finder_upper = memmem::Finder::new(b"<LINK ");
 
-    scan_link_tags(body, &link_finder, page_url, &mut result);
-    scan_link_tags(body, &link_finder_upper, page_url, &mut result);
+    scan_link_tags(body, &link_finder, &base, &mut result);
+    scan_link_tags(body, &link_finder_upper, &base, &mut result);
 
     // --- Scan <meta> tags for msapplication-TileImage ---
     let meta_finder = memmem::Finder::new(b"<meta ");
     let meta_finder_upper = memmem::Finder::new(b"<META ");
 
-    scan_meta_tags(body, &meta_finder, page_url, &mut result);
-    scan_meta_tags(body, &meta_finder_upper, page_url, &mut result);
+    scan_meta_tags(body, &meta_finder, &base, &mut result);
+    scan_meta_tags(body, &meta_finder_upper, &base, &mut result);
 
     result
 }
@@ -108,24 +118,13 @@ pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
 ///
 /// The `<link>` tags whose `rel` is a favicon value give their `url`, the
 /// `msapplication-TileImage` `<meta>` tags their `content`, as in the HTML
-/// scanner. Unlike it, relative URLs honour `<base href>`, so the two give
-/// different URLs for a page with a `<base>`. `data:` URLs are skipped:
-/// WAT cuts every one after its first comma (`trimDataUrl` in
-/// ia-web-commons), so the inline image is gone, and the stub left is no
-/// URL to fetch.
-///
-/// ## `Cow` for a value computed only sometimes
-///
-/// Most pages have no `<base>`, and the base is then `page_url` itself.
-/// `Cow::Borrowed(page_url)` uses it without copying; only a page with a
-/// `<base>` pays for building a new `String` (`Cow::Owned`). Both deref to
-/// `&str`, so the code below doesn't care which one it got.
+/// scanner. With several `<base>` tags, ia-web-commons probably keeps the
+/// last one where the HTML scanner keeps the first; rare, and not copied
+/// there. `data:` URLs are skipped: WAT cuts every one after its first comma
+/// (`trimDataUrl` in ia-web-commons), so the inline image is gone, and the
+/// stub left is no URL to fetch.
 pub fn favicons_in_head(head: &Head<'_>, page_url: &str) -> Vec<String> {
-    // `<base href>` may itself be relative to the page.
-    let base: Cow<'_, str> = match head.base.trim() {
-        "" => Cow::Borrowed(page_url),
-        base_href => Cow::Owned(resolve_url(page_url, base_href)),
-    };
+    let base = document_base_url(page_url, &head.base);
     let link_urls = head
         .links
         .iter()
@@ -183,7 +182,7 @@ fn is_tile_image_name(name: &[u8]) -> bool {
 fn scan_link_tags(
     body: &[u8],
     finder: &memmem::Finder<'_>,
-    page_url: &str,
+    base: &DocumentBase<'_>,
     result: &mut FaviconResult,
 ) {
     let mut pos = 0;
@@ -206,7 +205,7 @@ fn scan_link_tags(
             && is_favicon_rel(rel_value)
             && let Some(href) = extract_attribute(tag_bytes, b"href")
         {
-            process_favicon_value(href, page_url, result);
+            process_favicon_value(href, base, result);
         }
 
         pos = tag_end;
@@ -217,7 +216,7 @@ fn scan_link_tags(
 fn scan_meta_tags(
     body: &[u8],
     finder: &memmem::Finder<'_>,
-    page_url: &str,
+    base: &DocumentBase<'_>,
     result: &mut FaviconResult,
 ) {
     let mut pos = 0;
@@ -239,11 +238,48 @@ fn scan_meta_tags(
             && is_tile_image_name(name_value)
             && let Some(content) = extract_attribute(tag_bytes, b"content")
         {
-            process_favicon_value(content, page_url, result);
+            process_favicon_value(content, base, result);
         }
 
         pos = tag_end;
     }
+}
+
+/// The `href` of the page's first `<base>` tag that has one.
+///
+/// Like `<link>` and `<meta>`, `<base>` is looked for in lower and upper
+/// case. If a page has both, the one that comes first wins.
+fn first_base_href(body: &[u8]) -> Option<&[u8]> {
+    let lower = first_base_href_found_by(body, &memmem::Finder::new(b"<base "));
+    let upper = first_base_href_found_by(body, &memmem::Finder::new(b"<BASE "));
+    // Each is `Some((tag_start, href))` if found: keep the earlier one.
+    [lower, upper]
+        .into_iter()
+        .flatten()
+        .min_by_key(|&(tag_start, _)| tag_start)
+        .map(|(_, href)| href)
+}
+
+/// The first `<base>` tag with an `href` that `finder` finds: where it
+/// starts, and its `href`.
+fn first_base_href_found_by<'a>(
+    body: &'a [u8],
+    finder: &memmem::Finder<'_>,
+) -> Option<(usize, &'a [u8])> {
+    let mut pos = 0;
+    while pos < body.len() {
+        let tag_start = pos + finder.find(&body[pos..])?;
+        // `None` if truncated — no closing `>`
+        let tag_end = find_tag_end(body, tag_start)?;
+
+        // A `<base>` may only set a `target`: the next one may have an `href`.
+        if let Some(href) = extract_attribute(&body[tag_start..tag_end], b"href") {
+            return Some((tag_start, href));
+        }
+
+        pos = tag_end;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -376,10 +412,11 @@ fn trim_end_ascii(s: &[u8]) -> &[u8] {
 
 /// Process a favicon attribute value — either a URL or an inline `data:` URI.
 ///
-/// Mirrors AIL's logic:
+/// As in AIL, a value is one of two kinds:
 /// - `data:` URIs → decode the base64 payload, store as inline favicon
-/// - Everything else → resolve to absolute URL using the page URL as base
-fn process_favicon_value(value: &[u8], page_url: &str, result: &mut FaviconResult) {
+/// - Everything else → resolve to absolute URL against the page's base URL
+///   (`DocumentBase`)
+fn process_favicon_value(value: &[u8], base: &DocumentBase<'_>, result: &mut FaviconResult) {
     // Convert to string — favicon URLs should be valid UTF-8 (they're in
     // HTML attributes). If not, skip this value.
     let value_str = match std::str::from_utf8(value) {
@@ -404,8 +441,70 @@ fn process_favicon_value(value: &[u8], page_url: &str, result: &mut FaviconResul
             }
         }
     } else {
-        // Regular URL — resolve relative to the page URL.
-        push_resolved(&mut result.urls, page_url, value_str);
+        // Regular URL — resolve relative to the page's base URL.
+        push_resolved(&mut result.urls, base.url(), value_str);
+    }
+}
+
+/// The URL a page's relative favicon URLs resolve against, found on first
+/// use.
+///
+/// ## `OnceCell`: computing a value on first use, through `&self`
+///
+/// Finding the `<base>` tag costs a scan of the page, wasted on the many
+/// pages that declare no favicon. So the scanners get this struct instead
+/// of the URL, and `url()` scans the first time it is called only. The
+/// scanners hold a shared reference (`&DocumentBase`), yet the first call
+/// must store its result: `OnceCell` allows exactly that, being written
+/// once through `&self` (*interior mutability*), then read ever after.
+///
+/// `std::cell::LazyCell` would also do it, holding the closure to run
+/// instead of `body` and `page_url`. But a closure's type has no name, so
+/// every function taking a `LazyCell` would need a generic parameter for
+/// it. Unlike `LazyLock`, neither type can be shared between threads, and
+/// neither needs to: a page is scanned on one thread.
+struct DocumentBase<'a> {
+    body: &'a [u8],
+    page_url: &'a str,
+    url: OnceCell<Cow<'a, str>>,
+}
+
+impl<'a> DocumentBase<'a> {
+    fn new(body: &'a [u8], page_url: &'a str) -> Self {
+        Self {
+            body,
+            page_url,
+            url: OnceCell::new(),
+        }
+    }
+
+    /// The page's base URL, looking for its `<base>` the first time only.
+    fn url(&self) -> &str {
+        self.url.get_or_init(|| {
+            // A `<base href>` that isn't UTF-8 is ignored, as a favicon URL
+            // that isn't would be.
+            let base_href = first_base_href(self.body)
+                .and_then(|href| std::str::from_utf8(href).ok())
+                .unwrap_or("");
+            document_base_url(self.page_url, base_href)
+        })
+    }
+}
+
+/// A page's base URL: its `<base href>` (`""` when it has none), itself
+/// resolved against `page_url`, else `page_url`.
+///
+/// ## `Cow` for a value computed only sometimes
+///
+/// Most pages have no `<base>`, and the base is then `page_url` itself.
+/// `Cow::Borrowed(page_url)` uses it without copying; only a page with a
+/// `<base>` pays for building a new `String` (`Cow::Owned`). Both deref to
+/// `&str`, so the code using it doesn't care which one it got.
+fn document_base_url<'a>(page_url: &'a str, base_href: &str) -> Cow<'a, str> {
+    match base_href.trim() {
+        "" => Cow::Borrowed(page_url),
+        // `<base href>` may itself be relative to the page.
+        base_href => Cow::Owned(resolve_url(page_url, base_href)),
     }
 }
 
@@ -606,6 +705,54 @@ mod tests {
         let html = br#"<link rel="icon" href="images/fav.png">"#;
         let result = extract_favicons(html, "https://example.com/blog/post");
         assert!(result.urls.iter().any(|u| u == "https://example.com/blog/images/fav.png"));
+    }
+
+    #[test]
+    fn relative_url_resolved_against_relative_base() {
+        let html = br#"<base href="/static/"><link rel="icon" href="icons/fav.png">"#;
+        let result = extract_favicons(html, "https://example.net/docs/page.html");
+        assert_eq!(result.urls, ["https://example.net/static/icons/fav.png"]);
+    }
+
+    #[test]
+    fn urls_resolved_against_absolute_base() {
+        let html = br#"
+            <BASE HREF="https://cdn.example.org/assets/">
+            <link rel="icon" href="fav.png">
+            <link rel="apple-touch-icon" href="/touch.png">
+        "#;
+        let result = extract_favicons(html, "https://example.net/docs/page.html");
+        assert_eq!(
+            result.urls,
+            [
+                "https://cdn.example.org/assets/fav.png",
+                "https://cdn.example.org/touch.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn first_base_with_an_href_wins() {
+        // In both case orders: neither finder may win just by being lower
+        // or upper case.
+        let pages: [&[u8]; 2] = [
+            br#"
+            <base target="_blank">
+            <base href="/first/">
+            <BASE HREF="/second/">
+            <link rel="icon" href="fav.png">
+            "#,
+            br#"
+            <BASE TARGET="_blank">
+            <BASE HREF="/first/">
+            <base href="/second/">
+            <link rel="icon" href="fav.png">
+            "#,
+        ];
+        for html in pages {
+            let result = extract_favicons(html, "https://example.net/docs/page.html");
+            assert_eq!(result.urls, ["https://example.net/first/fav.png"]);
+        }
     }
 
     #[test]
