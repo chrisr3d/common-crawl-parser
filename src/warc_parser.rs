@@ -2,13 +2,17 @@
 //
 // The `warc` crate (v0.4) parses ALL headers with nom and allocates a HashMap
 // per record. For .onion extraction we only need two pieces of information:
-//   1. Is this a "response" record? (WARC-Type header)
+//   1. Is this record one of the pages? (WARC-Type header)
 //   2. What are the body bytes? (Content-Length header + body data)
 //
-// By parsing only these two headers and skipping non-response bodies entirely,
-// we avoid reading ~60% of the decompressed data into memory. This is the
-// same philosophy ripgrep uses: do the minimum work to determine relevance,
-// then only process what matters.
+// By parsing only these two headers and skipping the other records' bodies
+// entirely, we avoid reading ~60% of the decompressed data into memory. This
+// is the same philosophy ripgrep uses: do the minimum work to determine
+// relevance, then only process what matters.
+//
+// Which `WARC-Type` holds the pages depends on the Format: `response` in
+// WARC Archives, `conversion` in WET Archives (`Format::record_type`). The
+// caller passes it to the iterator, which skips every other type.
 //
 // Two parser implementations:
 //   - `WarcRecordIter<R: BufRead>` — streaming parser for sequential reads
@@ -22,10 +26,12 @@ use memchr::memmem;
 // Streaming Parser — works with BufRead (e.g., gzip decoder + BufReader)
 // ---------------------------------------------------------------------------
 
-/// A parsed WARC response record — the fields we need for .onion extraction.
+/// A parsed WARC record of the wanted type — the fields we need for .onion
+/// extraction.
 ///
-/// Non-response records are skipped entirely (their bodies are never read).
-/// This struct only exists for records where `WARC-Type: response`.
+/// Records of other types are skipped entirely (their bodies are never
+/// read). This struct only exists for records whose `WARC-Type` is the one
+/// the iterator was built with.
 ///
 /// In addition to the body, we extract metadata from WARC headers:
 /// - `target_uri`: the original URL that was crawled (WARC-Target-URI header)
@@ -39,7 +45,7 @@ pub struct WarcRecord {
     pub date: String,
 }
 
-/// Iterates WARC response records from a `BufRead` source.
+/// Iterates the WARC records of one type from a `BufRead` source.
 ///
 /// ## How WARC records are structured
 ///
@@ -64,15 +70,20 @@ pub struct WarcRecord {
 /// of syscalls and thousands.
 pub struct WarcRecordIter<R: BufRead> {
     reader: R,
+    // The `WARC-Type` of the records returned; all others are skipped.
+    record_type: &'static str,
     // Reused across records to avoid re-allocating for each header section.
     // `clear()` resets the length to 0 but keeps the allocated capacity.
     line_buf: String,
 }
 
 impl<R: BufRead> WarcRecordIter<R> {
-    pub fn new(reader: R) -> Self {
+    /// Iterate the records of `reader` whose `WARC-Type` is `record_type`
+    /// (`response`, `conversion`, ...).
+    pub fn new(reader: R, record_type: &'static str) -> Self {
         Self {
             reader,
+            record_type,
             line_buf: String::with_capacity(256),
         }
     }
@@ -111,7 +122,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
             // that separates headers from body. For each line, we only check
             // if it starts with "WARC-Type:" or "Content-Length:". Everything
             // else is ignored — no allocation, no parsing.
-            let mut is_response = false;
+            let mut is_wanted = false;
             let mut content_length: usize = 0;
             let mut target_uri = String::new();
             let mut date = String::new();
@@ -130,7 +141,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
                         // We compare against lowercase — WARC spec allows mixed case
                         // but Common Crawl consistently uses this capitalization.
                         if let Some(value) = trim_header(&self.line_buf, "WARC-Type:") {
-                            is_response = value.eq_ignore_ascii_case("response");
+                            is_wanted = value.eq_ignore_ascii_case(self.record_type);
                         } else if let Some(value) = trim_header(&self.line_buf, "Content-Length:") {
                             // Manual ASCII digit parsing — faster than str::parse::<usize>
                             // because we skip UTF-8 validation and error handling overhead.
@@ -149,13 +160,13 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
 
             // --- Phase 3: Read or skip the body ---
             //
-            // This is where the big optimization happens. For non-response records
-            // (request, metadata, warcinfo, etc.), we skip the body entirely by
-            // reading and discarding `content_length` bytes. The `warc` crate
-            // reads and allocates the body for EVERY record, even ones we'll
-            // immediately discard. Skipping saves ~60% of memory allocations
-            // and data copying.
-            if !is_response || content_length == 0 {
+            // This is where the big optimization happens. For records of other
+            // types (request, metadata, warcinfo, etc. in a WARC Archive), we
+            // skip the body entirely by reading and discarding `content_length`
+            // bytes. The `warc` crate reads and allocates the body for EVERY
+            // record, even ones we'll immediately discard. Skipping saves ~60%
+            // of memory allocations and data copying.
+            if !is_wanted || content_length == 0 {
                 // Skip body bytes by reading into a discard buffer.
                 // We can't seek (gzip streams don't support seeking), so we
                 // read and throw away the bytes. Using a stack buffer avoids
@@ -166,7 +177,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
                 continue; // Move on to the next record
             }
 
-            // Response record — read the body into a buffer.
+            // Wanted record — read the body into a buffer.
             let mut body = vec![0u8; content_length];
             if let Err(e) = self.reader.read_exact(&mut body) {
                 return Some(Err(e));
@@ -234,7 +245,8 @@ fn skip_bytes<R: Read>(reader: &mut R, mut n: usize) -> io::Result<()> {
 // Slice Parser — works on contiguous &[u8] (e.g., memory-mapped file)
 // ---------------------------------------------------------------------------
 
-/// A reference to a WARC response record within a memory-mapped slice.
+/// A reference to a WARC record of the wanted type within a memory-mapped
+/// slice.
 ///
 /// Unlike `WarcRecord` which owns its data, this borrows directly
 /// from the mmap. Zero allocation, zero copying — the bytes stay in
@@ -245,7 +257,7 @@ pub struct WarcSlice<'a> {
     pub date: &'a [u8],
 }
 
-/// Iterates WARC response records from a contiguous byte slice.
+/// Iterates the WARC records of one type from a contiguous byte slice.
 ///
 /// This parser uses `memchr::memmem` to find record and header boundaries
 /// instead of line-by-line reading. On a contiguous slice, this is faster
@@ -256,15 +268,20 @@ pub struct WarcSlice<'a> {
 pub struct WarcSliceIter<'a> {
     data: &'a [u8],
     pos: usize,
+    // The `WARC-Type` of the records returned; all others are skipped.
+    record_type: &'static str,
     // Pre-compiled searchers reused across all records.
     header_end_finder: memmem::Finder<'a>,
 }
 
 impl<'a> WarcSliceIter<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
+    /// Iterate the records of `data` whose `WARC-Type` is `record_type`
+    /// (`response`, `conversion`, ...).
+    pub fn new(data: &'a [u8], record_type: &'static str) -> Self {
         Self {
             data,
             pos: 0,
+            record_type,
             header_end_finder: memmem::Finder::new(b"\r\n\r\n"),
         }
     }
@@ -288,7 +305,7 @@ impl<'a> Iterator for WarcSliceIter<'a> {
 
             // Parse headers from the header section.
             let header_bytes = &self.data[record_start..record_start + header_end_offset];
-            let mut is_response = false;
+            let mut is_wanted = false;
             let mut content_length: usize = 0;
             let mut target_uri: &[u8] = b"";
             let mut date: &[u8] = b"";
@@ -302,7 +319,7 @@ impl<'a> Iterator for WarcSliceIter<'a> {
                 }
                 if starts_with_ignore_case(line, b"warc-type:") {
                     let value = trim_bytes(&line[b"warc-type:".len()..]);
-                    is_response = value.eq_ignore_ascii_case(b"response");
+                    is_wanted = value.eq_ignore_ascii_case(self.record_type.as_bytes());
                 } else if starts_with_ignore_case(line, b"content-length:") {
                     let value = trim_bytes(&line[b"content-length:".len()..]);
                     content_length = parse_ascii_usize_bytes(value);
@@ -319,8 +336,8 @@ impl<'a> Iterator for WarcSliceIter<'a> {
             // Advance past the terminator (up to 4 bytes) for the next record.
             self.pos = (body_end + 4).min(self.data.len());
 
-            if !is_response || content_length == 0 {
-                continue; // Skip non-response records
+            if !is_wanted || content_length == 0 {
+                continue; // Skip records of other types
             }
 
             if body_end > self.data.len() {
@@ -441,7 +458,7 @@ mod tests {
     fn streaming_parser_only_returns_response_records() {
         let data = make_warc_stream();
         let reader = BufReader::new(data.as_slice());
-        let records: Vec<_> = WarcRecordIter::new(reader)
+        let records: Vec<_> = WarcRecordIter::new(reader, "response")
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
@@ -456,7 +473,7 @@ mod tests {
     fn streaming_parser_extracts_metadata() {
         let data = make_warc_stream();
         let reader = BufReader::new(data.as_slice());
-        let records: Vec<_> = WarcRecordIter::new(reader)
+        let records: Vec<_> = WarcRecordIter::new(reader, "response")
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
@@ -469,7 +486,7 @@ mod tests {
     #[test]
     fn slice_parser_only_returns_response_records() {
         let data = make_warc_stream();
-        let records: Vec<_> = WarcSliceIter::new(&data).collect();
+        let records: Vec<_> = WarcSliceIter::new(&data, "response").collect();
 
         assert_eq!(records.len(), 2, "Should return only the 2 response records");
         assert!(records[0].body.windows(6).any(|w| w == b".onion"),
@@ -479,7 +496,7 @@ mod tests {
     #[test]
     fn slice_parser_extracts_metadata() {
         let data = make_warc_stream();
-        let records: Vec<_> = WarcSliceIter::new(&data).collect();
+        let records: Vec<_> = WarcSliceIter::new(&data, "response").collect();
 
         assert_eq!(records[0].target_uri, b"https://example.com/page1");
         assert_eq!(records[0].date, b"2025-10-01T12:00:00Z");
@@ -491,11 +508,12 @@ mod tests {
     fn both_parsers_produce_same_bodies() {
         let data = make_warc_stream();
 
-        let streaming: Vec<Vec<u8>> = WarcRecordIter::new(BufReader::new(data.as_slice()))
-            .map(|r| r.unwrap().body)
-            .collect();
+        let streaming: Vec<Vec<u8>> =
+            WarcRecordIter::new(BufReader::new(data.as_slice()), "response")
+                .map(|r| r.unwrap().body)
+                .collect();
 
-        let sliced: Vec<&[u8]> = WarcSliceIter::new(&data)
+        let sliced: Vec<&[u8]> = WarcSliceIter::new(&data, "response")
             .map(|s| s.body)
             .collect();
 
@@ -509,7 +527,7 @@ mod tests {
     fn empty_body_response_is_skipped() {
         let data = make_warc_record("response", b"");
         let reader = BufReader::new(data.as_slice());
-        let records: Vec<_> = WarcRecordIter::new(reader)
+        let records: Vec<_> = WarcRecordIter::new(reader, "response")
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(records.len(), 0, "Empty body responses are skipped");
@@ -523,7 +541,7 @@ mod tests {
         data.extend_from_slice(&make_warc_record("response", b"hello"));
 
         let reader = BufReader::new(data.as_slice());
-        let records: Vec<_> = WarcRecordIter::new(reader)
+        let records: Vec<_> = WarcRecordIter::new(reader, "response")
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(records.len(), 1, "Only the trailing response is returned");
@@ -550,14 +568,14 @@ mod tests {
 
         // Streaming parser
         let reader = BufReader::new(record.as_slice());
-        let records: Vec<_> = WarcRecordIter::new(reader)
+        let records: Vec<_> = WarcRecordIter::new(reader, "response")
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body, b"hello");
 
         // Slice parser
-        let records: Vec<_> = WarcSliceIter::new(&record).collect();
+        let records: Vec<_> = WarcSliceIter::new(&record, "response").collect();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body, b"hello");
     }

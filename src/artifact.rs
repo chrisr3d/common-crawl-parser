@@ -79,9 +79,9 @@ impl ArtifactKind {
     /// reference lives for `'static`.
     pub fn format_requirement(self) -> FormatRequirement {
         match self {
-            // Only WARC can be read so far. Once the WET and WAT readers
-            // exist, `onion` also accepts WAT + WET and `favicon` WAT
-            // (ADR-0001).
+            // WARC and WET can be read so far, but WET alone misses most
+            // onions. Once the WAT reader exists, `onion` also accepts
+            // WAT + WET and `favicon` WAT (ADR-0001).
             ArtifactKind::Onion => &[&[Format::Warc]],
             ArtifactKind::Favicon => &[&[Format::Warc]],
         }

@@ -415,7 +415,7 @@ fn parse_archives(
             kind_list(&kinds)
         );
 
-        match parse_archive(transport, shard, &mut extractors) {
+        match parse_archive(transport, archive.format(), shard, &mut extractors) {
             Ok(()) => {
                 for extractor in extractors {
                     let kind = extractor.kind();

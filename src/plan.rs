@@ -287,6 +287,20 @@ mod tests {
     }
 
     #[test]
+    fn wet_alone_cannot_serve_onion() {
+        // WET drops HTTP headers and attribute values, where most onions
+        // are: it serves `onion` only together with WAT (ADR-0001).
+        let wet = FormatSet::of(&[Wet]);
+        assert_eq!(
+            Plan::new(Dataset::CcMain, &[ArtifactKind::Onion], Some(wet)),
+            Err(PlanError::Unserved {
+                kind: ArtifactKind::Onion,
+                formats: wet
+            })
+        );
+    }
+
+    #[test]
     fn forced_formats_must_be_published_by_the_dataset() {
         assert_eq!(
             Plan::new(

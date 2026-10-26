@@ -6,8 +6,8 @@
 // `PageRecord` that *borrows* the same bytes, so extractors work on one
 // type without anything being copied.
 //
-// One variant per Format. Only WARC is read today; WAT and WET get their
-// own variants when their parsers arrive.
+// One variant per Format: WARC and WET are read today, WAT gets its own
+// variant when its reader arrives.
 
 use memchr::memmem;
 
@@ -22,15 +22,17 @@ use memchr::memmem;
 /// `WarcRecord`'s buffers (or a region of the mmap) and is gone before the
 /// next record is read.
 ///
-/// ## Matching on a one-variant enum
+/// ## Exhaustive `match`
 ///
-/// Extractors `match` on the record even though there is a single variant
-/// today. When a `Wat` variant is added, every such `match` stops compiling
-/// until it says what to do with WAT records, so no extractor can silently
-/// ignore a new Format.
+/// Extractors `match` on the record's variant without a `_` catch-all arm.
+/// When a `Wat` variant is added, every such `match` stops compiling until
+/// it says what to do with WAT records, so no extractor can silently ignore
+/// a new Format.
 pub enum PageRecord<'a> {
     /// A WARC `response` record.
     Warc(WarcResponse<'a>),
+    /// A WET `conversion` record.
+    Wet(WetConversion<'a>),
 }
 
 impl<'a> PageRecord<'a> {
@@ -38,6 +40,7 @@ impl<'a> PageRecord<'a> {
     pub fn page_url(&self) -> &'a str {
         match self {
             PageRecord::Warc(response) => response.page_url,
+            PageRecord::Wet(conversion) => conversion.page_url,
         }
     }
 
@@ -45,6 +48,7 @@ impl<'a> PageRecord<'a> {
     pub fn date(&self) -> &'a str {
         match self {
             PageRecord::Warc(response) => response.date,
+            PageRecord::Wet(conversion) => conversion.date,
         }
     }
 }
@@ -68,6 +72,23 @@ impl<'a> WarcResponse<'a> {
         let (http_headers, http_body) = split_http_response(self.http_response)?;
         is_html_content(http_headers).then_some(http_body)
     }
+}
+
+/// A WET `conversion` record: page URL, crawl date and the page's visible
+/// text.
+///
+/// Common Crawl writes one per HTML page of the matching WARC Archive,
+/// copying that response's `WARC-Target-URI` and `WARC-Date`, so both are
+/// the page's, as in a `WarcResponse`.
+pub struct WetConversion<'a> {
+    /// The `WARC-Target-URI` header.
+    pub page_url: &'a str,
+    /// The `WARC-Date` header.
+    pub date: &'a str,
+    /// The text nodes of the HTML page, without markup, HTTP headers or
+    /// attribute values. Bytes, like `WarcResponse::http_response`: the
+    /// extractors search bytes.
+    pub text: &'a [u8],
 }
 
 // ---------------------------------------------------------------------------

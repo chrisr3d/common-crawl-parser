@@ -9,12 +9,15 @@
 // The fixture is a hand-built Archive (see `fixture_archive`), small enough
 // that every expected Artifact can be written out below.
 
+// Each test crate compiles its own copy of `common` and uses only part of
+// it; `allow` silences the dead-code warnings for the rest.
+#[allow(dead_code)]
 mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use cc_extract::{OnionEngine, Shard, Sighting, Transport};
+use cc_extract::{Format, OnionEngine, Shard, Sighting, Transport};
 use common::{
     Snapshot, WarcBuilder, assert_all_agree, http_response, parse, parse_with_every_combination,
     write_archive,
@@ -195,7 +198,12 @@ fn fixture_yields_pinned_artifacts() {
         ARCHIVE_NAME,
         &fixture_archive(),
     );
-    let snapshot = parse(Transport::Disk(path), &shard(), OnionEngine::Memchr);
+    let snapshot = parse(
+        Transport::Disk(path),
+        Format::Warc,
+        &shard(),
+        OnionEngine::Memchr,
+    );
     assert_eq!(snapshot, expected_snapshot());
 }
 

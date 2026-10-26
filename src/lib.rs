@@ -12,7 +12,7 @@
 //   - Transport: how the compressed bytes arrive (a file on disk, a buffer
 //     in memory, or a decompressed copy that is memory-mapped), see
 //     `Transport` below
-//   - Format: how records are read; WARC only for now (`warc_parser`,
+//   - Format: how records are read; WARC and WET for now (`warc_parser`,
 //     `page_record`)
 //   - Artifact kind: what is extracted, one `Extractor` per kind
 //     (`extractor`, `artifact`)
@@ -39,7 +39,7 @@ pub use artifact::{ArtifactKind, Shard, Sighting, Sightings, merge_sightings};
 pub use extractor::{Extractor, FaviconExtractor, OnionEngine, OnionExtractor};
 pub use format::{ArchivePath, Dataset, Format, FormatSet};
 pub use plan::{FormatRequirement, Plan, PlanError};
-pub use page_record::{PageRecord, WarcResponse};
+pub use page_record::{PageRecord, WarcResponse, WetConversion};
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -265,11 +265,11 @@ pub async fn download_archive_to_memory(
 /// `Memory` value without bytes, or a `Disk` value without a path, can't be
 /// built, so `parse_archive` never has to handle one.
 pub enum Transport {
-    /// Stream-decompress a `.warc.gz` file on disk.
+    /// Stream-decompress a gzipped Archive on disk.
     Disk(PathBuf),
-    /// Stream-decompress a `.warc.gz` already downloaded into memory.
+    /// Stream-decompress a gzipped Archive already downloaded into memory.
     Memory(Vec<u8>),
-    /// Decompress a `.warc.gz` file to a temporary `.warc` next to it, then
+    /// Decompress a gzipped Archive to a temporary file next to it, then
     /// memory-map that copy and read records straight from the mapping.
     Mmap(PathBuf),
 }
@@ -277,11 +277,15 @@ pub enum Transport {
 /// Progress is reported every this many records.
 const PROGRESS_EVERY: u64 = 10_000;
 
-/// Read every record of one Archive once and hand it to every extractor.
+/// Read every page record of one `format` Archive once and hand it to
+/// every extractor.
 ///
 /// When this returns, each extractor holds what it found in the Archive;
 /// `Extractor::into_sightings` hands that over. The function itself never
 /// looks at which Artifact kinds it is feeding.
+///
+/// WAT Archives can't be read yet: they are rejected before any byte is
+/// read.
 ///
 /// ## Synchronous on purpose
 ///
@@ -299,15 +303,20 @@ const PROGRESS_EVERY: u64 = 10_000;
 /// afterwards.
 pub fn parse_archive(
     transport: Transport,
+    format: Format,
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if format == Format::Wat {
+        return Err("WAT Archives can't be read yet".into());
+    }
+
     let records_scanned = match transport {
         // `File` and `Cursor<Vec<u8>>` both implement `Read`, so one
         // streaming loop serves both.
-        Transport::Disk(path) => parse_stream(fs::File::open(path)?, shard, extractors)?,
-        Transport::Memory(data) => parse_stream(Cursor::new(data), shard, extractors)?,
-        Transport::Mmap(path) => parse_mmap(&path, shard, extractors)?,
+        Transport::Disk(path) => parse_stream(fs::File::open(path)?, format, shard, extractors)?,
+        Transport::Memory(data) => parse_stream(Cursor::new(data), format, shard, extractors)?,
+        Transport::Mmap(path) => parse_mmap(&path, format, shard, extractors)?,
     };
 
     if records_scanned >= PROGRESS_EVERY {
@@ -316,7 +325,7 @@ pub fn parse_archive(
     Ok(())
 }
 
-/// Parse a gzipped WARC stream with the streaming record parser.
+/// Parse a gzipped Archive with the streaming record parser.
 ///
 /// ## `std::io::Cursor` — the adapter pattern
 ///
@@ -329,33 +338,30 @@ pub fn parse_archive(
 /// record as its own gzip member; `GzDecoder` would stop after the first.
 fn parse_stream<R: Read>(
     compressed: R,
+    format: Format,
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
 ) -> io::Result<u64> {
     let decoder = MultiGzDecoder::new(compressed);
-    let records = warc_parser::WarcRecordIter::new(BufReader::new(decoder));
+    let records = warc_parser::WarcRecordIter::new(BufReader::new(decoder), format.record_type());
     let mut records_scanned = 0;
 
     for record in records {
         let record = record?;
         // The `PageRecord` borrows the record's own buffers: nothing is
         // copied, and it is dropped before the next record is read.
-        let page = PageRecord::Warc(WarcResponse {
-            page_url: &record.target_uri,
-            date: &record.date,
-            http_response: &record.body,
-        });
+        let page = to_page_record(format, &record.target_uri, &record.date, &record.body);
         hand_over(&page, shard, extractors, &mut records_scanned);
     }
 
     Ok(records_scanned)
 }
 
-/// Parse a WARC Archive through memory-mapped I/O.
+/// Parse an Archive through memory-mapped I/O.
 ///
 /// ## How mmap works here
 ///
-/// WARC archives are gzip-compressed, and gzip is a streaming format —
+/// Archives are gzip-compressed, and gzip is a streaming format —
 /// you can't random-access into compressed data. So we decompress the
 /// entire archive to a temporary file first, then memory-map that file.
 ///
@@ -372,6 +378,7 @@ fn parse_stream<R: Read>(
 /// ~3-5GB on disk.
 fn parse_mmap(
     path: &Path,
+    format: Format,
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
 ) -> Result<u64, Box<dyn Error + Send + Sync>> {
@@ -396,18 +403,14 @@ fn parse_mmap(
     let mmap = unsafe { memmap2::Mmap::map(&tmp_file)? };
     let mut records_scanned = 0;
 
-    for record in warc_parser::WarcSliceIter::new(&mmap) {
+    for record in warc_parser::WarcSliceIter::new(&mmap, format.record_type()) {
         // The slice parser returns raw header bytes; extractors want `&str`.
         // `from_utf8_lossy` returns a `Cow`: it borrows when the bytes are
         // valid UTF-8 (the usual case) and allocates only to replace
         // invalid ones.
         let page_url = String::from_utf8_lossy(record.target_uri);
         let date = String::from_utf8_lossy(record.date);
-        let page = PageRecord::Warc(WarcResponse {
-            page_url: &page_url,
-            date: &date,
-            http_response: record.body,
-        });
+        let page = to_page_record(format, &page_url, &date, record.body);
         hand_over(&page, shard, extractors, &mut records_scanned);
     }
 
@@ -418,6 +421,30 @@ fn parse_mmap(
     }
 
     Ok(records_scanned)
+}
+
+/// The page one record of a `format` Archive holds: its `body` (the bytes
+/// after the WARC headers) is the HTTP response in WARC, the page's text in
+/// WET.
+fn to_page_record<'a>(
+    format: Format,
+    page_url: &'a str,
+    date: &'a str,
+    body: &'a [u8],
+) -> PageRecord<'a> {
+    match format {
+        Format::Warc => PageRecord::Warc(WarcResponse {
+            page_url,
+            date,
+            http_response: body,
+        }),
+        Format::Wet => PageRecord::Wet(WetConversion {
+            page_url,
+            date,
+            text: body,
+        }),
+        Format::Wat => unreachable!("parse_archive rejects WAT Archives"),
+    }
 }
 
 /// Hand one record to every extractor and report progress now and then.

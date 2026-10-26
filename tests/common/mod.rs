@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cc_extract::{
-    ArtifactKind, Extractor, FaviconExtractor, OnionEngine, OnionExtractor, Shard, Sighting,
-    Transport, parse_archive,
+    ArtifactKind, Extractor, FaviconExtractor, Format, OnionEngine, OnionExtractor, Shard,
+    Sighting, Transport, parse_archive,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -34,6 +34,9 @@ use flate2::write::GzEncoder;
 // ---------------------------------------------------------------------------
 
 /// Builds a gzipped WARC Archive in memory, one record at a time.
+///
+/// WET Archives are WARC files too, with other record types, so the same
+/// builder makes them (`warcinfo`, then `conversion` records).
 ///
 /// Common Crawl compresses every record as its own gzip member and
 /// concatenates the members into one `.warc.gz` file. A plain `GzDecoder`
@@ -145,6 +148,18 @@ impl WarcBuilder {
         )
     }
 
+    /// A `conversion` record, as in WET Archives: the visible text of one
+    /// HTML page.
+    pub fn conversion(self, target_uri: &str, date: &str, text: &str) -> Self {
+        self.record(
+            "conversion",
+            Some(target_uri),
+            date,
+            "text/plain",
+            text.as_bytes(),
+        )
+    }
+
     /// The finished `.warc.gz` bytes.
     pub fn finish(self) -> Vec<u8> {
         self.archive
@@ -194,13 +209,19 @@ pub struct Snapshot {
     pub favicon_urls: BTreeMap<String, Vec<Sighting>>,
 }
 
-/// Parse one Archive with both extractors and collect what they found.
-pub fn parse(transport: Transport, shard: &Shard, onion_engine: OnionEngine) -> Snapshot {
+/// Parse one Archive in `format` with both extractors and collect what
+/// they found.
+pub fn parse(
+    transport: Transport,
+    format: Format,
+    shard: &Shard,
+    onion_engine: OnionEngine,
+) -> Snapshot {
     let mut extractors: Vec<Box<dyn Extractor>> = vec![
         Box::new(OnionExtractor::new(onion_engine)),
         Box::new(FaviconExtractor::new()),
     ];
-    parse_archive(transport, shard, &mut extractors)
+    parse_archive(transport, format, shard, &mut extractors)
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
 
     let mut snapshot = Snapshot {
@@ -221,13 +242,15 @@ pub fn parse(transport: Transport, shard: &Shard, onion_engine: OnionEngine) -> 
 
 /// Parse one Archive with every Transport and both onion engines.
 ///
-/// The first entry, `disk/memchr`, is the default and the reference
-/// `assert_all_agree` compares the others against. The `memory` runs read
-/// the file only when their turn comes, so a real ~1 GB Archive is held in
-/// RAM once at a time.
+/// The Format comes from the file name's suffix. The first entry,
+/// `disk/memchr`, is the default and the reference `assert_all_agree`
+/// compares the others against. The `memory` runs read the file only when
+/// their turn comes, so a real ~1 GB Archive is held in RAM once at a time.
 pub fn parse_with_every_combination(path: &Path) -> Vec<(String, Snapshot)> {
     let archive_name = path.file_name().unwrap().to_string_lossy();
     let shard = Shard::from_archive_name(&archive_name);
+    let format = Format::from_archive_name(&archive_name)
+        .unwrap_or_else(|| panic!("{archive_name} has no known Format suffix"));
 
     let mut results = Vec::new();
     for (engine, engine_name) in [
@@ -235,13 +258,18 @@ pub fn parse_with_every_combination(path: &Path) -> Vec<(String, Snapshot)> {
         (OnionEngine::Regex, "regex"),
     ] {
         results.push(timed(format!("disk/{engine_name}"), || {
-            parse(Transport::Disk(path.to_path_buf()), &shard, engine)
+            parse(Transport::Disk(path.to_path_buf()), format, &shard, engine)
         }));
         results.push(timed(format!("memory/{engine_name}"), || {
-            parse(Transport::Memory(fs::read(path).unwrap()), &shard, engine)
+            parse(
+                Transport::Memory(fs::read(path).unwrap()),
+                format,
+                &shard,
+                engine,
+            )
         }));
         results.push(timed(format!("mmap/{engine_name}"), || {
-            parse(Transport::Mmap(path.to_path_buf()), &shard, engine)
+            parse(Transport::Mmap(path.to_path_buf()), format, &shard, engine)
         }));
     }
     results

@@ -64,7 +64,8 @@ pub enum OnionEngine {
     Regex,
 }
 
-/// Finds `.onion` addresses anywhere in the HTTP response.
+/// Finds `.onion` addresses anywhere in a page: the whole HTTP response of
+/// a WARC record, the text of a WET record.
 pub struct OnionExtractor {
     search: OnionSearch,
     sightings: Sightings,
@@ -98,10 +99,12 @@ impl Extractor for OnionExtractor {
     }
 
     fn extract(&mut self, record: &PageRecord<'_>, shard: &Shard) {
-        // The whole response, HTTP headers included: about half of the
-        // onions found sit in headers such as `Onion-Location`.
         let haystack = match record {
+            // The whole response, HTTP headers included: about half of the
+            // onions found sit in headers such as `Onion-Location`.
             PageRecord::Warc(response) => response.http_response,
+            // Only the onions written out as text on the page.
+            PageRecord::Wet(conversion) => conversion.text,
         };
         let found = match &self.search {
             OnionSearch::Memchr(finder) => onion_search::search_memchr(haystack, finder),
@@ -143,6 +146,9 @@ impl Extractor for FaviconExtractor {
     fn extract(&mut self, record: &PageRecord<'_>, shard: &Shard) {
         let html = match record {
             PageRecord::Warc(response) => response.html_body(),
+            // WET keeps only the page's text: no `<link>` or `<meta>` tag
+            // survives, so there is nothing to find.
+            PageRecord::Wet(_) => None,
         };
         let Some(html) = html else {
             return;

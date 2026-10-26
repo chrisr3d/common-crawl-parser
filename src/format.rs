@@ -58,6 +58,18 @@ impl Format {
         }
     }
 
+    /// `WARC-Type` of the records that hold pages in this Format's
+    /// Archives. All three Formats are WARC files; they differ in which
+    /// record types they contain, and the record parsers skip every other
+    /// type (a WARC's own `metadata` records, each Archive's `warcinfo`).
+    pub fn record_type(self) -> &'static str {
+        match self {
+            Format::Warc => "response",
+            Format::Wat => "metadata",
+            Format::Wet => "conversion",
+        }
+    }
+
     /// Typical size of one Archive in this Format: the cost the planner
     /// minimizes, and what the RAM guard of `--transport memory` expects
     /// one download to hold.
