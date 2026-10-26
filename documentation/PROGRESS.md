@@ -1680,3 +1680,84 @@ if let Some(rel_value) = extract_attribute(tag_bytes, b"rel")
     process_favicon_value(href, page_url, result);
 }
 ```
+
+## Step 17: WARC Favicons Honour `<base href>`
+
+### What we built
+
+The HTML scanner now resolves relative favicon URLs as a browser does: against the page's
+first `<base>` tag with an `href`, itself resolved against the page URL, else against the
+page URL (the HTML standard's "document base URL"). The WAT reader already did so with
+`Head.Base`, so WARC and WAT now give the same favicon URLs for a page declaring a `<base>`:
+`https://example.net/docs/page.html` with `<base href="/static/">` and
+`<link rel="icon" href="icons/fav.png">` gives `https://example.net/static/icons/fav.png`
+from both, where WARC gave `https://example.net/docs/icons/fav.png` before.
+
+- **Finding `<base>`**: `first_base_href` scans like the `<link>` and `<meta>` scanners
+  (`memmem` finders for `<base ` and `<BASE `, `find_tag_end`, `extract_attribute`),
+  skipping a `<base>` that only sets a `target`. With both cases on one page, the earlier
+  tag wins. ia-web-commons probably keeps the *last* `<base>` when a page has several;
+  that is not copied.
+- **Only when needed**: the scan runs the first time a favicon URL is resolved
+  (`DocumentBase::url`), so a page declaring no favicon pays nothing for it.
+- **One rule for both Formats**: `document_base_url(page_url, base_href)` turns a
+  `<base href>` (`""` when none) into the base URL; `favicons_in_head` and the HTML scanner
+  both call it.
+- **Tests**: unit tests in `favicon_search.rs` for a relative `<base>`, an absolute one on
+  another host (also in upper case, with a root-relative favicon), and the first `<base>`
+  with an `href` winning, in either case order. The WARC vs WAT + WET fixture of
+  `tests/wat_archive.rs` gains page C, with a relative `<base>` and a relative favicon, so
+  both Formats are pinned to the same URL; it replaces the WAT-only `Head.Base` test of
+  Step 16. No page of the characterization fixtures declares a `<base>`, and their tests
+  pass unchanged.
+
+### Rust concepts introduced
+
+**`OnceCell`: a value computed on first use, through `&self`**
+The scanners take a `&DocumentBase` instead of the page URL, and the base URL is computed
+the first time one of them asks for it. Computing means storing the result, yet the
+scanners hold only a shared reference. `std::cell::OnceCell` allows exactly that: it can be
+written once through `&self`, then only read:
+
+```rust
+struct DocumentBase<'a> {
+    body: &'a [u8],
+    page_url: &'a str,
+    url: OnceCell<Cow<'a, str>>,
+}
+
+fn url(&self) -> &str {
+    self.url.get_or_init(|| { /* scan for <base>, resolve it */ })
+}
+```
+
+Changing data behind a shared reference is *interior mutability*. Rust forbids it for
+ordinary fields; the types in `std::cell` allow it in controlled ways. `OnceCell` is safe
+because the value can be set only once: every `&str` handed out afterwards points into a
+value that never changes again.
+
+**`OnceCell`, `LazyCell` and `LazyLock`**
+`std::cell::LazyCell` is a `OnceCell` holding the closure to run, so
+`LazyCell::new(|| /* scan body for <base>, resolve it */)` would need no struct. But a closure's
+type has no name, and every scanner taking that `LazyCell` would need a generic parameter
+for it. The struct holds what the closure would capture (`body`, `page_url`) and keeps the
+signatures plain. `LazyLock` (Step 16) is the thread-safe version, for a `static` shared by
+threads; one page is scanned on one thread, so a `Cell` type is enough.
+
+**`Option` as an iterator**
+`Option<T>` implements `IntoIterator`, yielding its value if it has one. Picking the earlier
+of two tags that may each be missing then needs no `match` over four cases:
+
+```rust
+[lower, upper]
+    .into_iter()
+    .flatten() // drop the `None`s
+    .min_by_key(|&(tag_start, _)| tag_start)
+    .map(|(_, href)| href)
+```
+
+**`?` on `Option`, again**
+As in the `filter_map` closure of Step 13, `?` on an `Option` returns `None` early, here
+from a whole function: `first_base_href_found_by` returns `None` at `finder.find(...)?`
+when no tag is left and at `find_tag_end(...)?` when the tag is cut short, where the
+`<link>` and `<meta>` scanners, which return nothing, need `let ... else { break }`.
