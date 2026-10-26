@@ -1477,3 +1477,66 @@ if let Some(forced) = forced
 
 The body runs only if both match, and `forced` is in scope for the second pattern. Before,
 this needed two nested `if let`s.
+
+## Step 15: Reading WET Archives
+
+### What we built
+
+WET Archives can now be read, and the onion extractor searches their text. A WET Archive
+is a WARC file too: one `warcinfo` record, then one `conversion` record per HTML page,
+holding the page's visible text (`text/plain`). Its `WARC-Target-URI` and `WARC-Date` are
+the page URL and crawl time, as in the WARC `response` it was made from.
+
+No Plan reads WET yet: WET alone finds about a third of the onions (they mostly sit in
+HTTP headers and attribute values, which WET drops), so `onion` still requires WARC and
+`--formats wet -e onion` is still rejected. WET becomes plannable together with WAT.
+
+- **Record selection per Format**: `Format::record_type()` names the `WARC-Type` holding
+  the pages (`response` for WARC, `conversion` for WET, `metadata` for WAT). Both record
+  parsers, `WarcRecordIter::new(reader, record_type)` and `WarcSliceIter::new(data,
+  record_type)`, take it and skip every other record's body, as they skipped every
+  non-`response` record before.
+- **`parse_archive(transport, format, &shard, &mut extractors)`**: the Format is passed in
+  (a `Memory` Transport has no file name to read it from); `main` passes
+  `archive.format()`. A WAT Archive is rejected with an error before anything is read.
+- **`PageRecord::Wet(WetConversion { page_url, date, text })`**: the second variant. The
+  onion extractor searches `text`; the favicon extractor finds nothing in it, since WET
+  keeps no `<link>` or `<meta>` tag.
+- **Tests**: `tests/wet_archive.rs` builds a WET fixture (`WarcBuilder::conversion`) and
+  parses it through `parse_archive`: onions written in the text are found with the page's
+  URL and date, an onion inside the `warcinfo` record is not, favicon markup shown as text
+  is not a favicon, and every Transport and onion engine agrees. `parse_with_every_combination`
+  now takes the Format from the file name's suffix. A planner test pins that WET alone
+  can't serve `onion`.
+
+### Rust concepts introduced
+
+**`&'static str` fields**
+`WarcRecordIter` stores the wanted record type as `record_type: &'static str`. A string
+literal such as `"conversion"` is compiled into the binary and lives for the whole
+program, so its type is `&'static str`. Storing a `'static` reference needs no lifetime
+parameter on the struct: `WarcRecordIter<R>` stays as it was, whereas a field of type
+`&'a str` would have made it `WarcRecordIter<'a, R>` and tied every iterator to the
+lifetime of whatever owns the string.
+
+**Exhaustive `match`: the payoff**
+Step 12 had extractors `match` on the one-variant `PageRecord` without a `_` arm. Adding
+`PageRecord::Wet` now made the build fail at every such `match`: `page_url()`, `date()`,
+the onion extractor and the favicon extractor. Each error is a place that has to decide
+what a WET record means, and none could be forgotten. A `_ => …` arm would have compiled
+silently and treated WET like whatever it fell through to.
+
+**`unreachable!` behind a check at the entry**
+`parse_archive` returns an error for `Format::Wat` before reading anything, so the
+`Format::Wat` arm of the `match` that builds a `PageRecord` (`to_page_record`) can never
+run. `unreachable!` says so: it panics with its message if the assumption is ever broken,
+instead of inventing a value. Naming the arm rather than writing `_ =>` keeps the `match`
+exhaustive over `Format`: a fourth Format would stop it compiling. The compiler does
+*not* point at it when the WAT reader arrives (the arm already compiles); the check in
+`parse_archive` and the `unreachable!` message are what lead there.
+
+**`BTreeMap::from([...])`**
+A map can be built from an array of `(key, value)` tuples in one expression, as the WET
+test does for its expected Sightings: `BTreeMap::from([(k1, v1), (k2, v2)])`. The
+standard library implements `From<[(K, V); N]>` for every array length `N`, one generic
+`impl` over a *const generic* parameter, rather than one `impl` per length.
