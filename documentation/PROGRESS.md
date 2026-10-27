@@ -1761,3 +1761,142 @@ As in the `filter_map` closure of Step 13, `?` on an `Option` returns `None` ear
 from a whole function: `first_base_href_found_by` returns `None` at `finder.find(...)?`
 when no tag is left and at `find_tag_end(...)?` when the tag is cut short, where the
 `<link>` and `<meta>` scanners, which return nothing, need `let ... else { break }`.
+
+## Step 18: The `inline-favicon` Artifact Kind
+
+### What we built
+
+Favicons that pages embed as base64 `data:` URIs were decoded since the first favicon scanner,
+then thrown away. They are now an Artifact kind of their own, `inline-favicon`, saved in
+`inline_favicons.json`:
+
+```json
+{
+  "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d": {
+    "mmh3": 1932519735,
+    "media_type": "image/png",
+    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ...",
+    "sightings": [{ "page_url": "...", "date": "...", "shard": "..." }]
+  }
+}
+```
+
+- **Key**: the SHA-256 of the decoded bytes, in hex (`inline_favicon::sha256_hex`, `sha2`
+  crate). The same image on many pages, or written with other line breaks, is one entry.
+- **`mmh3`**: Shodan's favicon hash, the number its `http.favicon.hash:` filter takes:
+  MurmurHash3 x86_32, seed 0, of the image's base64 as Python's `codecs.encode(data,
+  "base64")` writes it (a newline every 76 characters and at the end), read as a signed
+  `i32`. Hand-written, with the base64 encoder.
+- **`media_type`**: from the `data:` header, without parameters, in lower case
+  (`data:Image/SVG+XML;charset=utf-8;base64,` → `image/svg+xml`). The scanner now returns
+  an `InlineImage { media_type, bytes }`, and only decodes URIs marked `;base64`: a
+  percent-encoded `data:image/svg+xml,...` is dropped, as before, even when its text happens
+  to read as base64.
+- **Plan**: `inline-favicon` accepts WARC only (WAT cuts `data:` URLs, WET has no markup),
+  so asking for it plans WARC even on CC-MAIN, and the other kinds read that WARC
+  (ADR-0001). It is not in the default `--extract` list.
+- **One type for every kind's results**: the other kinds map each Artifact to a list of
+  Sightings; this one maps each image to a description *and* its Sightings. The pipeline
+  now holds a `Findings` per kind (`Sightings` or `InlineFavicons`), which the extractors
+  return (`Extractor::into_findings`) and `main`, `load_sightings_from`,
+  `save_sightings_to`, `merge_sightings_from` and `save_then_mark` pass along. Deduplication
+  stays in one place: `merge_sightings` is generic over the map's values. `merge` unions an
+  image's Sightings across output directories; the first media type seen wins.
+- **Tests**: unit tests for the encoder (RFC 4648 vectors), the line wrapping (Python's
+  output), MurmurHash3 (reference vectors, and `mmh3.hash("foo")` from the Python README),
+  Shodan's hash and SHA-256 (FIPS 180-2 `"abc"`); scanner tests for the media type and the
+  non-base64 URI; a merge test. End to end (`tests/crawl_cli.rs`), `-e onion,inline-favicon`
+  on a WARC-only workspace plans WARC, finds the onion, and saves one PNG seen on two pages
+  with two Sightings, its SHA-256 and `mmh3` pinned from Python's `hashlib` and `mmh3`.
+
+### Rust concepts introduced
+
+**Hashing crates: `sha2` and the `Digest` trait**
+RustCrypto publishes one crate per hash family (`sha2`, `sha3`, `blake2`, `md-5`, ...), all
+implementing the `Digest` trait of the `digest` crate, so they are used the same way:
+
+```rust
+use sha2::{Digest, Sha256};
+
+let digest = Sha256::digest(bytes); // 32 bytes
+```
+
+A cryptographic hash is worth a dependency: it is easy to get subtly wrong, and a wrong
+SHA-256 is only noticed when the keys fail to match someone else's. MurmurHash3 is a few
+dozen lines with published test vectors, so it is written by hand here, as teaching
+material; the `murmur3` crate would do as well.
+
+**Why `DefaultHasher` is not an identifier**
+`std::hash::DefaultHasher` is the hash `HashMap` uses. Its documentation leaves the
+algorithm unspecified on purpose (SipHash-1-3 today), so a later Rust release may change it,
+and every key saved by an earlier build would then stop matching. Its 64 bits also make a
+collision as likely as not past about five billion distinct inputs (the birthday bound).
+Anything saved, compared across programs or kept for years needs a hash fixed by a standard:
+SHA-256 gives the same hex in Rust, Python's `hashlib` and `sha256sum`.
+
+**An enum holding either map, saved `#[serde(untagged)]`**
+`main` keeps every requested kind's results side by side in one
+`BTreeMap<ArtifactKind, Findings>`, so they need one type though their files differ:
+
+```rust
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum Findings {
+    Sightings(Sightings),
+    InlineFavicons(InlineFavicons),
+}
+```
+
+`untagged` writes a variant as its content alone, so `onions.json` keeps its shape. Reading
+back can't be untagged, though: `{}` fits both variants. `Findings::from_json(kind, json)`
+lets the kind choose, through `Findings::empty(kind)`, the one `match` saying which kind has
+which shape. `Findings::merge` matches on the pair `(self, from)`, checking both shapes at
+once; mixing them would be a bug, so it panics.
+
+**A generic function over a trait, and the orphan rule**
+`merge_sightings` used to take `Sightings` only. It now takes any map whose values hold
+Sightings:
+
+```rust
+pub trait ArtifactEntry {
+    fn sightings_mut(&mut self) -> &mut Vec<Sighting>;
+    fn add_sighting(&mut self, sighting: Sighting) { /* dedup on (page_url, shard) */ }
+}
+
+pub fn merge_sightings<E: ArtifactEntry>(into: &mut HashMap<String, E>, from: HashMap<String, E>)
+```
+
+The compiler builds one copy of the function per value type (*monomorphization*), and
+inside it `E` can only be used through the trait. `add_sighting` is a *provided method*:
+implementors write `sightings_mut` only and inherit the dedup. `ArtifactEntry` is
+implemented for `Vec<Sighting>`, a `std` type: allowed because the trait is ours (the
+*orphan rule* requires the trait or the type to be local to the crate).
+
+**`std::mem::take`**
+Merging needs an image's description without its Sightings, to insert it, and the Sightings
+on their own, to add one by one. `mem::take(entry.sightings_mut())` moves the list out and
+leaves an empty `Vec` in its place (`Default::default()`), with no clone.
+
+**Wrapping arithmetic, rotations and `chunks_exact`**
+MurmurHash3 multiplies and adds modulo 2³². Rust's `*` and `+` panic on overflow in debug
+builds, so the intent is spelled out: `wrapping_mul`, `wrapping_add`, and `rotate_left` for
+C's `(x << r) | (x >> (32 - r))`. The input is read 4 bytes at a time with `chunks_exact(4)`,
+which yields whole blocks only and keeps the 0 to 3 leftover bytes as its `remainder()`;
+iterating `&mut blocks` leaves `blocks` usable for that call after the loop.
+`u32::from_le_bytes` reads a block as the reference does on x86.
+
+**`cast_signed`**
+Python's `mmh3.hash` returns a signed number: the same 32 bits read as an `i32`.
+`u32::cast_signed` (Rust 1.87) says exactly that, where `as i32` could be any conversion.
+
+**`let ... else`, again**
+`InlineFaviconExtractor::extract` reads only WARC HTML pages, and returns early otherwise:
+
+```rust
+let PageRecord::Warc(response) = record else {
+    return;
+};
+let Some(html) = response.html_body() else {
+    return;
+};
+```
