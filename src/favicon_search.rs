@@ -56,13 +56,24 @@ pub struct FaviconRef {
     pub inline_data: Option<Vec<u8>>,
 }
 
+/// A favicon embedded in the page as a base64 `data:` URI, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    /// The media type the URI declares, without parameters and in lower
+    /// case: `image/png` for `data:image/png;base64,...`. Empty if the URI
+    /// declares none.
+    pub media_type: String,
+    /// The image itself.
+    pub bytes: Vec<u8>,
+}
+
 /// Result of scanning one HTML page for favicon references.
 #[derive(Debug, Default)]
 pub struct FaviconResult {
     /// Favicon URLs found in `<link>` / `<meta>` tags (resolved to absolute).
     pub urls: Vec<String>,
-    /// Base64-decoded inline favicons from `data:` URIs.
-    pub inline_favicons: Vec<Vec<u8>>,
+    /// Inline favicons decoded from base64 `data:` URIs.
+    pub inline_favicons: Vec<InlineImage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,22 +439,44 @@ fn process_favicon_value(value: &[u8], base: &DocumentBase<'_>, result: &mut Fav
         return;
     }
 
-    if let Some(data_payload) = value_str.strip_prefix("data:") {
-        // Inline data: URI — extract and decode the base64 payload.
-        // Format: data:[<mediatype>][;base64],<data>
-        if let Some((_header, data)) = data_payload.split_once(',') {
-            // Strip whitespace (AIL does `''.join(data.split())`)
-            let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-            if let Ok(bytes) = base64_decode(&cleaned) {
-                if !bytes.is_empty() {
-                    result.inline_favicons.push(bytes);
-                }
-            }
+    if let Some(data_uri) = value_str.strip_prefix("data:") {
+        if let Some(image) = decode_inline_image(data_uri) {
+            result.inline_favicons.push(image);
         }
     } else {
         // Regular URL — resolve relative to the page's base URL.
         push_resolved(&mut result.urls, base.url(), value_str);
     }
+}
+
+/// Decode what follows `data:` in a `data:[<mediatype>][;base64],<data>`
+/// URI; `None` unless the data is base64 and decodes to some bytes.
+///
+/// A URI without `;base64` holds percent-encoded text, such as
+/// `data:image/svg+xml,<svg…>`: it is not decoded, even when its text
+/// happens to read as base64.
+fn decode_inline_image(data_uri: &str) -> Option<InlineImage> {
+    let (header, data) = data_uri.split_once(',')?;
+    // `;base64` comes last: `image/svg+xml;charset=utf-8;base64`.
+    let (media_type, encoding) = header.rsplit_once(';')?;
+    if !encoding.trim().eq_ignore_ascii_case("base64") {
+        return None;
+    }
+    // Parameters such as `;charset=utf-8` follow the type itself, and
+    // `IMAGE/PNG` is the same type as `image/png`.
+    let media_type = media_type
+        .split_once(';')
+        .map_or(media_type, |(media_type, _parameters)| media_type)
+        .trim()
+        .to_ascii_lowercase();
+
+    // Strip whitespace (AIL does `''.join(data.split())`)
+    let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64_decode(&cleaned).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(InlineImage { media_type, bytes })
 }
 
 /// The URL a page's relative favicon URLs resolve against, found on first
@@ -677,13 +710,44 @@ mod tests {
         assert_eq!(result.urls, ["https://example.com/favicon.ico"]);
     }
 
+    fn inline_image(media_type: &str, bytes: &[u8]) -> InlineImage {
+        InlineImage {
+            media_type: media_type.to_string(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
     #[test]
-    fn inline_data_uri_decoded() {
+    fn inline_data_uri_decoded_with_its_media_type() {
         // "hello" in base64 = "aGVsbG8="
         let html = br#"<link rel="icon" href="data:image/png;base64,aGVsbG8=">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert_eq!(result.inline_favicons.len(), 1);
-        assert_eq!(result.inline_favicons[0], b"hello");
+        assert_eq!(
+            result.inline_favicons,
+            [inline_image("image/png", b"hello")]
+        );
+        assert!(result.urls.is_empty());
+    }
+
+    #[test]
+    fn inline_media_type_without_parameters_in_lower_case() {
+        // "<svg/>" in base64 = "PHN2Zy8+"
+        // With spaces after the `;`s, as some pages write it.
+        let html = br#"<link rel="icon" href="data:Image/SVG+XML; charset=utf-8; base64,PHN2Zy8+">"#;
+        let result = extract_favicons(html, "https://example.com/");
+        assert_eq!(
+            result.inline_favicons,
+            [inline_image("image/svg+xml", b"<svg/>")]
+        );
+    }
+
+    #[test]
+    fn data_uri_not_in_base64_is_dropped() {
+        // Percent-encoded data, even when it happens to read as base64.
+        let html = br#"<link rel="icon" href="data:image/svg+xml,abcd">"#;
+        let result = extract_favicons(html, "https://example.com/");
+        assert!(result.inline_favicons.is_empty());
+        assert!(result.urls.is_empty());
     }
 
     #[test]
