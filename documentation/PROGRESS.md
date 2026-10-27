@@ -1900,3 +1900,90 @@ let Some(html) = response.html_body() else {
     return;
 };
 ```
+
+## Step 19: The Modular Refactor in Review; Docs and a SLURM Example
+
+### What we built
+
+Steps 10 to 18 turned a WARC-only extractor of two hard-wired kinds into a program built
+from three independent choices: the Transport (how bytes arrive: `-t disk|memory|mmap`), the
+Format (how records are read: WARC, WAT, WET) and the Artifact kind (what is extracted:
+`-e onion,favicon,inline-favicon`). Which Formats a Shard downloads is no longer a choice
+the user makes, but the planner's: the cheapest Formats serving every kind still to do.
+
+| | Before (`onion-crawler` 1.3.1) | After (`cc-extract` 2.0.0) |
+|---|---|---|
+| Kinds | `onion` and `favicon`, always both | Any of `onion`, `favicon`, `inline-favicon` (`-e`) |
+| Formats | WARC only; WAT and WET crashed the parser | WARC, WAT, WET, planned per Shard (ADR-0001) |
+| Download per CC-MAIN Shard, default kinds | ~1 GB | ~240 MB (WAT + WET) |
+| Parsing | Six copy-pasted `parse_warc_*` functions | One `parse_archive`, one `Extractor` per kind |
+| CLI | `-s/--strategy` and `-m/--stream` mixed Transport and search | `-t/--transport` and `--onion-engine`, independent |
+| `processed.log` | Archive file names: a Shard done once was never redone | `<shard> <kind>`: a kind can be added later (ADR-0002) |
+| Crash between save and mark | Results of the Archive lost | Shard redone, nothing lost (`save_then_mark`) |
+| Favicons | Guessed root `/favicon.ico` on every page, `<base href>` ignored | Declared favicons only (ADR-0003), resolved against `<base href>` |
+| Inline favicons | Decoded, then dropped | Saved with SHA-256, Shodan `mmh3` and media type |
+
+Adding an Artifact kind now takes a variant in `ArtifactKind`, an `impl Extractor`, and one
+arm in each `match` on the kind (`format_requirement`, `output_filename`,
+`Findings::empty`, `new_extractor`). The compiler lists every one of those arms, as none
+of them has a `_` fallback, and `tests/cli_help.rs` asks for the new name in the README's
+`-h` block; the parsing loop, the planner and the state handling don't change.
+
+This step brings the documents in line:
+
+- **`documentation/FEATURES.md`** is rewritten for 2.0.0: the paths file and Datasets, Format
+  requirements and Plans, the three record readers, each kind's rules per Format, the
+  `inline_favicons.json` shape, and the known limitations as they stand now (the fixed
+  ones gone, new ones in: what WAT + WET miss compared with WARC, `--limit` on a re-run,
+  the RAM guard with several processes per node, CC-NEWS's unverified Formats).
+- **`README.md`** describes the kinds and the Plans, and shows `cc-extract -h` and
+  `cc-extract merge -h` verbatim. `tests/cli_help.rs` runs the binary and fails when the
+  README no longer matches, so a new option or kind can't be documented in `main.rs` only.
+- **Help text**: `--jobs` showed its default as a number, the core count of the machine
+  printing the help (`[default: 16]`); on a cluster that is the login node's, not the compute
+  node's. It now says `(default: number of CPU cores)`. `--output-dir` stated its default twice,
+  `-t memory` still said "~1 GB per job", `--offset` and `--output-dir` spoke of one SLURM
+  task where the example runs several processes per task, and `--limit --help` now explains
+  that Shards already done aren't counted.
+- **`examples/slurm/crawl.sh` and `merge.sh`** replace the two uncommitted scripts written
+  for one cluster: `<...>` placeholders for account, partition and paths, cores read from
+  `SLURM_CPUS_ON_NODE` instead of a fixed `--cpus-per-task`, any paths file, `--extract` and
+  `--transport memory`. Several processes per node, each with its own `--offset`, `--limit`
+  and `--output-dir`, then `merge` over every `<output root>/<task>/<process>/`.
+- **`documentation/RESEARCH-warc-wat-wet.md`** keeps its measurements under the names they
+  were taken with, and gains a note mapping them to today's.
+
+### Rust concepts introduced
+
+**`include_str!`: a file compiled into the program**
+`include_str!("../README.md")` is a macro that reads the file when the crate is compiled
+and puts its text in the binary as a `&'static str`; the path is relative to the source
+file using it. The test needs no file I/O at run time and can't fail on a missing file: a
+missing README fails the build. Cargo knows the test depends on the file (the compiler
+reports included files as dependencies), so editing the README rebuilds the test.
+`include_bytes!` does the same for a `&'static [u8; N]`.
+
+**Short and long help from one doc comment**
+clap splits a field's `///` comment at its first blank line: the first paragraph is the
+`-h` text, the whole comment the `--help` text. `-h` stays one line per option, and
+`--help` explains (the `--limit` paragraph above lives there only). A `//` comment between
+`///` and the field, as on `jobs`, is invisible to clap: notes for the reader of the code
+only.
+
+**`default_value_t` and `hide_default_value`**
+`default_value_t = default_jobs()` is an expression clap evaluates when it builds the
+parser, every time the program starts, and `--help` prints whatever it returned.
+`hide_default_value = true` keeps the default but hides it from the help, which then says
+in words what the default is.
+
+**Testing the documentation through the binary**
+`Command::new(env!("CARGO_BIN_EXE_cc-extract")).args(["-h"]).output()` runs the binary and
+collects its exit status, stdout and stderr. The test asserts that the README *contains*
+that output (`str::contains`), so the README can wrap it in prose and code fences. clap
+only wraps help to the terminal width with its `wrap_help` feature, which this crate
+doesn't enable, so the output is the same on every machine.
+
+**Cargo's `examples/` discovery**
+Cargo builds `examples/*.rs` and `examples/*/main.rs` as example targets
+(`cargo run --example baseline`). `examples/slurm/` holds no `main.rs`, so Cargo ignores
+it: shell scripts can sit next to Rust examples without becoming a target.
