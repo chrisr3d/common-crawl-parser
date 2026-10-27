@@ -70,7 +70,7 @@ impl ArtifactKind {
         }
     }
 
-    /// The Format combinations this kind can be extracted from (ADR-0001),
+    /// The Format combinations this kind can be extracted from,
     /// among which the planner chooses (`plan`).
     ///
     /// ## A static table as a `match`

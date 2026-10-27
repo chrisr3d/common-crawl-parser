@@ -144,8 +144,7 @@ fails when the two blocks above no longer match the binary.
 ## Artifact Kinds and Plans
 
 Before downloading a Shard, the program picks its Plan: the cheapest Formats, among those the
-Shard's Dataset publishes, that serve every requested kind not yet done for it
-([ADR-0001](docs/adr/0001-format-selection-by-cheapest-combination.md)). Each kind then reads
+Shard's Dataset publishes, that serve every requested kind not yet done for it. Each kind then reads
 the cheapest of its own accepted Formats inside the Plan:
 
 | `--extract` | Plan on CC-MAIN | Downloaded per Shard |

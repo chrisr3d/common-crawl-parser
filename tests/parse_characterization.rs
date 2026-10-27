@@ -2,9 +2,9 @@
 //
 // A characterization test pins what the code does *today*, right or wrong,
 // so that a refactor can prove it changed behaviour only where intended.
-// Issue 02 pinned the six `parse_warc*` functions this way; issue 03
-// replaced them with one `parse_archive`, and the expected values below
-// changed only where that issue said they would.
+// The six `parse_warc*` functions were pinned this way first; when one
+// `parse_archive` replaced them, the expected values below changed only
+// where that change was meant to change them.
 //
 // The fixture is a hand-built Archive (see `fixture_archive`), small enough
 // that every expected Artifact can be written out below.
@@ -178,8 +178,8 @@ fn expected_snapshot() -> Snapshot {
             // Onion search ignores `Content-Type`.
             (PLAIN_TEXT_V3, on_c()),
         ]),
-        // Only favicons a page declares: no root `/favicon.ico` guess
-        // (ADR-0003). Nothing from page B: its inline `data:` favicon is
+        // Only favicons a page declares: no root `/favicon.ico` guess.
+        // Nothing from page B: its inline `data:` favicon is
         // an `inline-favicon` Artifact, not a URL. Nothing from page C:
         // favicons are only searched in HTML responses.
         favicon_urls: string_keys(vec![

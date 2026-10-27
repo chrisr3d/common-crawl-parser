@@ -925,8 +925,8 @@ async fn run_crawl(input: String, config: Config) {
                 });
                 eprintln!("  [{}] Parsing time: {:.1}s", shard, parse_time.as_secs_f64());
 
-                // A kind is done only if every Archive it reads parsed
-                // (ADR-0002); the others' partial Sightings are dropped.
+                // A kind is done only if every Archive it reads parsed; the
+                // others' partial Sightings are dropped.
                 let parsed_formats: FormatSet = parsed.iter().map(ArchivePath::format).collect();
                 let (done, undone) = plan.split_done(parsed_formats);
                 let found: Vec<(ArtifactKind, Findings)> = done

@@ -487,7 +487,7 @@ fn hand_over(
 
 /// Load the (Shard, Artifact kind) pairs already done in `output_dir`.
 ///
-/// `processed.log` holds one `<shard> <kind>` line per done pair (ADR-0002),
+/// `processed.log` holds one `<shard> <kind>` line per done pair,
 /// such as `CC-MAIN-20260305070756-20260305100756-00000 onion`. Lines
 /// without a kind name this version knows are ignored: a bare Archive
 /// name, as written before kinds were tracked, doesn't say which kinds were

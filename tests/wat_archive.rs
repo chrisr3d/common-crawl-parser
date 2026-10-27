@@ -258,7 +258,7 @@ fn seen_on(page_url: &str, date: &str) -> Sighting {
     }
 }
 
-/// ADR-0001: `onion` accepts WAT + WET instead of WARC, `favicon` WAT.
+/// `onion` accepts WAT + WET instead of WARC, `favicon` WAT.
 /// The Plan for both reads WAT and WET; the favicon extractor finds nothing
 /// in WET, so handing it WET too changes nothing.
 #[test]

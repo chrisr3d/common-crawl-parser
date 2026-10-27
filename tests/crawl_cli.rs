@@ -204,7 +204,7 @@ fn saved_state(output_dir: &Path) -> (Vec<Findings>, Vec<String>) {
     (sightings, processed)
 }
 
-/// ADR-0002: a kind added later runs alone on a Shard already done for the
+/// A kind added later runs alone on a Shard already done for the
 /// others, and ends up with the same files as asking for every kind at once.
 ///
 /// Every run reads WARC (`--formats warc`), the one Format both kinds can
@@ -231,7 +231,7 @@ fn adding_a_kind_later_runs_only_that_kind() {
     assert_eq!(stepwise.0, expected_sightings());
 }
 
-/// ADR-0001: on CC-MAIN, `onion` and `favicon` are read from WAT + WET,
+/// On CC-MAIN, `onion` and `favicon` are read from WAT + WET,
 /// derived from the WARC paths file line, and give what WARC gives. The
 /// WARC Archive is not in `download/`: fetching it would fail the run.
 #[test]
@@ -309,7 +309,7 @@ fn formats_that_cannot_serve_a_kind_are_rejected() {
     assert!(!dir.join("output").exists());
 }
 
-/// ADR-0001: only WARC serves `inline-favicon`, so asking for it plans WARC
+/// Only WARC serves `inline-favicon`, so asking for it plans WARC
 /// even on CC-MAIN, and `onion` reads that WARC instead of WAT + WET. The
 /// WAT and WET Archives are not in `download/`: fetching them would fail
 /// the run.

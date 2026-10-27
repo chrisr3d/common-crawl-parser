@@ -983,7 +983,7 @@ Current behaviour the pinned test records, right or wrong:
   `Content-Type`.
 - Uppercase onions are not extracted: both engines match `[a-z2-7]` only.
 - Favicon search only runs on `text/html` / `application/xhtml` responses, and adds
-  a root `/favicon.ico` guess for every HTML page (to be dropped, ADR-0003).
+  a root `/favicon.ico` guess for every HTML page (to be dropped).
 - Only `response` records are searched.
 
 Known gap, not covered by the fixture: the two onion engines disagree when a
@@ -1110,7 +1110,8 @@ Behaviour changes, each visible as one line in the characterization test diff:
   to turn any file they couldn't parse into an empty map, which the next save then
   wrote over the old results. They now return an error naming the file, and the crawl
   stops before writing anything (`tests/output_state.rs`).
-- No root `/favicon.ico` guess for every HTML page (ADR-0003): only declared favicons.
+- No root `/favicon.ico` guess for every HTML page: only declared favicons. A guessed
+  URL was never checked to exist, and nearly a third of the URLs saved were guesses.
 - Inline `data:` favicons are no longer part of the parse result. They were never saved
   anyway; they come back as their own Artifact kind.
 - Both onion engines use ASCII word boundaries. The regex pattern is now
@@ -1217,7 +1218,7 @@ only `[0-9A-Za-z_]` on each side. It is also cheaper: a Unicode `\b` can force t
 ### What we built
 
 A run can now extract any subset of Artifact kinds, and a later run can add a kind
-without redoing the work already done (ADR-0002). The crate is renamed `onion-crawler` →
+without redoing the work already done. The crate is renamed `onion-crawler` →
 `cc-extract` (version 2.0.0: the CLI changed in incompatible ways).
 
 - **`processed.log` per (Shard, kind)**: each line is `<shard> <kind>`, such as
@@ -1349,7 +1350,7 @@ crate only.
 ### What we built
 
 Each Shard is now planned before it is downloaded: the program picks the cheapest Formats
-that serve every requested kind (ADR-0001), downloads one Archive per Format in that
+that serve every requested kind, downloads one Archive per Format in that
 Plan, and hands each Archive to the kinds that read its Format. Only WARC can be read so
 far, so every kind's Format requirement is still `{WARC}` and every Plan is WARC: the
 behaviour on a WARC paths file is unchanged. The WET and WAT readers, in the next steps,
@@ -1397,7 +1398,7 @@ only have to add their entries to the table.
   available RAM is divided by the largest estimated Plan among the scheduled Shards instead
   of a flat 1 GB. With WARC Plans this is the same 1 GB as before.
 
-The planner is tested with the requirement tables of ADR-0001 (`onion` = WARC or WAT + WET,
+The planner is tested with the target requirement tables (`onion` = WARC or WAT + WET,
 `favicon` = WARC or WAT, `inline-favicon` = WARC): `onion` + `favicon` plan WAT + WET with
 `onion` reading both and `favicon` WAT only, `favicon` alone plans WAT, anything with
 `inline-favicon` plans WARC, CC-NEWS always plans WARC.
@@ -1545,7 +1546,7 @@ standard library implements `From<[(K, V); N]>` for every array length `N`, one 
 
 ### What we built
 
-WAT Archives can now be read, and with them the Plans of ADR-0001 come into force: on
+WAT Archives can now be read, and with them the cheaper Plans come into force: on
 CC-MAIN, the default `-e onion,favicon` downloads WAT + WET (~240 MB per Shard) instead of
 WARC (~1 GB), `onion` reading both and `favicon` WAT only; `-e favicon` downloads WAT only.
 WARC is still read for CC-NEWS, or when forced with `--formats warc`.
@@ -1793,8 +1794,8 @@ then thrown away. They are now an Artifact kind of their own, `inline-favicon`, 
   percent-encoded `data:image/svg+xml,...` is dropped, as before, even when its text happens
   to read as base64.
 - **Plan**: `inline-favicon` accepts WARC only (WAT cuts `data:` URLs, WET has no markup),
-  so asking for it plans WARC even on CC-MAIN, and the other kinds read that WARC
-  (ADR-0001). It is not in the default `--extract` list.
+  so asking for it plans WARC even on CC-MAIN, and the other kinds read that WARC.
+  It is not in the default `--extract` list.
 - **One type for every kind's results**: the other kinds map each Artifact to a list of
   Sightings; this one maps each image to a description *and* its Sightings. The pipeline
   now holds a `Findings` per kind (`Sightings` or `InlineFavicons`), which the extractors
@@ -1914,13 +1915,13 @@ the user makes, but the planner's: the cheapest Formats serving every kind still
 | | Before (`onion-crawler` 1.3.1) | After (`cc-extract` 2.0.0) |
 |---|---|---|
 | Kinds | `onion` and `favicon`, always both | Any of `onion`, `favicon`, `inline-favicon` (`-e`) |
-| Formats | WARC only; WAT and WET crashed the parser | WARC, WAT, WET, planned per Shard (ADR-0001) |
+| Formats | WARC only; WAT and WET crashed the parser | WARC, WAT, WET, planned per Shard |
 | Download per CC-MAIN Shard, default kinds | ~1 GB | ~240 MB (WAT + WET) |
 | Parsing | Six copy-pasted `parse_warc_*` functions | One `parse_archive`, one `Extractor` per kind |
 | CLI | `-s/--strategy` and `-m/--stream` mixed Transport and search | `-t/--transport` and `--onion-engine`, independent |
-| `processed.log` | Archive file names: a Shard done once was never redone | `<shard> <kind>`: a kind can be added later (ADR-0002) |
+| `processed.log` | Archive file names: a Shard done once was never redone | `<shard> <kind>`: a kind can be added later |
 | Crash between save and mark | Results of the Archive lost | Shard redone, nothing lost (`save_then_mark`) |
-| Favicons | Guessed root `/favicon.ico` on every page, `<base href>` ignored | Declared favicons only (ADR-0003), resolved against `<base href>` |
+| Favicons | Guessed root `/favicon.ico` on every page, `<base href>` ignored | Declared favicons only, resolved against `<base href>` |
 | Inline favicons | Decoded, then dropped | Saved with SHA-256, Shodan `mmh3` and media type |
 
 Adding an Artifact kind now takes a variant in `ArtifactKind`, an `impl Extractor`, and one

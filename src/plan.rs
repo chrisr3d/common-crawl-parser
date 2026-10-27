@@ -1,4 +1,4 @@
-// The planner — which Formats to read for one Shard (ADR-0001)
+// The planner — which Formats to read for one Shard
 //
 // Each Artifact kind accepts some Format combinations, its Format
 // requirement (`ArtifactKind::format_requirement`). The Plan for a Shard is
@@ -149,7 +149,7 @@ impl Plan {
 
     /// Split the kinds into those done once the Archives of `parsed` have
     /// parsed, and the others: a kind is done only if every Format it reads
-    /// is in `parsed` (ADR-0002).
+    /// is in `parsed`.
     ///
     /// `Iterator::partition` sends each item to the first collection when
     /// the closure returns `true`, to the second otherwise.
@@ -209,7 +209,7 @@ mod tests {
     use crate::format::Dataset;
     use Format::{Warc, Wat, Wet};
 
-    // The real requirement tables (ADR-0001).
+    // The real requirement tables.
     const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();
     const FAVICON: FormatRequirement = ArtifactKind::Favicon.format_requirement();
     const INLINE_FAVICON: FormatRequirement = ArtifactKind::InlineFavicon.format_requirement();
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn wet_alone_cannot_serve_onion() {
         // WET drops HTTP headers and attribute values, where most onions
-        // are: it serves `onion` only together with WAT (ADR-0001).
+        // are: it serves `onion` only together with WAT.
         let wet = FormatSet::of(&[Wet]);
         assert_eq!(
             Plan::new(Dataset::CcMain, &[ArtifactKind::Onion], Some(wet)),

@@ -16,7 +16,8 @@
 // 6. Inline `data:` URIs in any of the above → decoded as base64 favicons
 //
 // Unlike AIL, we don't add a guessed `{scheme}://{domain}/favicon.ico` for
-// every page: only favicons a page declares are recorded (ADR-0003).
+// every page: only favicons a page declares are recorded. A guessed URL
+// was never checked to exist, and one per page would swell the results.
 //
 // Relative URLs resolve as a browser resolves them: against the page's
 // first `<base href>`, itself resolved against the page URL, else against
@@ -700,7 +701,7 @@ mod tests {
     fn no_root_favicon_guess_without_tags() {
         let html = b"<html><head><title>No icons</title></head></html>";
         let result = extract_favicons(html, "https://example.com/page/deep");
-        assert!(result.urls.is_empty(), "only declared favicons (ADR-0003)");
+        assert!(result.urls.is_empty(), "only declared favicons are recorded");
     }
 
     #[test]

@@ -76,7 +76,7 @@ Each kind accepts some combinations of Formats (its Format requirement):
 
 A Shard's Plan is the cheapest combination of Formats, among those its Dataset
 publishes, that contains an accepted combination for every kind still to do
-for it (ADR-0001). Cost is the estimated Archive size: WARC ~1 GB, WAT ~170 MB,
+for it. Cost is the estimated Archive size: WARC ~1 GB, WAT ~170 MB,
 WET ~70 MB. Inside the Plan, each kind reads the cheapest of its own accepted
 combinations:
 
@@ -101,7 +101,7 @@ no kind reads is not downloaded.
 
 A kind reading several Archives gets the union of what each one gave: Sightings
 are not joined record by record. A (Shard, kind) pair is done only when every
-Archive that kind reads has been downloaded and parsed (ADR-0002); a failed
+Archive that kind reads has been downloaded and parsed; a failed
 WET Archive leaves `onion` undone but still lets `favicon` finish from WAT.
 
 ## 3. Download
@@ -247,7 +247,9 @@ declares a favicon; in WAT it is ia-web-commons' `Head.Base`.
 - `fav.png` is resolved against the base's directory.
 
 **No root guess.** Unlike AIL, no `{scheme}://{host}/favicon.ico` is added for
-pages that declare nothing: only declared favicons are recorded (ADR-0003).
+pages that declare nothing: only declared favicons are recorded. A guessed URL
+was never checked to exist, and with one per HTML page such guesses made up
+nearly a third of the URLs in `favicons.json`.
 
 **`data:` values** are not favicon URLs. In WARC, base64 ones are handed to the
 `inline-favicon` kind (next section); in WAT they are skipped, since
