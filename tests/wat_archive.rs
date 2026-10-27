@@ -223,8 +223,8 @@ fn expected_snapshot() -> Snapshot {
             (ANCHOR_V3.to_string(), on_a()),
             (TEXT_V2.to_string(), on_a()),
         ]),
-        // Not extracted: page B's inline `data:` favicon (no Artifact kind
-        // keeps it yet, and WAT has cut it anyway).
+        // Not extracted: page B's inline `data:` favicon (an
+        // `inline-favicon` Artifact, not a URL, and WAT has cut it anyway).
         favicon_urls: BTreeMap::from([
             ("https://example.com/blog/favicon.png".to_string(), on_a()),
             ("https://example.com/tile.png".to_string(), on_a()),

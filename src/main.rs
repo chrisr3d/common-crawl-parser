@@ -25,9 +25,10 @@ use futures::stream::{self, StreamExt};
 
 use cc_extract::{
     download_archive, download_archive_to_memory, load_processed_from, load_sightings_from,
-    merge_sightings, merge_sightings_from, parse_archive, save_sightings_to, save_then_mark,
-    ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Format, FormatSet, OnionEngine,
-    OnionExtractor, Plan, Shard, Sightings, Transport, DEFAULT_OUTPUT_DIR,
+    merge_sightings_from, parse_archive, save_sightings_to, save_then_mark, ArchivePath,
+    ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
+    InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, Shard, Transport,
+    DEFAULT_OUTPUT_DIR,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,7 @@ fn new_extractor(kind: ArtifactKind, onion_engine: OnionEngine) -> Box<dyn Extra
     match kind {
         ArtifactKind::Onion => Box::new(OnionExtractor::new(onion_engine)),
         ArtifactKind::Favicon => Box::new(FaviconExtractor::new()),
+        ArtifactKind::InlineFavicon => Box::new(InlineFaviconExtractor::new()),
     }
 }
 
@@ -338,7 +340,7 @@ struct ScheduledShard {
 struct ShardResult {
     shard: Shard,
     /// What each kind found, for the kinds whose Archives all parsed.
-    found: Vec<(ArtifactKind, Sightings)>,
+    found: Vec<(ArtifactKind, Findings)>,
     /// The kinds left undone because one of their Archives failed.
     undone: Vec<ArtifactKind>,
     /// The Archives that were downloaded and parsed.
@@ -388,7 +390,7 @@ async fn fetch(
 ///
 /// Returns what each kind found, merged over the Archives it reads, and the
 /// Archives that parsed. Sightings from different Archives are unioned
-/// (`merge_sightings`), never joined record by record. An Archive that
+/// (`Findings::merge`), never joined record by record. An Archive that
 /// fails to parse contributes nothing: its extractors, and what they found
 /// before the error, are dropped.
 fn parse_archives(
@@ -397,8 +399,8 @@ fn parse_archives(
     plan: &Plan,
     onion_engine: OnionEngine,
     transport_choice: TransportChoice,
-) -> (BTreeMap<ArtifactKind, Sightings>, Vec<ArchivePath>) {
-    let mut found: BTreeMap<ArtifactKind, Sightings> = BTreeMap::new();
+) -> (BTreeMap<ArtifactKind, Findings>, Vec<ArchivePath>) {
+    let mut found: BTreeMap<ArtifactKind, Findings> = BTreeMap::new();
     let mut parsed = Vec::new();
 
     for (archive, transport) in downloaded {
@@ -419,7 +421,10 @@ fn parse_archives(
             Ok(()) => {
                 for extractor in extractors {
                     let kind = extractor.kind();
-                    merge_sightings(found.entry(kind).or_default(), extractor.into_sightings());
+                    found
+                        .entry(kind)
+                        .or_insert_with(|| Findings::empty(kind))
+                        .merge(extractor.into_findings());
                 }
                 parsed.push(archive);
             }
@@ -519,7 +524,7 @@ fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
 ///
 /// Every finished Shard saves the results files again, so carrying on
 /// with an empty map would overwrite a file that merely failed to load.
-fn load_or_exit(loaded: Result<Sightings, Box<dyn Error>>) -> Sightings {
+fn load_or_exit(loaded: Result<Findings, Box<dyn Error>>) -> Findings {
     loaded.unwrap_or_else(|err| {
         eprintln!("Error: {}", err);
         eprintln!(
@@ -532,9 +537,9 @@ fn load_or_exit(loaded: Result<Sightings, Box<dyn Error>>) -> Sightings {
 }
 
 /// Save every requested kind's results file, reporting each one.
-fn save_all(results: &BTreeMap<ArtifactKind, Sightings>, output_dir: &str) {
-    for (&kind, sightings) in results {
-        match save_sightings_to(kind, sightings, output_dir) {
+fn save_all(results: &BTreeMap<ArtifactKind, Findings>, output_dir: &str) {
+    for (&kind, findings) in results {
+        match save_sightings_to(kind, findings, output_dir) {
             Ok(()) => {
                 let path = Path::new(output_dir).join(kind.output_filename());
                 eprintln!("{} results saved to {}", kind, path.display());
@@ -666,7 +671,7 @@ async fn run_crawl(input: String, config: Config) {
     // are saved again: a run with `-e onion` never touches `favicons.json`.
     // A `BTreeMap` keeps the kinds in declaration order for the messages.
     let processed = load_processed_from(&config.output_dir);
-    let mut results: BTreeMap<ArtifactKind, Sightings> = kinds
+    let mut results: BTreeMap<ArtifactKind, Findings> = kinds
         .iter()
         .map(|&kind| (kind, load_or_exit(load_sightings_from(kind, &config.output_dir))))
         .collect();
@@ -674,7 +679,7 @@ async fn run_crawl(input: String, config: Config) {
     eprintln!(
         "State: {} (Shard, kind) pair(s) done; {} in results\n",
         processed.len(),
-        count_list(results.iter().map(|(&kind, sightings)| (kind, sightings.len())))
+        count_list(results.iter().map(|(&kind, findings)| (kind, findings.len())))
     );
 
     // --- Schedule: the requested kinds still missing for each Shard ---
@@ -749,7 +754,7 @@ async fn run_crawl(input: String, config: Config) {
         );
         eprintln!(
             "Total in results: {}",
-            count_list(results.iter().map(|(&kind, sightings)| (kind, sightings.len())))
+            count_list(results.iter().map(|(&kind, findings)| (kind, findings.len())))
         );
         return;
     }
@@ -915,16 +920,19 @@ async fn run_crawl(input: String, config: Config) {
                 // (ADR-0002); the others' partial Sightings are dropped.
                 let parsed_formats: FormatSet = parsed.iter().map(ArchivePath::format).collect();
                 let (done, undone) = plan.split_done(parsed_formats);
-                let found: Vec<(ArtifactKind, Sightings)> = done
+                let found: Vec<(ArtifactKind, Findings)> = done
                     .into_iter()
-                    .map(|kind| (kind, by_kind.remove(&kind).unwrap_or_default()))
+                    .map(|kind| {
+                        let findings = by_kind.remove(&kind);
+                        (kind, findings.unwrap_or_else(|| Findings::empty(kind)))
+                    })
                     .collect();
 
                 if !found.is_empty() {
                     eprintln!(
                         "  [{}] Found {}",
                         shard,
-                        count_list(found.iter().map(|(kind, sightings)| (*kind, sightings.len())))
+                        count_list(found.iter().map(|(kind, findings)| (*kind, findings.len())))
                     );
                 }
 
@@ -965,7 +973,7 @@ async fn run_crawl(input: String, config: Config) {
         // done. A crash or failed write in between leaves the pair
         // unmarked, never marked with its Sightings unsaved (see
         // `save_then_mark`).
-        for (kind, sightings) in result.found {
+        for (kind, findings) in result.found {
             // Extractors only run for requested kinds, and every
             // requested kind was loaded. Inserting an empty map here
             // instead would overwrite a results file never loaded.
@@ -973,7 +981,7 @@ async fn run_crawl(input: String, config: Config) {
                 .get_mut(&kind)
                 .expect("results are loaded for every requested kind");
             let count_before = all.len();
-            merge_sightings(all, sightings);
+            all.merge(findings);
             *new_counts.entry(kind).or_default() += all.len() - count_before;
 
             if let Err(err) = save_then_mark(kind, all, &result.shard, &output_dir) {
@@ -1026,7 +1034,7 @@ async fn run_crawl(input: String, config: Config) {
     );
     eprintln!(
         "Total in results: {}",
-        count_list(results.iter().map(|(&kind, sightings)| (kind, sightings.len())))
+        count_list(results.iter().map(|(&kind, findings)| (kind, findings.len())))
     );
     if process_count > 0 {
         let avg_dl = total_download.as_secs_f64() / process_count as f64;

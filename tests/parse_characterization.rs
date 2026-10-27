@@ -180,8 +180,8 @@ fn expected_snapshot() -> Snapshot {
         ]),
         // Only favicons a page declares: no root `/favicon.ico` guess
         // (ADR-0003). Nothing from page B: its inline `data:` favicon is
-        // not kept until the `inline-favicon` kind exists. Nothing from
-        // page C: favicons are only searched in HTML responses.
+        // an `inline-favicon` Artifact, not a URL. Nothing from page C:
+        // favicons are only searched in HTML responses.
         favicon_urls: string_keys(vec![
             // `relative.png` resolved against the page's directory.
             ("https://example.com/blog/relative.png", on_a()),

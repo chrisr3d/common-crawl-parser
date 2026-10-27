@@ -1,10 +1,11 @@
 // Artifact kinds, Shards and Sightings — the vocabulary extractors speak
 //
 // An Artifact is one value found in a crawled page (one `.onion` address,
-// one favicon URL). A Sighting records where and when it was seen: the page,
-// the crawl date, and the Shard the page was read from. Every Artifact kind
-// keeps its results the same way, a map from each Artifact to its
-// Sightings (`Sightings`).
+// one favicon URL, one inline favicon image). A Sighting records where and
+// when it was seen: the page, the crawl date, and the Shard the page was
+// read from. Every Artifact kind keeps its results as a map from each
+// Artifact to its Sightings (`Sightings`); `inline-favicon` also describes
+// each image (`InlineFavicons`). `Findings` holds either.
 //
 // The helpers at the bottom are the only place that decides when two
 // Sightings are "the same": extraction, the per-Archive merge in `main` and
@@ -18,6 +19,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::format::Format;
+use crate::inline_favicon::InlineFavicons;
 use crate::page_record::PageRecord;
 use crate::plan::FormatRequirement;
 
@@ -38,7 +40,7 @@ use crate::plan::FormatRequirement;
 /// ## `clap::ValueEnum`: one name per kind
 ///
 /// The derive turns each variant into a CLI value, kebab-cased (`Onion` →
-/// `onion`, a future `InlineFavicon` → `inline-favicon`), so `--extract`
+/// `onion`, `InlineFavicon` → `inline-favicon`), so `--extract`
 /// parses kinds without hand-written code. `Display` and `FromStr` below
 /// reuse those names, so the CLI, progress output and `processed.log` all
 /// spell a kind the same way and can't drift apart.
@@ -48,6 +50,8 @@ pub enum ArtifactKind {
     Onion,
     /// Favicon URLs that HTML pages declare
     Favicon,
+    /// Favicon images that HTML pages embed as base64 `data:` URIs
+    InlineFavicon,
 }
 
 impl ArtifactKind {
@@ -62,6 +66,7 @@ impl ArtifactKind {
         match self {
             ArtifactKind::Onion => "onions.json",
             ArtifactKind::Favicon => "favicons.json",
+            ArtifactKind::InlineFavicon => "inline_favicons.json",
         }
     }
 
@@ -89,6 +94,10 @@ impl ArtifactKind {
             ArtifactKind::Onion => &[&[Format::Warc], &[Format::Wat, Format::Wet]],
             // WAT lists every `<link>` and `<meta>` tag of the `<head>`.
             ArtifactKind::Favicon => &[&[Format::Warc], &[Format::Wat]],
+            // Only WARC keeps the images: WAT cuts every `data:` URL after
+            // its first comma (`trimDataUrl` in ia-web-commons), and WET
+            // keeps no markup.
+            ArtifactKind::InlineFavicon => &[&[Format::Warc]],
         }
     }
 }
@@ -167,8 +176,8 @@ impl fmt::Display for Shard {
 /// One occurrence of an Artifact: the page it was seen on, when that page
 /// was crawled, and the Shard it came from.
 ///
-/// `Serialize` / `Deserialize` define the JSON shape of `onions.json` and
-/// `favicons.json`: `{"page_url": ..., "date": ..., "shard": ...}`.
+/// `Serialize` / `Deserialize` define its JSON shape in every kind's output
+/// file: `{"page_url": ..., "date": ..., "shard": ...}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sighting {
     /// URL of the crawled page (`WARC-Target-URI`).
@@ -190,9 +199,113 @@ impl Sighting {
     }
 }
 
-/// The results of one Artifact kind: each Artifact mapped to the pages it
-/// was seen on.
+/// The results of the `onion` and `favicon` kinds: each Artifact mapped to
+/// the pages it was seen on.
 pub type Sightings = HashMap<String, Vec<Sighting>>;
+
+/// What one Artifact kind found, in the shape of its output file.
+///
+/// ## An enum to hold either map
+///
+/// The pipeline keeps every requested kind's results side by side (a
+/// `BTreeMap<ArtifactKind, Findings>` in `main`), so they need one type,
+/// though not every kind's file has the same shape. Each variant carries
+/// one of the maps; `merge`, `len` and saving work on either, and only
+/// `empty` and `from_json` need to know which kind has which.
+///
+/// `#[serde(untagged)]` saves a variant as its map alone, without the
+/// variant's name around it: `onions.json` stays `{artifact: [sightings]}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Findings {
+    /// `onion`, `favicon`: each Artifact (an address, a URL) mapped to its
+    /// Sightings.
+    Sightings(Sightings),
+    /// `inline-favicon`: each image, keyed by its SHA-256, with its
+    /// Sightings.
+    InlineFavicons(InlineFavicons),
+}
+
+impl Findings {
+    /// Nothing found yet, in `kind`'s shape.
+    pub fn empty(kind: ArtifactKind) -> Self {
+        match kind {
+            ArtifactKind::Onion | ArtifactKind::Favicon => Findings::Sightings(Sightings::new()),
+            ArtifactKind::InlineFavicon => Findings::InlineFavicons(InlineFavicons::new()),
+        }
+    }
+
+    /// Read `kind`'s Findings from the JSON of its output file.
+    ///
+    /// Untagged variants could be told apart by trying each shape in turn,
+    /// but an empty file (`{}`) fits both: the kind decides instead.
+    pub fn from_json(kind: ArtifactKind, json: &str) -> serde_json::Result<Self> {
+        // `empty` is the one place that says which kind has which shape.
+        Ok(match Findings::empty(kind) {
+            Findings::Sightings(_) => Findings::Sightings(serde_json::from_str(json)?),
+            Findings::InlineFavicons(_) => Findings::InlineFavicons(serde_json::from_str(json)?),
+        })
+    }
+
+    /// Number of distinct Artifacts.
+    pub fn len(&self) -> usize {
+        match self {
+            Findings::Sightings(map) => map.len(),
+            Findings::InlineFavicons(map) => map.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Merge `from`, found for the same kind, into these Findings
+    /// (`merge_sightings`).
+    ///
+    /// # Panics
+    ///
+    /// If `from` has the other shape. Findings are only merged with the
+    /// same kind's, so that would be a bug, not bad input.
+    pub fn merge(&mut self, from: Findings) {
+        // Matching on the pair checks both shapes at once.
+        match (self, from) {
+            (Findings::Sightings(into), Findings::Sightings(from)) => merge_sightings(into, from),
+            (Findings::InlineFavicons(into), Findings::InlineFavicons(from)) => {
+                merge_sightings(into, from)
+            }
+            _ => panic!("cannot merge the Findings of two different kinds"),
+        }
+    }
+}
+
+/// What a kind's results hold for one Artifact: its Sightings, and for some
+/// kinds a description of the Artifact too (`InlineFavicon`).
+///
+/// ## Implementing our trait for a `std` type
+///
+/// `Vec<Sighting>`, the entry of `Sightings`, is a type from `std`, yet it
+/// implements `ArtifactEntry` below. Rust allows an `impl` when the trait
+/// or the type is defined in the current crate (the *orphan rule*): the
+/// trait is ours, so we may implement it for any type.
+pub trait ArtifactEntry {
+    /// The pages the Artifact was seen on.
+    fn sightings_mut(&mut self) -> &mut Vec<Sighting>;
+
+    /// Record that the Artifact was seen on `sighting`'s page, unless that
+    /// page of that Shard is already listed.
+    ///
+    /// A *provided method*: the trait gives its body, so implementors only
+    /// write `sightings_mut`, and every entry type dedups the same way.
+    fn add_sighting(&mut self, sighting: Sighting) {
+        push_unless_seen(self.sightings_mut(), sighting);
+    }
+}
+
+impl ArtifactEntry for Vec<Sighting> {
+    fn sightings_mut(&mut self) -> &mut Vec<Sighting> {
+        self
+    }
+}
 
 /// Record that every Artifact in `found` was seen on `record`'s page.
 ///
@@ -209,16 +322,31 @@ pub fn add_sightings(
     }
     let sighting = Sighting::new(record, shard);
     for artifact in found {
-        push_unless_seen(sightings.entry(artifact).or_default(), sighting.clone());
+        sightings
+            .entry(artifact)
+            .or_default()
+            .add_sighting(sighting.clone());
     }
 }
 
 /// Merge the Sightings in `from` into `into`, skipping pages already listed.
-pub fn merge_sightings(into: &mut Sightings, from: Sightings) {
-    for (artifact, list) in from {
-        let existing = into.entry(artifact).or_default();
-        for sighting in list {
-            push_unless_seen(existing, sighting);
+/// An Artifact new to `into` comes with its description; one already in it
+/// keeps its own.
+///
+/// ## A generic function
+///
+/// `E: ArtifactEntry` makes this one function serve `Sightings` and
+/// `InlineFavicons` alike: the compiler builds one copy per entry type it
+/// is called with (*monomorphization*), and inside it, `E` can only be used
+/// through `ArtifactEntry`'s methods, which is all the merge needs.
+pub fn merge_sightings<E: ArtifactEntry>(into: &mut HashMap<String, E>, from: HashMap<String, E>) {
+    for (artifact, mut entry) in from {
+        // `mem::take` moves the list out and leaves an empty one: `entry`
+        // is kept without its Sightings, which are then added one by one.
+        let sightings = std::mem::take(entry.sightings_mut());
+        let existing = into.entry(artifact).or_insert(entry);
+        for sighting in sightings {
+            existing.add_sighting(sighting);
         }
     }
 }
@@ -245,6 +373,7 @@ fn push_unless_seen(list: &mut Vec<Sighting>, sighting: Sighting) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inline_favicon::InlineFavicon;
 
     fn sighting(page_url: &str, archive_name: &str) -> Sighting {
         Sighting {
@@ -299,6 +428,32 @@ mod tests {
                 sighting(page, "shard-1.warc.gz"),
                 sighting(page, "shard-2.warc.gz")
             ]
+        );
+    }
+
+    #[test]
+    fn merging_inline_favicons_unions_sightings_and_keeps_the_first_description() {
+        let favicon = |media_type: &str, sightings: Vec<Sighting>| InlineFavicon {
+            mmh3: 1,
+            media_type: media_type.to_string(),
+            data: "aGVsbG8=".to_string(),
+            sightings,
+        };
+        let on_a = sighting("https://example.com/a", "shard-1.warc.gz");
+        let on_b = sighting("https://example.com/b", "shard-1.warc.gz");
+
+        let mut merged =
+            InlineFavicons::from([("hash".to_string(), favicon("image/png", vec![on_a.clone()]))]);
+        let more = InlineFavicons::from([(
+            "hash".to_string(),
+            // The same bytes, declared with another media type.
+            favicon("image/x-icon", vec![on_a.clone(), on_b.clone()]),
+        )]);
+        merge_sightings(&mut merged, more);
+
+        assert_eq!(
+            merged,
+            InlineFavicons::from([("hash".to_string(), favicon("image/png", vec![on_a, on_b]))])
         );
     }
 }

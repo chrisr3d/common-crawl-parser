@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cc_extract::{
-    ArtifactKind, PROCESSED_FILENAME, Shard, Sighting, Sightings, load_sightings_from,
+    ArtifactKind, Findings, PROCESSED_FILENAME, Shard, Sighting, load_sightings_from,
 };
 use common::{WarcBuilder, http_response, wat_response_json};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// File names of the fixture Shard's Archives, one per Format.
 const WARC_NAME: &str = "CC-MAIN-20250101000000-20250101010101-00000.warc.gz";
@@ -89,9 +89,45 @@ fn wet_archive() -> Vec<u8> {
         .finish()
 }
 
+/// A 1×1 PNG in base64, as a page embeds it. At 96 characters, it fills
+/// more than one of the 76-character lines Shodan's hash is computed on.
+const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==";
+/// The PNG's SHA-256, by Python's `hashlib.sha256(png).hexdigest()`.
+const PNG_SHA256: &str = "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d";
+/// The PNG's Shodan favicon hash, by Python's
+/// `mmh3.hash(codecs.encode(png, "base64"))`.
+const PNG_MMH3: i32 = 1_932_519_735;
+
+/// A second page, embedding the same PNG as the first.
+const OTHER_PAGE: &str = "https://example.org/";
+const OTHER_DATE: &str = "2025-01-01T00:00:02Z";
+
+/// Two pages embedding the same PNG as a `data:` URI, the second with its
+/// base64 cut over two lines; the first also mentions an onion.
+fn inline_favicon_warc_archive() -> Vec<u8> {
+    let page = format!(
+        r#"<html><head><link rel="icon" href="data:image/png;base64,{PNG_BASE64}"></head>
+<body>Mirror: {TEXT_ONION}</body></html>"#
+    );
+    let (start, end) = PNG_BASE64.split_at(40);
+    let other_page = format!(
+        r#"<html><head><link rel="shortcut icon" href="data:image/png;base64,{start}
+{end}"></head></html>"#
+    );
+    let headers = [("Content-Type", "text/html")];
+    WarcBuilder::new()
+        .response(PAGE, DATE, &http_response(&headers, &page))
+        .response(
+            OTHER_PAGE,
+            OTHER_DATE,
+            &http_response(&headers, &other_page),
+        )
+        .finish()
+}
+
 /// What a crawl of the fixture saves for each kind (in `ArtifactKind::all`
 /// order), whichever Formats it reads.
-fn expected_sightings() -> Vec<Sightings> {
+fn expected_sightings() -> Vec<Findings> {
     let on_page = || {
         vec![Sighting {
             page_url: PAGE.to_string(),
@@ -100,11 +136,16 @@ fn expected_sightings() -> Vec<Sightings> {
         }]
     };
     vec![
-        HashMap::from([
+        Findings::Sightings(HashMap::from([
             (HEADER_ONION.to_string(), on_page()),
             (TEXT_ONION.to_string(), on_page()),
-        ]),
-        HashMap::from([("https://example.com/icon.png".to_string(), on_page())]),
+        ])),
+        Findings::Sightings(HashMap::from([(
+            "https://example.com/icon.png".to_string(),
+            on_page(),
+        )])),
+        // No inline favicon on the page.
+        Findings::empty(ArtifactKind::InlineFavicon),
     ]
 }
 
@@ -148,7 +189,7 @@ fn crawl(workspace: &Path, args: &[&str]) -> String {
 /// Compared loaded rather than byte for byte: a `HashMap` is saved in an
 /// order that changes from run to run, and `processed.log` lines are
 /// appended run after run, so their order depends on which runs wrote them.
-fn saved_state(output_dir: &Path) -> (Vec<Sightings>, Vec<String>) {
+fn saved_state(output_dir: &Path) -> (Vec<Findings>, Vec<String>) {
     let dir = output_dir.to_str().unwrap();
     let sightings = ArtifactKind::all()
         .iter()
@@ -228,11 +269,15 @@ fn favicon_alone_reads_only_wat() {
         "the Plan should be WAT:\n{stderr}"
     );
     // `expected_sightings` lists the kinds in `ArtifactKind::all` order.
-    let [_, favicons]: [Sightings; 2] = expected_sightings().try_into().unwrap();
+    let [_, favicons, inline_favicons]: [Findings; 3] = expected_sightings().try_into().unwrap();
     assert_eq!(
         saved_state(&dir.join("output")),
         (
-            vec![Sightings::new(), favicons],
+            vec![
+                Findings::empty(ArtifactKind::Onion),
+                favicons,
+                inline_favicons
+            ],
             vec![format!("{SHARD} favicon")]
         )
     );
@@ -262,4 +307,66 @@ fn formats_that_cannot_serve_a_kind_are_rejected() {
         "the message should name the kind and the Formats:\n{stderr}"
     );
     assert!(!dir.join("output").exists());
+}
+
+/// ADR-0001: only WARC serves `inline-favicon`, so asking for it plans WARC
+/// even on CC-MAIN, and `onion` reads that WARC instead of WAT + WET. The
+/// WAT and WET Archives are not in `download/`: fetching them would fail
+/// the run.
+///
+/// The PNG on two pages is one Artifact, keyed by the SHA-256 of its bytes,
+/// with two Sightings.
+#[test]
+fn inline_favicon_plans_warc_and_onion_rides_along() {
+    let dir = workspace(
+        "inline_favicon_plans_warc_and_onion_rides_along",
+        &[(WARC_NAME, inline_favicon_warc_archive())],
+    );
+
+    let stderr = crawl(&dir, &["-e", "onion,inline-favicon"]);
+
+    assert!(
+        stderr.contains(&format!(
+            "{SHARD}: extracting onion,inline-favicon from warc\n"
+        )),
+        "the Plan should be WARC:\n{stderr}"
+    );
+    let output = dir.join("output");
+    let (findings, processed) = saved_state(&output);
+    assert_eq!(
+        processed,
+        [format!("{SHARD} inline-favicon"), format!("{SHARD} onion")]
+    );
+    let [onions, favicons, _]: [Findings; 3] = findings.try_into().unwrap();
+    assert_eq!(
+        onions,
+        Findings::Sightings(HashMap::from([(
+            TEXT_ONION.to_string(),
+            vec![Sighting {
+                page_url: PAGE.to_string(),
+                date: DATE.to_string(),
+                shard: Shard::from_archive_name(SHARD),
+            }]
+        )]))
+    );
+    assert!(favicons.is_empty());
+
+    // The file itself, so its JSON shape is pinned too.
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(output.join("inline_favicons.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        saved,
+        json!({
+            PNG_SHA256: {
+                "mmh3": PNG_MMH3,
+                "media_type": "image/png",
+                "data": PNG_BASE64,
+                "sightings": [
+                    {"page_url": PAGE, "date": DATE, "shard": SHARD},
+                    {"page_url": OTHER_PAGE, "date": OTHER_DATE, "shard": SHARD},
+                ],
+            }
+        })
+    );
 }

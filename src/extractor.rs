@@ -9,7 +9,10 @@ use clap::ValueEnum;
 use memchr::memmem;
 use regex::bytes::Regex;
 
-use crate::artifact::{ArtifactKind, Shard, Sightings, add_sightings};
+use crate::artifact::{
+    ArtifactEntry, ArtifactKind, Findings, Shard, Sighting, Sightings, add_sightings,
+};
+use crate::inline_favicon::{InlineFavicon, InlineFavicons, sha256_hex};
 use crate::page_record::PageRecord;
 use crate::{favicon_search, onion_search};
 
@@ -45,7 +48,7 @@ pub trait Extractor {
     /// A plain `self` would need the concrete type's size, which a
     /// `dyn Extractor` doesn't have, so it couldn't be called on a trait
     /// object.
-    fn into_sightings(self: Box<Self>) -> Sightings;
+    fn into_findings(self: Box<Self>) -> Findings;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +131,8 @@ impl Extractor for OnionExtractor {
         self.sightings.len()
     }
 
-    fn into_sightings(self: Box<Self>) -> Sightings {
-        self.sightings
+    fn into_findings(self: Box<Self>) -> Findings {
+        Findings::Sightings(self.sightings)
     }
 }
 
@@ -156,8 +159,8 @@ impl Extractor for FaviconExtractor {
 
     fn extract(&mut self, record: &PageRecord<'_>, shard: &Shard) {
         let found = match record {
-            // The scanner also decodes inline `data:` favicons; they are not
-            // kept until they get their own Artifact kind.
+            // The scanner also decodes inline `data:` favicons: those are
+            // the `inline-favicon` kind's (`InlineFaviconExtractor`).
             PageRecord::Warc(response) => response
                 .html_body()
                 .map(|html| favicon_search::extract_favicons(html, response.page_url).urls),
@@ -183,7 +186,65 @@ impl Extractor for FaviconExtractor {
         self.sightings.len()
     }
 
-    fn into_sightings(self: Box<Self>) -> Sightings {
-        self.sightings
+    fn into_findings(self: Box<Self>) -> Findings {
+        Findings::Sightings(self.sightings)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline favicons
+// ---------------------------------------------------------------------------
+
+/// Finds the favicon images that HTML pages embed as base64 `data:` URIs,
+/// each one saved under the SHA-256 of its bytes.
+#[derive(Default)]
+pub struct InlineFaviconExtractor {
+    favicons: InlineFavicons,
+}
+
+impl InlineFaviconExtractor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Extractor for InlineFaviconExtractor {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::InlineFavicon
+    }
+
+    fn extract(&mut self, record: &PageRecord<'_>, shard: &Shard) {
+        // Only WARC keeps the images (`ArtifactKind::format_requirement`).
+        let PageRecord::Warc(response) = record else {
+            return;
+        };
+        let Some(html) = response.html_body() else {
+            return;
+        };
+        // The same scan as the favicon extractor's, which keeps the URLs:
+        // with both kinds requested, a page is scanned twice, a few
+        // microseconds next to its decompression.
+        let images = favicon_search::extract_favicons(html, response.page_url).inline_favicons;
+        if images.is_empty() {
+            return;
+        }
+
+        let sighting = Sighting::new(record, shard);
+        for image in images {
+            self.favicons
+                .entry(sha256_hex(&image.bytes))
+                // Shodan's hash and the base64 are computed the first time
+                // an image is seen only.
+                .or_insert_with(|| InlineFavicon::new(&image))
+                .add_sighting(sighting.clone());
+        }
+    }
+
+    fn artifact_count(&self) -> usize {
+        self.favicons.len()
+    }
+
+    fn into_findings(self: Box<Self>) -> Findings {
+        Findings::InlineFavicons(self.favicons)
     }
 }

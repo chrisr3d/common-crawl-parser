@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cc_extract::{
-    ArtifactKind, Extractor, FaviconExtractor, Format, OnionEngine, OnionExtractor, Shard,
-    Sighting, Transport, parse_archive,
+    ArtifactKind, Extractor, FaviconExtractor, Findings, Format, OnionEngine, OnionExtractor,
+    Shard, Sighting, Transport, parse_archive,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -359,13 +359,21 @@ pub fn parse_together(
         favicon_urls: BTreeMap::new(),
     };
     for extractor in extractors {
+        let kind = extractor.kind();
+        // `let ... else`: both extractors above find a `Sightings` map.
+        let Findings::Sightings(found) = extractor.into_findings() else {
+            unreachable!("{kind} finds Sightings");
+        };
         // A new Artifact kind makes this `match` non-exhaustive, so the
         // compiler asks where its results belong.
-        let found = match extractor.kind() {
+        let into = match kind {
             ArtifactKind::Onion => &mut snapshot.onions,
             ArtifactKind::Favicon => &mut snapshot.favicon_urls,
+            // Only WARC serves it, so it can't be compared across Formats;
+            // `tests/crawl_cli.rs` pins it.
+            ArtifactKind::InlineFavicon => unreachable!("no {kind} extractor is built above"),
         };
-        found.extend(extractor.into_sightings());
+        into.extend(found);
     }
     snapshot
 }

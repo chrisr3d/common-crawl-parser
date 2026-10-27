@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use cc_extract::{
-    ArtifactKind, PROCESSED_FILENAME, Shard, Sightings, load_processed_from, load_sightings_from,
+    ArtifactKind, Findings, PROCESSED_FILENAME, Shard, load_processed_from, load_sightings_from,
     save_then_mark,
 };
 
@@ -99,7 +99,12 @@ fn failed_save_leaves_the_pair_unmarked() {
     let dir = dir.to_str().unwrap();
     let shard = Shard::from_archive_name("CC-MAIN-20250101000000-20250101010101-00000");
 
-    let saved = save_then_mark(ArtifactKind::Onion, &Sightings::new(), &shard, dir);
+    let saved = save_then_mark(
+        ArtifactKind::Onion,
+        &Findings::empty(ArtifactKind::Onion),
+        &shard,
+        dir,
+    );
 
     assert!(saved.is_err());
     assert!(load_processed_from(dir).is_empty());

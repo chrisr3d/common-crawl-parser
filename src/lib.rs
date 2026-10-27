@@ -28,6 +28,7 @@ pub mod artifact;
 pub mod extractor;
 pub mod favicon_search;
 pub mod format;
+pub mod inline_favicon;
 pub mod onion_search;
 pub mod page_record;
 pub mod plan;
@@ -35,9 +36,12 @@ pub mod warc_parser;
 
 // Re-exports: the types callers need most, importable from the crate root
 // (`cc_extract::Sighting` rather than `cc_extract::artifact::Sighting`).
-pub use artifact::{ArtifactKind, Shard, Sighting, Sightings, merge_sightings};
-pub use extractor::{Extractor, FaviconExtractor, OnionEngine, OnionExtractor};
+pub use artifact::{ArtifactKind, Findings, Shard, Sighting, Sightings, merge_sightings};
+pub use extractor::{
+    Extractor, FaviconExtractor, InlineFaviconExtractor, OnionEngine, OnionExtractor,
+};
 pub use format::{ArchivePath, Dataset, Format, FormatSet};
+pub use inline_favicon::{InlineFavicon, InlineFavicons};
 pub use plan::{FormatRequirement, Plan, PlanError};
 pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
 
@@ -281,7 +285,7 @@ const PROGRESS_EVERY: u64 = 10_000;
 /// every extractor.
 ///
 /// When this returns, each extractor holds what it found in the Archive;
-/// `Extractor::into_sightings` hands that over. The function itself never
+/// `Extractor::into_findings` hands that over. The function itself never
 /// looks at which Artifact kinds it is feeding.
 ///
 /// ## Synchronous on purpose
@@ -528,7 +532,7 @@ fn mark_processed_in(shard: &Shard, kind: ArtifactKind, output_dir: &str) -> io:
     writeln!(file, "{} {}", shard, kind)
 }
 
-/// Save `kind`'s Sightings, then record `shard` as done for `kind`.
+/// Save `kind`'s Findings, then record `shard` as done for `kind`.
 ///
 /// ## Ordering for crash safety
 ///
@@ -546,25 +550,25 @@ fn mark_processed_in(shard: &Shard, kind: ArtifactKind, output_dir: &str) -> io:
 /// after a failed save.
 pub fn save_then_mark(
     kind: ArtifactKind,
-    sightings: &Sightings,
+    findings: &Findings,
     shard: &Shard,
     output_dir: &str,
 ) -> Result<(), Box<dyn Error>> {
-    save_sightings_to(kind, sightings, output_dir)?;
+    save_sightings_to(kind, findings, output_dir)?;
     mark_processed_in(shard, kind, output_dir)
         .map_err(|err| format!("saved, but could not mark {} {}: {}", shard, kind, err))?;
     Ok(())
 }
 
-/// Load `kind`'s saved Sightings from `output_dir`.
+/// Load `kind`'s saved Findings from `output_dir`.
 pub fn load_sightings_from(
     kind: ArtifactKind,
     output_dir: &str,
-) -> Result<Sightings, Box<dyn Error>> {
-    load_sightings(&Path::new(output_dir).join(kind.output_filename()))
+) -> Result<Findings, Box<dyn Error>> {
+    load_sightings(kind, &Path::new(output_dir).join(kind.output_filename()))
 }
 
-/// Load one kind's saved Sightings; a missing file means none yet.
+/// Load `kind`'s Findings saved in `path`; a missing file means none yet.
 ///
 /// ## Why an unreadable file is an error, not an empty map
 ///
@@ -574,33 +578,33 @@ pub fn load_sightings_from(
 /// instead of `page_url` / `shard`) would make that save silently replace
 /// the file's contents. Failing here stops the run before anything is
 /// written.
-fn load_sightings(path: &Path) -> Result<Sightings, Box<dyn Error>> {
+fn load_sightings(kind: ArtifactKind, path: &Path) -> Result<Findings, Box<dyn Error>> {
     if !path.exists() {
-        return Ok(Sightings::new());
+        return Ok(Findings::empty(kind));
     }
     // `map_err` adds the path to the message: serde's error alone says
     // "missing field `page_url` at line 4" without naming the file.
     let content = fs::read_to_string(path)
         .map_err(|err| format!("cannot read {}: {}", path.display(), err))?;
-    let sightings = serde_json::from_str(&content)
+    let findings = Findings::from_json(kind, &content)
         .map_err(|err| format!("cannot load {}: {}", path.display(), err))?;
-    Ok(sightings)
+    Ok(findings)
 }
 
-/// Save `kind`'s Sightings to its file in `output_dir`.
+/// Save `kind`'s Findings to its file in `output_dir`.
 pub fn save_sightings_to(
     kind: ArtifactKind,
-    sightings: &Sightings,
+    findings: &Findings,
     output_dir: &str,
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(output_dir)?;
     let path = Path::new(output_dir).join(kind.output_filename());
-    let json = serde_json::to_string_pretty(sightings)?;
+    let json = serde_json::to_string_pretty(findings)?;
     fs::write(&path, json).map_err(|err| format!("cannot write {}: {}", path.display(), err))?;
     Ok(())
 }
 
-/// Merge `kind`'s Sightings saved in several output directories into one
+/// Merge `kind`'s Findings saved in several output directories into one
 /// deduplicated map; `None` when no directory has a loadable file for
 /// `kind`.
 ///
@@ -612,18 +616,20 @@ pub fn save_sightings_to(
 /// `merge_sightings` the crawl uses after each Archive. A file that can't
 /// be loaded is reported and skipped, so one bad task doesn't block the
 /// merge of all the others.
-pub fn merge_sightings_from(kind: ArtifactKind, input_dirs: &[PathBuf]) -> Option<Sightings> {
-    let mut merged: Option<Sightings> = None;
+pub fn merge_sightings_from(kind: ArtifactKind, input_dirs: &[PathBuf]) -> Option<Findings> {
+    let mut merged: Option<Findings> = None;
 
     for dir in input_dirs {
         let path = dir.join(kind.output_filename());
         if !path.exists() {
             continue;
         }
-        match load_sightings(&path) {
+        match load_sightings(kind, &path) {
             // `get_or_insert_with` creates the map the first time a file
             // is found, which is what turns `None` into `Some`.
-            Ok(partial) => merge_sightings(merged.get_or_insert_with(Sightings::new), partial),
+            Ok(partial) => merged
+                .get_or_insert_with(|| Findings::empty(kind))
+                .merge(partial),
             Err(err) => eprintln!("Warning: {}, skipping it", err),
         }
     }

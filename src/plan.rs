@@ -209,11 +209,10 @@ mod tests {
     use crate::format::Dataset;
     use Format::{Warc, Wat, Wet};
 
-    // The real requirement tables (ADR-0001), and the one `inline-favicon`
-    // will have once it exists.
+    // The real requirement tables (ADR-0001).
     const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();
     const FAVICON: FormatRequirement = ArtifactKind::Favicon.format_requirement();
-    const INLINE_FAVICON: FormatRequirement = &[&[Warc]];
+    const INLINE_FAVICON: FormatRequirement = ArtifactKind::InlineFavicon.format_requirement();
 
     fn cc_main() -> FormatSet {
         Dataset::CcMain.available_formats()
