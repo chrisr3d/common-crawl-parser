@@ -51,9 +51,9 @@ use cc_extract::{
 enum TransportChoice {
     /// Download to download/, stream-decompress from the file
     Disk,
-    /// Download into RAM, stream-decompress from there (no disk I/O, ~1 GB per job)
+    /// Download into RAM, stream-decompress from there (no disk I/O; a job holds its Shard's Archives)
     Memory,
-    /// Download to download/, decompress to a temporary .warc, memory-map it
+    /// Download to download/, decompress to a temporary file, memory-map it
     Mmap,
 }
 
@@ -232,19 +232,27 @@ struct Config {
     input: Option<String>,
 
     /// Maximum number of Shards to process (default: all)
+    ///
+    /// Shards already done for every requested kind are skipped and not
+    /// counted, so a run repeated with the same --offset goes on past the
+    /// paths the first run covered.
     #[arg(short, long)]
     limit: Option<usize>,
 
     /// Skip the first N paths in the file (for SLURM array partitioning)
     ///
-    /// Combined with --limit, this lets each SLURM array task process a
-    /// non-overlapping slice: task 0 gets --offset 0 --limit 1000,
-    /// task 1 gets --offset 1000 --limit 1000, etc.
+    /// Combined with --limit, this gives each of several processes its own
+    /// slice: process 0 gets --offset 0 --limit 1000, process 1 gets
+    /// --offset 1000 --limit 1000, etc. (see examples/slurm/).
     #[arg(short, long, default_value_t = 0)]
     offset: usize,
 
-    /// Number of concurrent download+parse tasks
-    #[arg(short, long, default_value_t = default_jobs())]
+    /// Number of concurrent download+parse tasks (default: number of CPU cores)
+    //
+    // The default is counted when the program starts, so `--help` would
+    // show this machine's count: on a cluster, the login node's rather than
+    // the compute node's. `hide_default_value` leaves it to the text above.
+    #[arg(short, long, default_value_t = default_jobs(), hide_default_value = true)]
     jobs: usize,
 
     /// Delete each Shard's Archives once parsed
@@ -279,7 +287,7 @@ struct Config {
     #[arg(long, value_enum, value_delimiter = ',')]
     formats: Option<Vec<Format>>,
 
-    /// How downloaded archives reach the parser
+    /// How downloaded Archives reach the parser
     #[arg(short, long, value_enum, default_value_t = TransportChoice::Disk)]
     transport: TransportChoice,
 
@@ -287,10 +295,11 @@ struct Config {
     #[arg(long, value_enum, default_value_t = OnionEngine::Memchr)]
     onion_engine: OnionEngine,
 
-    /// Output directory for results and processed log (default: output/)
+    /// Output directory for results and processed log
     ///
-    /// In HPC batch mode, each SLURM task should use a unique directory
-    /// (e.g., `--output-dir output/42/`) to avoid file contention.
+    /// In HPC batch mode, give each process its own directory (e.g.,
+    /// `--output-dir output/3/7/`) so no two write the same file; `merge`
+    /// combines them afterwards.
     #[arg(long, default_value = DEFAULT_OUTPUT_DIR)]
     output_dir: String,
 
@@ -310,7 +319,7 @@ enum Command {
         #[arg(required = true)]
         input_dirs: Vec<PathBuf>,
 
-        /// Output directory for the merged result (default: output/)
+        /// Output directory for the merged results
         #[arg(short, long, default_value = DEFAULT_OUTPUT_DIR)]
         output_dir: String,
     },
