@@ -17,6 +17,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,6 +25,8 @@ use cc_extract::{
     ArtifactKind, Findings, PROCESSED_FILENAME, Shard, Sighting, load_sightings_from,
 };
 use common::{WarcBuilder, http_response, wat_response_json};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde_json::{Value, json};
 
 /// File names of the fixture Shard's Archives, one per Format.
@@ -305,6 +308,45 @@ fn formats_that_cannot_serve_a_kind_are_rejected() {
     assert!(
         stderr.contains("cannot extract favicon from wet"),
         "the message should name the kind and the Formats:\n{stderr}"
+    );
+    assert!(!dir.join("output").exists());
+}
+
+/// A gzipped paths file cut short (an interrupted download of it) stops the
+/// run at startup, rather than being read as if its first lines were all of
+/// it. The fixture Shard is the first line and its WARC Archive is in
+/// `download/`, so a run that went on would process it, with `--limit 1`.
+#[test]
+fn a_paths_file_cut_short_stops_the_run() {
+    let dir = workspace(
+        "a_paths_file_cut_short_stops_the_run",
+        &[(WARC_NAME, warc_archive())],
+    );
+    let lines: String = (0..2000)
+        .map(|n| ARCHIVE_URI.replace("-00000.warc.gz", &format!("-{n:05}.warc.gz\n")))
+        .collect();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(lines.as_bytes()).unwrap();
+    let mut gzipped = encoder.finish().unwrap();
+    gzipped.truncate(gzipped.len() / 2);
+    fs::write(dir.join("warc.paths.gz"), gzipped).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cc-extract"))
+        .current_dir(&dir)
+        .args(["warc.paths.gz", "--formats", "warc", "--limit", "1"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "cc-extract should fail:\n{stderr}"
+    );
+    // The startup line names the file too: match the error itself.
+    assert!(
+        stderr.contains("cannot read 'warc.paths.gz'"),
+        "the message should name the paths file:\n{stderr}"
     );
     assert!(!dir.join("output").exists());
 }

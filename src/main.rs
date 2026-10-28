@@ -658,9 +658,21 @@ async fn run_crawl(input: String, config: Config) {
         Box::new(BufReader::new(file))
     };
 
-    let uris: Vec<String> = reader
+    // `lines()` yields one `Result` per line, and a read error (such as a
+    // `.gz` paths file cut short) must stop the run: `filter_map(Result::ok)`
+    // would drop it and go on with the lines read so far, as if they were
+    // the whole file. Collecting into `Result<Vec<_>, _>` stops at the first
+    // `Err` and returns it instead.
+    let lines: Vec<String> = reader
         .lines()
-        .filter_map(Result::ok)
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|err| {
+            eprintln!("Error: cannot read '{}': {}", input, err);
+            process::exit(1);
+        });
+
+    let uris: Vec<String> = lines
+        .into_iter()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .skip(config.offset)
