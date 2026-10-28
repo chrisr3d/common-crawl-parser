@@ -8,13 +8,13 @@
 // `processed.log` records which (Shard, Artifact kind) pairs are done, one
 // `<shard> <kind>` line each.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 use cc_extract::{
-    ArtifactKind, Findings, PROCESSED_FILENAME, Shard, load_processed_from, load_sightings_from,
-    save_then_mark,
+    ArtifactKind, Findings, PROCESSED_FILENAME, Shard, Sighting, load_processed_from,
+    load_sightings_from, save_then_mark,
 };
 
 /// An empty output directory of its own for `test_name`, inside Cargo's
@@ -108,4 +108,43 @@ fn failed_save_leaves_the_pair_unmarked() {
 
     assert!(saved.is_err());
     assert!(load_processed_from(dir).is_empty());
+}
+
+/// A save writes the new content in full under another name before it
+/// replaces the results file. A save that fails on the way, or a run killed
+/// during it, leaves the previous file as it was, and the next run loads it.
+#[test]
+fn failed_save_leaves_the_previous_results_loadable() {
+    let dir = output_dir("failed_save_leaves_the_previous_results_loadable");
+    let results_path = dir.join(ArtifactKind::Onion.output_filename());
+    let dir = dir.to_str().unwrap();
+    let shard = Shard::from_archive_name("CC-MAIN-20250101000000-20250101010101-00000");
+    let previous = Findings::Sightings(HashMap::from([(
+        "abcdefghijklmnop.onion".to_string(),
+        vec![Sighting {
+            page_url: "https://example.com/".to_string(),
+            date: "2025-01-01T00:00:00Z".to_string(),
+            shard: shard.clone(),
+        }],
+    )]));
+    save_then_mark(ArtifactKind::Onion, &previous, &shard, dir).unwrap();
+    let previous_bytes = fs::read(&results_path).unwrap();
+    // The new content is written to `onions.json.tmp` first: a directory
+    // there makes that write fail, even for a user that file permissions
+    // wouldn't stop.
+    fs::create_dir(results_path.with_extension("json.tmp")).unwrap();
+
+    let saved = save_then_mark(
+        ArtifactKind::Onion,
+        &Findings::empty(ArtifactKind::Onion),
+        &Shard::from_archive_name("CC-MAIN-20250101000000-20250101010101-00001"),
+        dir,
+    );
+
+    assert!(saved.is_err());
+    assert_eq!(fs::read(&results_path).unwrap(), previous_bytes);
+    assert_eq!(
+        load_sightings_from(ArtifactKind::Onion, dir).unwrap(),
+        previous
+    );
 }

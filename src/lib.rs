@@ -50,8 +50,12 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::process;
 
 use flate2::read::MultiGzDecoder;
+use futures::stream::{self, Stream, TryStreamExt};
+use tokio::io::AsyncWriteExt;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -68,10 +72,89 @@ pub const DEFAULT_OUTPUT_DIR: &str = "output";
 pub const PROCESSED_FILENAME: &str = "processed.log";
 
 // ---------------------------------------------------------------------------
+// Temporary files
+// ---------------------------------------------------------------------------
+
+/// `path` with `suffix` appended to its file name: `onions.json` and
+/// `.tmp` give `onions.json.tmp`, in the same directory.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path.file_name().unwrap_or_default().to_os_string();
+    file_name.push(suffix);
+    path.with_file_name(file_name)
+}
+
+/// A file removed when this value is dropped, unless `keep` was called.
+///
+/// ## Cleaning up on every way out with `Drop`
+///
+/// A function writing a temporary file can be left in many ways: each `?`
+/// returns early with an error, and an async task can be dropped while it
+/// waits at an `.await`. Rust runs `drop` on every local value whichever
+/// way the function is left, so removing the file in `Drop` covers them all,
+/// where a `remove_file` call before the final `Ok` would only cover the way
+/// that reaches it.
+///
+/// A killed process runs no destructors. What it leaves is a file under a
+/// temporary name, which no later run reads.
+///
+/// `drop` can't `.await`, so it removes the file with the blocking
+/// `fs::remove_file`, in async code too: unlinking a file is one quick
+/// system call, not worth handing to another thread.
+struct TempFile {
+    /// `None` once `keep` was called: there is nothing left to remove.
+    path: Option<PathBuf>,
+}
+
+impl TempFile {
+    fn new(path: PathBuf) -> Self {
+        TempFile { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("only `keep` takes the path, and it consumes the value")
+    }
+
+    /// Keep the file: called once it was renamed to its final name, so the
+    /// drop at the end of `keep` has nothing to remove.
+    fn keep(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let Some(path) = &self.path else { return };
+        match fs::remove_file(path) {
+            // An error may come before the file was created.
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                eprintln!("Warning: could not remove {}: {}", path.display(), err);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Download Logic
 // ---------------------------------------------------------------------------
 
-/// Download one Archive from Common Crawl to `download/` using async I/O.
+/// Directory where the disk and mmap Transports keep downloaded Archives,
+/// under the current directory.
+const DOWNLOAD_DIR: &str = "download";
+
+/// Where the disk and mmap Transports keep a downloaded Archive.
+pub fn download_path(archive: &ArchivePath) -> PathBuf {
+    Path::new(DOWNLOAD_DIR).join(archive.file_name())
+}
+
+/// Download one Archive from Common Crawl to `download/` using async I/O,
+/// unless it is there already, and return its path there.
+///
+/// The one place that decides whether an Archive is downloaded: a file at
+/// its name in `download/` is the Archive, complete, since `save_archive`
+/// puts one there only once every byte arrived.
 ///
 /// ## Why `reqwest` instead of `ureq`
 ///
@@ -83,35 +166,28 @@ pub const PROCESSED_FILENAME: &str = "processed.log";
 /// released during network waits and can run other tasks. With 4 concurrent
 /// downloads, we use ~1 thread instead of 4 blocked threads. This is the
 /// core benefit of async for I/O-bound work.
-///
-/// ## Streaming download
-///
-/// We use `response.chunk()` to stream the body in pieces rather than
-/// buffering the entire archive (hundreds of MB) in memory. Each chunk is
-/// written to disk immediately. This keeps memory usage constant regardless
-/// of archive size.
 pub async fn download_archive(
     client: &reqwest::Client,
     archive: &ArchivePath,
-) -> Result<bool, Box<dyn Error + Send + Sync>> {
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
     let filename = archive.file_name();
-    let local_path: PathBuf = Path::new("download").join(filename);
+    let local_path = download_path(archive);
 
     if local_path.exists() {
         eprintln!("  [{}] Already downloaded, skipping download", filename);
-        return Ok(false);
+        return Ok(local_path);
     }
 
     // `tokio::fs::create_dir_all` is the async version of `fs::create_dir_all`.
     // For file system operations, async doesn't help much (disk I/O is fast),
     // but it avoids blocking the Tokio runtime thread.
-    tokio::fs::create_dir_all("download").await?;
+    tokio::fs::create_dir_all(DOWNLOAD_DIR).await?;
 
     eprintln!("  [{}] Downloading...", filename);
     eprintln!("  [{}] URL: {}", filename, url);
 
-    let mut response = client.get(&url).send().await?.error_for_status()?;
+    let response = client.get(&url).send().await?.error_for_status()?;
 
     // Content-Length header tells us the total size (if the server provides it).
     let total_size = response.content_length();
@@ -119,23 +195,84 @@ pub async fn download_archive(
         eprintln!("  [{}] Size: {:.1} MB", filename, size as f64 / 1_048_576.0);
     }
 
-    // Stream the response body chunk by chunk to a file.
-    // `response.chunk()` yields `Option<Bytes>` — each call returns the next
-    // piece of the body, or None when complete. At each `.await`, the task
-    // suspends and the thread can run other downloads.
-    let mut file = tokio::fs::File::create(&local_path).await?;
+    // `response.chunk()` yields `Option<Bytes>`: each call returns the next
+    // piece of the body, or `None` when complete. `try_unfold` turns those
+    // calls into a `Stream`, the shape `save_archive` reads: it threads the
+    // response from one call to the next, and stops at the first `None` or
+    // error.
+    let chunks = stream::try_unfold(response, |mut response| async move {
+        let chunk = response.chunk().await?;
+        Ok::<_, reqwest::Error>(chunk.map(|chunk| (chunk, response)))
+    });
+    save_archive(chunks, total_size, &local_path).await?;
+
+    Ok(local_path)
+}
+
+/// Save an Archive's body, arriving as a stream of `chunks`, to
+/// `local_path`.
+///
+/// ## Complete or absent
+///
+/// A file at `local_path` counts as the Archive, downloaded in full: the
+/// next run parses it rather than downloading it again. So the chunks are
+/// written to `<file name>.<process id>.part` next to it, and renamed to
+/// `local_path` only once the stream ended and, when the server announced
+/// a `Content-Length`, the byte count matches it. A failed download removes
+/// its partial file (`TempFile`); a killed one leaves it, under a name no
+/// run reads. The rename is atomic because both names are in the same
+/// directory, hence on the same filesystem (see `save_sightings_to`).
+///
+/// `std::process::id()` makes the partial name unique per process on one
+/// machine: several processes can share one `download/` and, on a re-run,
+/// reach the same Shard. Each then writes its own partial file, never into
+/// another's; the second rename replaces the first Archive with the same
+/// bytes. (Process ids are unique per machine only: processes on several
+/// nodes sharing one `download/` over a network filesystem could pick the
+/// same one.)
+///
+/// ## Streaming download
+///
+/// Each chunk is written to disk as soon as it arrives, rather than
+/// buffering the entire Archive (hundreds of MB) in memory. This keeps
+/// memory usage constant regardless of Archive size. At each `.await`, the
+/// task suspends and the thread can run other downloads.
+///
+/// ## Any stream of bytes
+///
+/// The function is generic over the `Stream` trait (from `futures`, the
+/// async counterpart of `Iterator`): it reads chunks of any type that can be
+/// viewed as bytes (`AsRef<[u8]>`), with any error type. The HTTP response
+/// is one such stream; a test can build another from a `Vec`, without a
+/// network.
+pub async fn save_archive<S, B, E>(
+    chunks: S,
+    content_length: Option<u64>,
+    local_path: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: Error + Send + Sync + 'static,
+{
+    let filename = local_path.file_name().unwrap_or_default().to_string_lossy();
+    // Reading a stream with `try_next` needs it pinned: a stream (such as
+    // `try_unfold`'s) may hold a future that must not move in memory once
+    // polled. `pin!` pins it on the stack.
+    let mut chunks = pin!(chunks);
+    let partial = TempFile::new(with_suffix(local_path, &format!(".{}.part", process::id())));
+    let mut file = tokio::fs::File::create(partial.path()).await?;
     let mut bytes_written: u64 = 0;
     let mut last_report: u64 = 0;
 
-    // `bytes_stream()` returns a Stream of Result<Bytes> chunks.
-    // We consume it with `while let` + `.chunk()` for simplicity.
-    while let Some(chunk) = response.chunk().await? {
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    while let Some(chunk) = chunks.try_next().await? {
+        let chunk = chunk.as_ref();
+        file.write_all(chunk).await?;
         bytes_written += chunk.len() as u64;
 
         if bytes_written - last_report >= 10 * 1_048_576 {
             last_report = bytes_written;
-            match total_size {
+            match content_length {
                 Some(total) => {
                     let pct = (bytes_written as f64 / total as f64) * 100.0;
                     eprint!(
@@ -161,13 +298,35 @@ pub async fn download_archive(
         eprintln!();
     }
 
+    // tokio's `File` hands each write to a background thread, and
+    // `write_all` may return before the last one is done: `flush` waits for
+    // it, so the file holds every byte before it gets its final name.
+    file.flush().await?;
+    drop(file);
+
+    // The HTTP client already fails a body cut short of its
+    // `Content-Length`; checking here as well keeps the rule in this
+    // function, whatever stream it reads.
+    if let Some(expected) = content_length
+        && bytes_written != expected
+    {
+        return Err(format!(
+            "received {} bytes, but Content-Length announced {}",
+            bytes_written, expected
+        )
+        .into());
+    }
+
+    tokio::fs::rename(partial.path(), local_path).await?;
+    partial.keep();
+
     eprintln!(
         "  [{}] Done: {:.1} MB written",
         filename,
         bytes_written as f64 / 1_048_576.0,
     );
 
-    Ok(true)
+    Ok(())
 }
 
 /// Download one Archive into memory instead of to disk.
@@ -382,22 +541,25 @@ fn parse_mmap(
 ) -> Result<u64, Box<dyn Error + Send + Sync>> {
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
 
-    let tmp_path = path.with_extension("warc");
+    // Removed when this function returns, by `?` on an error too. Locals
+    // are dropped in reverse order of declaration: `tmp` first declared,
+    // last dropped, after the mapping and the file it maps are closed.
+    let tmp = TempFile::new(path.with_extension("warc"));
     eprintln!("  [{}] Decompressing to temp file for mmap...", filename);
     {
         let file = fs::File::open(path)?;
         let mut decoder = MultiGzDecoder::new(file);
-        let mut tmp_file = fs::File::create(&tmp_path)?;
+        let mut tmp_file = fs::File::create(tmp.path())?;
         io::copy(&mut decoder, &mut tmp_file)?;
     }
-    let tmp_size = fs::metadata(&tmp_path)?.len();
+    let tmp_size = fs::metadata(tmp.path())?.len();
     eprintln!(
         "  [{}] Decompressed: {:.1} MB",
         filename,
         tmp_size as f64 / 1_048_576.0
     );
 
-    let tmp_file = fs::File::open(&tmp_path)?;
+    let tmp_file = fs::File::open(tmp.path())?;
     let mmap = unsafe { memmap2::Mmap::map(&tmp_file)? };
     let mut records_scanned = 0;
 
@@ -411,12 +573,6 @@ fn parse_mmap(
         if let Some(page) = to_page_record(format, &page_url, &date, record.body) {
             hand_over(&page, shard, extractors, &mut records_scanned);
         }
-    }
-
-    drop(mmap);
-    drop(tmp_file);
-    if let Err(e) = fs::remove_file(&tmp_path) {
-        eprintln!("  [{}] Warning: could not remove temp file: {}", filename, e);
     }
 
     Ok(records_scanned)
@@ -592,6 +748,25 @@ fn load_sightings(kind: ArtifactKind, path: &Path) -> Result<Findings, Box<dyn E
 }
 
 /// Save `kind`'s Findings to its file in `output_dir`.
+///
+/// ## Write, then rename
+///
+/// `fs::write` straight to the results file would empty it first and then
+/// write the new JSON: a process killed in between (a time limit, the OOM
+/// killer, Ctrl-C) would leave a cut-off file, which the next run refuses to
+/// load. So the JSON is written in full to `<file>.tmp`, then renamed over
+/// the results file.
+///
+/// On Unix, `fs::rename` replaces the target in one step: any reader, or a
+/// run started after a kill, sees either the old file or the new one, never
+/// a mix. That holds only within one filesystem, where a rename just changes
+/// which file the name points to; across filesystems it fails. Hence the
+/// temporary file sits in the same directory as the results file.
+///
+/// The target is a killed process, not a power cut: no `fsync`, which on a
+/// network filesystem would wait for the server to store hundreds of MB on
+/// every save. A leftover `<file>.tmp` is never loaded, and the next save
+/// replaces it.
 pub fn save_sightings_to(
     kind: ArtifactKind,
     findings: &Findings,
@@ -600,7 +775,11 @@ pub fn save_sightings_to(
     fs::create_dir_all(output_dir)?;
     let path = Path::new(output_dir).join(kind.output_filename());
     let json = serde_json::to_string_pretty(findings)?;
-    fs::write(&path, json).map_err(|err| format!("cannot write {}: {}", path.display(), err))?;
+    let temporary = TempFile::new(with_suffix(&path, ".tmp"));
+    fs::write(temporary.path(), json)
+        .and_then(|()| fs::rename(temporary.path(), &path))
+        .map_err(|err| format!("cannot write {}: {}", path.display(), err))?;
+    temporary.keep();
     Ok(())
 }
 

@@ -24,9 +24,9 @@ use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 
 use cc_extract::{
-    download_archive, download_archive_to_memory, load_processed_from, load_sightings_from,
-    merge_sightings_from, parse_archive, save_sightings_to, save_then_mark, ArchivePath,
-    ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
+    download_archive, download_archive_to_memory, download_path, load_processed_from,
+    load_sightings_from, merge_sightings_from, parse_archive, save_sightings_to, save_then_mark,
+    ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
     InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, Shard, Transport,
     DEFAULT_OUTPUT_DIR,
 };
@@ -358,11 +358,6 @@ struct ShardResult {
     parse_time: Duration
 }
 
-/// Where the disk and mmap Transports keep a downloaded Archive.
-fn local_path(archive: &ArchivePath) -> PathBuf {
-    Path::new("download").join(archive.file_name())
-}
-
 /// Download one Archive, unless the file Transports find it already in
 /// `download/`, and return the `Transport` the parser reads it from.
 ///
@@ -379,12 +374,7 @@ async fn fetch(
             download_archive_to_memory(client, archive).await?,
         )),
         TransportChoice::Disk | TransportChoice::Mmap => {
-            let local_path = local_path(archive);
-            if local_path.exists() {
-                eprintln!("  [{}] Already downloaded", archive.file_name());
-            } else {
-                download_archive(client, archive).await?;
-            }
+            let local_path = download_archive(client, archive).await?;
             Ok(if transport_choice == TransportChoice::Mmap {
                 Transport::Mmap(local_path)
             } else {
@@ -1019,7 +1009,7 @@ async fn run_crawl(input: String, config: Config) {
         // failed to parse is kept.
         if delete && transport_choice != TransportChoice::Memory {
             for archive in &result.parsed {
-                let local_path = local_path(archive);
+                let local_path = download_path(archive);
                 match fs::remove_file(&local_path) {
                     Ok(()) => eprintln!("  [{}] Deleted {}", result.shard, local_path.display()),
                     Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", result.shard, err)
