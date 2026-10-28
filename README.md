@@ -39,6 +39,7 @@ Additional features:
 
 - **CLI with `clap`** — Short flags (`-l`, `-o`, `-j`, `-d`, `-e`, `-t`), auto `--help`, paths file as positional argument
 - **Timing** — Per-Shard download/parse duration and averages in summary
+- **Crash-safe writes** — Results files and downloads are written under a temporary name and renamed once complete: a killed run leaves no file cut short under a name a run reads, and the next run resumes as is
 
 ## Rust Concepts Covered
 
@@ -59,6 +60,7 @@ Each step introduces new Rust fundamentals:
 - SIMD-accelerated byte searching (`memchr`)
 - Memory-mapped I/O (`mmap`)
 - `unsafe` blocks and when they're justified
+- Cleanup on every error path with a `Drop` guard, and atomic file replacement with `fs::rename`
 - Values computed on first use (`OnceCell`, `LazyLock`)
 - Performance optimization and benchmarking strategies
 

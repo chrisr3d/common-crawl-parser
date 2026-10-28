@@ -1988,3 +1988,105 @@ doesn't enable, so the output is the same on every machine.
 Cargo builds `examples/*.rs` and `examples/*/main.rs` as example targets
 (`cargo run --example baseline`). `examples/slurm/` holds no `main.rs`, so Cargo ignores
 it: shell scripts can sit next to Rust examples without becoming a target.
+
+## Step 20: Crash-Safe Writes
+
+### What we built
+
+A process can be killed at any moment: a SLURM time limit, `scancel`, the OOM killer,
+Ctrl-C. Two writes used to put a file at its final name before its content was complete,
+so a kill there left a cut-off file that the next run tripped over. Now every file in
+`download/` and in the output directory is either complete or absent.
+
+- **Results files** (`save_sightings_to`): `fs::write` truncated `onions.json` and then
+  wrote the new JSON. A kill in between left a truncated file, which the next run refuses
+  to load (on purpose, rather than overwrite it), so the user had to repair it by hand. The
+  JSON is now written in full to `onions.json.tmp` in the same directory, then
+  `fs::rename`d over `onions.json`. A leftover `.tmp` file is never loaded, and the next
+  save replaces it.
+- **Downloads** (`save_archive`): the body used to stream straight into
+  `download/<file name>`, and any file there counted as downloaded, so an interrupted
+  download was parsed, truncated, on every later run. Chunks now go to
+  `download/<file name>.<process id>.part`, renamed to `download/<file name>` only once the
+  stream ended and, when the server sent one, the byte count matches `Content-Length` (a
+  mismatch is a download error). `save_archive` takes any `Stream` of byte chunks, so the
+  rule is tested without a network.
+- **One existence check**: `fetch` (in `main`) and `download_archive` both checked whether
+  the Archive was in `download/`. Now only `download_archive` does, and returns the path;
+  `download_path` is the one place that says where an Archive goes.
+- **Temporary files removed on error paths**: a `TempFile` guard removes the `.part` file
+  of a failed download, the `.tmp` file of a failed save, and the decompressed copy the
+  `mmap` Transport maps, which used to stay behind when decompression failed.
+- **No `fsync`**: the target is a killed process, not a power cut or a node crash. After a
+  kill, the kernel still writes out what the process wrote; `fsync` would only help when
+  the machine itself goes down, and on a network filesystem it waits for the server to
+  store the whole file, hundreds of MB for `favicons.json`, on every save.
+- **Tests**: a save whose temporary file can't be written fails and leaves the previous
+  `onions.json` byte for byte, still loadable (`tests/output_state.rs`). In
+  `tests/download.rs`, a body arriving in chunks appears at the Archive's name only after
+  the last one, and a body short of its `Content-Length`, or failing part-way, leaves
+  `download/` empty.
+
+### Rust concepts introduced
+
+**`fs::rename`: replacing a file in one step**
+On Unix, `rename` makes the target name point to the new file in one atomic step: any
+reader, or a run started after a kill, sees either the old file or the new one, never a
+mix, and never no file at all. This holds only within one filesystem, where a rename just
+edits a directory entry; across filesystems it fails (`EXDEV`), and a copy-then-delete
+fallback would lose the atomicity. That is why the temporary file is written next to its
+target, not in `/tmp`, which is often another filesystem (a `tmpfs` in RAM, or a node's
+local disk while the output is on the cluster's shared one).
+
+**`std::process::id`: names unique per process**
+`std::process::id()` returns the operating system's id for the running process (`u32`).
+Several processes can share one `download/` and reach the same Shard; with the id in the
+partial file's name, each writes its own file instead of interleaving bytes in one. Ids
+are unique among the processes running on one machine: a reused id belongs to a process
+that is gone, whose leftover `.part` file is simply overwritten. Processes on several
+nodes sharing one `download/` over a network filesystem could still pick the same id. The results
+`.tmp` file needs no id, as each process has its own output directory.
+
+**Cleaning up on `?` error paths: a guard type with `Drop`**
+`?` returns from the function as soon as a step fails, skipping any cleanup written
+further down; that is how `parse_mmap` left its decompressed file behind. A guard
+moves the cleanup into `Drop`, which Rust runs on every local value whichever way the
+function is left:
+
+```rust
+struct TempFile { path: Option<PathBuf> }
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+```
+
+`keep(mut self)` sets `path` to `None` once the file has been renamed to its final name,
+so the drop at the end of `keep` has nothing left to remove. The same `Drop` runs when an
+async task is cancelled at an `.await` (dropping a future drops its locals), but not when
+the process is killed: then the file stays under a name no run reads. Locals are dropped in
+reverse order of declaration, so declaring the guard first in `parse_mmap` removes the file
+only after the memory map and the open file are closed.
+
+**`Stream` and `try_unfold`: an async iterator, and building one**
+`futures::Stream` is the async counterpart of `Iterator`: `next().await` yields the next
+item, or `None` at the end. `save_archive` is generic over
+`S: Stream<Item = Result<B, E>>` with `B: AsRef<[u8]>`, so it reads `reqwest`'s `Bytes`
+as well as a test's `Vec<u8>`. `reqwest` hands the body out through repeated
+`response.chunk().await` calls instead; `stream::try_unfold(response, |mut response| ...)`
+turns those calls into a `Stream`, passing the response from one call to the next.
+`TryStreamExt::try_next()` reads such a stream of `Result`s with `?`.
+
+**`std::pin::pin!`: the standard library's `pin_mut!`**
+`try_next` needs a stream that can't move (Step 6's pinning). `std::pin::pin!(chunks)`
+does what `futures::pin_mut!` does, from the standard library: it pins the stream on the
+stack and gives back a `Pin<&mut S>`, which is `Unpin` itself.
+
+**`flush` before `rename` with `tokio::fs::File`**
+`tokio::fs::File` does its writes on a background thread: `write_all` may return before
+the last one has reached the file. `flush().await` waits for it. Renaming without it could
+give a reader the Archive's name before its last bytes are in.

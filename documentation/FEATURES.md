@@ -115,9 +115,22 @@ Where the bytes go depends on the Transport (`-t` / `--transport`, see the next
 section):
 
 - **`disk` and `mmap` (default `disk`).** The Archive is streamed to
-  `download/<file name>`, under the current directory. If that file already
-  exists, the download is skipped and the existing file is parsed. `-d` /
-  `--delete` removes each Archive of the Shard once it has parsed.
+  `download/<file name>.<process id>.part`, under the current directory, and
+  renamed to `download/<file name>` once the body is complete. When the server
+  sent a `Content-Length`, the byte count must match it, or the download fails.
+  If `download/<file name>` already exists, the download is skipped and the
+  existing file is parsed: only a complete Archive ever gets that name, so a
+  download cut short (a network error, a killed process) is fetched again on the
+  next run. `-d` / `--delete` removes each Archive of the Shard once it has
+  parsed.
+
+  A failed download removes its `.part` file; a killed process leaves it behind.
+  No run reads a `.part` file, so it is safe to delete once no run uses that
+  `download/`. The process id in the name keeps processes on one machine that
+  share a `download/` from writing into the same file when they reach the same
+  Shard. Process ids are unique per machine only: processes on several nodes
+  sharing a `download/` over a network filesystem could still collide (the
+  SLURM example uses `-t memory`, which writes nothing there).
 - **`memory`.** The Archive is collected into a `Vec<u8>` (pre-sized from
   `Content-Length`) and handed to the parser without touching the disk.
 
@@ -153,7 +166,7 @@ the same results:
 |---|---|
 | `disk` (default) | Stream-decompress `download/<file name>` (`WarcRecordIter` over a file) |
 | `memory` | Stream-decompress the downloaded `Vec<u8>` (`WarcRecordIter` over a `Cursor`) |
-| `mmap` | Decompress to a temporary file next to the Archive (3 to 5 GB for a WARC), memory-map it and read records as slices into it (`WarcSliceIter`); the file is deleted afterwards, unless decompressing it failed |
+| `mmap` | Decompress to a temporary file next to the Archive (3 to 5 GB for a WARC), memory-map it and read records as slices into it (`WarcSliceIter`); the file is deleted afterwards, after an error too |
 
 ## 5. Onion extraction
 
@@ -328,6 +341,15 @@ successive runs accumulate. A results file that can't be loaded (corrupt, or
 written in the old `url` / `archive` shape) stops the run before anything is
 written, rather than being overwritten.
 
+A results file is never written in place: the new JSON goes to
+`<file>.tmp` in the same directory, then `rename` puts it in place in one
+step (atomic within one filesystem). A run killed during a save leaves the
+previous file whole, and maybe a `<file>.tmp` that nothing loads and the next
+save replaces. This guards against a killed process, not a power cut or a node
+crash: nothing is forced to disk with `fsync`. `processed.log` needs no such
+care: it is appended one short line at a time, and a line cut off by a kill
+names no known kind, so it is ignored and its pair redone.
+
 A kind's file is saved before its `<shard> <kind>` line is appended, so a crash
 in between leaves the pair undone and the next run extracts it again;
 deduplication makes that redo change nothing. A later run with more kinds
@@ -399,11 +421,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **Results files are rewritten whole after every Shard.** A large
   `favicons.json` makes each save slower as the run goes on, on the one task
   that merges results.
-- **Interrupted downloads are reused as if complete.** With the `disk` and
-  `mmap` Transports, a partial `download/<file>` left by a failed or killed
-  download counts as "already downloaded" on the next run. The truncated
-  Archive then fails to parse (or yields partial results) on every retry,
-  until the file is deleted by hand.
 - **`--limit` counts Shards to do, not paths.** Re-running a slice with the same
   `--offset` and `--limit` after some of its Shards are done goes on past the
   slice's end, into the next process's paths. `merge` deduplicates, so this
