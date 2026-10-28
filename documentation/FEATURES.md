@@ -39,6 +39,8 @@ The positional argument is a paths file as Common Crawl publishes it
 (`warc.paths.gz`, `wat.paths.gz` or `wet.paths.gz` for a Crawl): one Archive path
 per line, relative to `https://data.commoncrawl.org/`. Plain text and gzip are
 both accepted; gzip is detected by the `.gz` extension. Blank lines are ignored.
+A file that can't be read to its end, such as a `.gz` cut short by an
+interrupted download, stops the run with exit 1 before anything is scheduled.
 
 Any of the three files will do: they list the same Shards, and the paths of a
 Shard's other Archives are derived from the line by swapping the Format's
@@ -432,6 +434,14 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **The RAM guard sees the whole machine.** Each process divides the free RAM by
   its largest Plan on its own, so several processes on one node can together
   schedule more in-memory Shards than fit.
+- **Processes sharing a `download/` can clash on the mmap copy.** With
+  `-t mmap`, an Archive is decompressed to `download/<file name without
+  .gz>.warc`, the same name in every process. Two processes parsing the same
+  Shard at once (overlapping slices on a re-run, see `--limit` above) write
+  the same file, and the first can be killed by `SIGBUS` when the second
+  truncates the copy it has mapped. A killed process also leaves its copy
+  (3 to 5 GB for a WARC) until the Shard is parsed with mmap again or the file
+  is deleted. `-t disk` and `-t memory` are not affected.
 - **CC-NEWS's Formats are unverified.** That CC-NEWS publishes WARC only was
   written from memory, commoncrawl.org being unreachable at the time. If it
   publishes WAT or WET too, its Plans are more expensive than they need to be.

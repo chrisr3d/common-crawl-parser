@@ -2090,3 +2090,41 @@ stack and gives back a `Pin<&mut S>`, which is `Unpin` itself.
 `tokio::fs::File` does its writes on a background thread: `write_all` may return before
 the last one has reached the file. `flush().await` waits for it. Renaming without it could
 give a reader the Archive's name before its last bytes are in.
+
+## Step 21: `cargo fmt` and `cargo clippy` Clean; Paths File Read Errors
+
+### What we built
+
+`cargo fmt -- --check` and `cargo clippy --all-targets -- -D warnings` now pass on the
+whole crate, so whatever they report on a new change belongs to that change.
+
+- **Formatting**: `cargo fmt` reformatted five files in `src/`, the `use cc_extract::{...}`
+  block of `main.rs` among them (edition 2024's style sorts names differently). It goes in
+  a commit of its own, with nothing else, so `git blame --ignore-rev` can skip it.
+- **Paths file read errors** (clippy's `lines_filter_map_ok`): the paths file was read with
+  `reader.lines().filter_map(Result::ok)`, which dropped read errors. A `warc.paths.gz`
+  cut short by an interrupted download gave only the paths before the cut, and the run
+  went on with them and exited with 0.
+  The first read error now stops the run with exit 1 and a message naming the file, like
+  a paths file that can't be opened or isn't gzip. Tested end to end in
+  `tests/crawl_cli.rs`: a `.gz` paths file cut in half stops the run before anything is
+  written.
+- **`collapsible_if`**: the `--limit` check is one let chain, like the `--formats` check;
+  here a pattern and a plain `bool` condition are joined by `&&`, where `--formats` joins
+  two patterns.
+
+### Rust concepts introduced
+
+**Why `filter_map(Result::ok)` on `lines()` hides errors**
+`BufRead::lines()` yields one `io::Result<String>` per line. `filter_map(Result::ok)` turns
+each `Err` into `None` and drops it, so a read error looks like the end of the file: the
+lines read before it come back as if they were all of it. It can also loop forever, as
+`lines()` doesn't stop after an error: a reader that fails the same way on every call
+yields `Err` endlessly, and `filter_map` keeps asking for the next one. Clippy suggests
+`map_while(Result::ok)`, which stops at the first `Err`; that ends the loop but still
+hides the error, making the silent truncation official.
+
+**`collect::<Result<Vec<_>, _>>()` stopping at the first error**
+As with `Plan::within` (Step 14), collecting the `Result`s into `Result<Vec<String>, _>`
+stops at the first `Err` and returns it, or returns every line in a `Vec`. `unwrap_or_else`
+then reports the error and exits, as the opening of the file does a few lines above.
