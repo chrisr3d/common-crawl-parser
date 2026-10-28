@@ -285,8 +285,8 @@ fn headers_object(headers: &[(&str, &str)]) -> Value {
 /// `CARGO_TARGET_TMPDIR` is set by Cargo only when compiling integration
 /// tests and benchmarks: a scratch directory inside `target/`. `env!` reads
 /// it at compile time. Tests run in parallel threads, so each test gets its
-/// own subdirectory; the `Mmap` Transport also writes a decompressed `.warc`
-/// next to the Archive, which must not collide either.
+/// own subdirectory: no two tests' files collide, and a test can list the
+/// directory to see what a parse leaves next to the Archive.
 pub fn write_archive(test_name: &str, file_name: &str, bytes: &[u8]) -> PathBuf {
     write_archives(test_name, &[(file_name, bytes)]).remove(0)
 }

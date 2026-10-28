@@ -231,8 +231,8 @@ const REAL_ARCHIVE_VAR: &str = "REAL_WARC_ARCHIVE";
 /// ```
 ///
 /// It parses the Archive six times, reads it fully into RAM for the
-/// `Memory` Transport, and the `Mmap` Transport decompresses it to a `.warc`
-/// file next to the Archive (several GB, removed afterwards).
+/// `Memory` Transport, and the `Mmap` Transport decompresses it to a copy
+/// next to the Archive (several GB of disk space while it runs).
 #[test]
 #[ignore = "slow: parses a real Archive six times; set REAL_WARC_ARCHIVE"]
 fn every_transport_and_engine_agrees_on_real_archive() {

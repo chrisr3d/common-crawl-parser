@@ -432,8 +432,11 @@ pub enum Transport {
     Disk(PathBuf),
     /// Stream-decompress a gzipped Archive already downloaded into memory.
     Memory(Vec<u8>),
-    /// Decompress a gzipped Archive to a temporary file next to it, then
-    /// memory-map that copy and read records straight from the mapping.
+    /// Decompress a gzipped Archive to a copy next to it, then memory-map
+    /// that copy and read records straight from the mapping. On Unix the
+    /// copy's name is removed as soon as it is created: no other process can
+    /// open it, and its space is freed when the parse ends or the process
+    /// dies. On Windows it keeps its name until the parse ends.
     Mmap(PathBuf),
 }
 
@@ -533,6 +536,41 @@ fn parse_stream<R: Read>(
 ///
 /// The trade-off is disk space: a 1GB compressed archive decompresses to
 /// ~3-5GB on disk.
+///
+/// ## A copy without a name
+///
+/// The copy is created under a name of its own, `<file name>.<process
+/// id>.mmap` next to the Archive, and that name is removed at once, before a
+/// single byte is written. On Unix, removing a name (`unlink`) doesn't touch
+/// the file itself: the kernel frees a file once it has no name left *and*
+/// nothing holds it open or mapped. Until then the open `File` still reads,
+/// writes and maps it. So:
+///
+/// - no other process can open the copy: it has no name to open it by. Two
+///   processes parsing the same Archive from one `download/` each map their
+///   own, and neither can truncate the other's under its mapping (reading a
+///   mapped page past the end of a truncated file kills the process with
+///   `SIGBUS`);
+/// - its space is freed when the function returns, on success or error,
+///   and when the process is killed too: the kernel closes a dead
+///   process's files and mappings, and nothing is left behind in
+///   `download/`.
+///
+/// `OpenOptions::create_new` fails if the name exists rather than opening
+/// the file there. The process id makes the name unique on one machine;
+/// machines sharing `download/` over a network filesystem could pick the
+/// same id at the same instant, and then the second gets an error instead
+/// of the first one's bytes.
+///
+/// On network filesystems the space is freed the same way. An NFS client
+/// renames a removed but still open file to a hidden `.nfsXXXX` (which
+/// `ls -a` shows, under a name no other run looks for) and removes it once
+/// the file is closed, after a kill too: only a crash of the machine itself
+/// leaves one behind. Lustre and GPFS keep such files on their servers.
+///
+/// Windows can't remove an open file: there the copy keeps its name until
+/// the function returns (`TempFile`), and a killed process leaves it
+/// behind.
 fn parse_mmap(
     path: &Path,
     format: Format,
@@ -540,27 +578,40 @@ fn parse_mmap(
     extractors: &mut [Box<dyn Extractor>],
 ) -> Result<u64, Box<dyn Error + Send + Sync>> {
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let copy_path = with_suffix(path, &format!(".{}.mmap", process::id()));
 
-    // Removed when this function returns, by `?` on an error too. Locals
-    // are dropped in reverse order of declaration: `tmp` first declared,
-    // last dropped, after the mapping and the file it maps are closed.
-    let tmp = TempFile::new(path.with_extension("warc"));
+    // Windows only: the guard removing the copy's name when this function
+    // returns, by `?` on an error too. Locals are dropped in reverse order
+    // of declaration: `_copy_name` first declared, last dropped, after the
+    // mapping and the file it maps are closed. It is assigned only once
+    // `create_new` succeeded, so it never removes a file another process
+    // created; a variable never assigned is never dropped.
+    #[cfg(not(unix))]
+    let _copy_name: TempFile;
+
     eprintln!("  [{}] Decompressing to temp file for mmap...", filename);
+    let mut copy = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&copy_path)?;
+    #[cfg(unix)]
+    fs::remove_file(&copy_path)?;
+    #[cfg(not(unix))]
     {
-        let file = fs::File::open(path)?;
-        let mut decoder = MultiGzDecoder::new(file);
-        let mut tmp_file = fs::File::create(tmp.path())?;
-        io::copy(&mut decoder, &mut tmp_file)?;
+        _copy_name = TempFile::new(copy_path);
     }
-    let tmp_size = fs::metadata(tmp.path())?.len();
+    io::copy(&mut MultiGzDecoder::new(fs::File::open(path)?), &mut copy)?;
+    let copy_size = copy.metadata()?.len();
     eprintln!(
         "  [{}] Decompressed: {:.1} MB",
         filename,
-        tmp_size as f64 / 1_048_576.0
+        copy_size as f64 / 1_048_576.0
     );
 
-    let tmp_file = fs::File::open(tmp.path())?;
-    let mmap = unsafe { memmap2::Mmap::map(&tmp_file)? };
+    // `unsafe`: the mapping assumes no one changes the file while it is
+    // mapped. Without a name, no other process can open the copy to do so.
+    let mmap = unsafe { memmap2::Mmap::map(&copy)? };
     let mut records_scanned = 0;
 
     for record in warc_parser::WarcSliceIter::new(&mmap, format.record_type()) {
