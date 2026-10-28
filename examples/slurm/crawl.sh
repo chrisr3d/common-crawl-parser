@@ -30,9 +30,10 @@
 # Then merge:      sbatch --dependency=afterok:${JOB} examples/slurm/merge.sh
 # Re-run one task: sbatch --array=3 examples/slurm/crawl.sh
 #
-# This script exits with 0 even when some of its processes failed (see the
-# end), so afterok starts merge.sh anyway, on the results so far. Re-run the
-# failed tasks, then merge.sh again.
+# This script exits with 0 even when some of its processes left Shards to
+# retry or stopped early (see the end), so afterok starts merge.sh anyway, on
+# the results so far. Re-run those tasks (once the cause of an early stop is
+# fixed), then merge.sh again.
 #
 # A re-run resumes: each process reads the processed.log of its own
 # --output-dir and skips the (Shard, kind) pairs already done. Done Shards
@@ -141,20 +142,32 @@ echo ""
 # ---------------------------------------------------------------------------
 # Wait for every process and collect exit codes
 # ---------------------------------------------------------------------------
-# A process exits with 0 even when some of its Shards failed: those are not
-# marked in its processed.log, and a re-run picks them up. A non-zero exit
-# means the process stopped early, such as on an unreadable results file or
-# an --offset past the end of the paths file.
+# A process exits with:
+#   0     every Shard of its slice done for every kind in EXTRACT
+#   3     it ran to the end, but some Shards failed (download, parse or
+#         save): they are not marked in its processed.log, and running the
+#         same command again retries them
+#   other it stopped early, such as on an unreadable results file or an
+#         --offset past the end of the paths file (1), on invalid arguments
+#         (2), or killed by a signal (128 + its number): fix the cause first
 # ---------------------------------------------------------------------------
-FAILURES=0
+TO_RETRY=0
+STOPPED=0
 for j in "${!PIDS[@]}"; do
     wait "${PIDS[$j]}"
     EXIT_CODE=$?
-    if [ "${EXIT_CODE}" -ne 0 ]; then
-        echo "  Process ${j} failed with exit code ${EXIT_CODE}"
-        FAILURES=$((FAILURES + 1))
-    fi
+    case "${EXIT_CODE}" in
+        0) ;;
+        3)
+            echo "  Process ${j} finished with Shards to retry"
+            TO_RETRY=$((TO_RETRY + 1))
+            ;;
+        *)
+            echo "  Process ${j} stopped early with exit code ${EXIT_CODE}"
+            STOPPED=$((STOPPED + 1))
+            ;;
+    esac
 done
 
 echo ""
-echo "=== Array task ${SLURM_ARRAY_TASK_ID} finished: $((PROCESSES_PER_NODE - FAILURES))/${PROCESSES_PER_NODE} processes succeeded ==="
+echo "=== Array task ${SLURM_ARRAY_TASK_ID} finished: $((PROCESSES_PER_NODE - TO_RETRY - STOPPED))/${PROCESSES_PER_NODE} processes done, ${TO_RETRY} with Shards to retry, ${STOPPED} stopped early ==="
