@@ -263,7 +263,10 @@ mod tests {
 
     #[test]
     fn address_at_start_of_input() {
-        assert_eq!(search_both(b"abcdefghijklmnop.onion is at the start").len(), 1);
+        assert_eq!(
+            search_both(b"abcdefghijklmnop.onion is at the start").len(),
+            1
+        );
     }
 
     #[test]

@@ -171,12 +171,8 @@ pub fn favicons_in_head(head: &Head<'_>, page_url: &str) -> Vec<String> {
 ///   but widely used and still present in the wild)
 /// - `mask-icon` — Safari pinned tab SVG icons
 /// - `apple-touch-icon` — iOS home screen icons
-const FAVICON_REL_VALUES: &[&[u8]] = &[
-    b"icon",
-    b"shortcut icon",
-    b"mask-icon",
-    b"apple-touch-icon",
-];
+const FAVICON_REL_VALUES: &[&[u8]] =
+    &[b"icon", b"shortcut icon", b"mask-icon", b"apple-touch-icon"];
 
 /// Whether a `<link>`'s `rel` declares a favicon.
 fn is_favicon_rel(rel: &[u8]) -> bool {
@@ -414,7 +410,10 @@ fn extract_quoted_or_bare_value(tag: &[u8], start: usize) -> Option<&[u8]> {
 
 /// Trim trailing ASCII whitespace from a byte slice.
 fn trim_end_ascii(s: &[u8]) -> &[u8] {
-    let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(0, |p| p + 1);
+    let end = s
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |p| p + 1);
     &s[..end]
 }
 
@@ -666,42 +665,70 @@ mod tests {
     fn basic_link_icon() {
         let html = br#"<html><head><link rel="icon" href="/favicon.png"></head></html>"#;
         let result = extract_favicons(html, "https://example.com/page");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/favicon.png"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/favicon.png")
+        );
     }
 
     #[test]
     fn shortcut_icon() {
         let html = br#"<link rel="shortcut icon" href="/icons/fav.ico">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/icons/fav.ico"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/icons/fav.ico")
+        );
     }
 
     #[test]
     fn apple_touch_icon() {
         let html = br#"<link rel="apple-touch-icon" href="/apple-icon.png">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/apple-icon.png"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/apple-icon.png")
+        );
     }
 
     #[test]
     fn mask_icon() {
         let html = br#"<link rel="mask-icon" href="/safari-pinned.svg">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/safari-pinned.svg"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/safari-pinned.svg")
+        );
     }
 
     #[test]
     fn msapplication_tile_image() {
         let html = br#"<meta name="msapplication-TileImage" content="/icons/tile.png">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/icons/tile.png"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/icons/tile.png")
+        );
     }
 
     #[test]
     fn no_root_favicon_guess_without_tags() {
         let html = b"<html><head><title>No icons</title></head></html>";
         let result = extract_favicons(html, "https://example.com/page/deep");
-        assert!(result.urls.is_empty(), "only declared favicons are recorded");
+        assert!(
+            result.urls.is_empty(),
+            "only declared favicons are recorded"
+        );
     }
 
     #[test]
@@ -734,7 +761,8 @@ mod tests {
     fn inline_media_type_without_parameters_in_lower_case() {
         // "<svg/>" in base64 = "PHN2Zy8+"
         // With spaces after the `;`s, as some pages write it.
-        let html = br#"<link rel="icon" href="data:Image/SVG+XML; charset=utf-8; base64,PHN2Zy8+">"#;
+        let html =
+            br#"<link rel="icon" href="data:Image/SVG+XML; charset=utf-8; base64,PHN2Zy8+">"#;
         let result = extract_favicons(html, "https://example.com/");
         assert_eq!(
             result.inline_favicons,
@@ -755,21 +783,36 @@ mod tests {
     fn absolute_url_left_as_is() {
         let html = br#"<link rel="icon" href="https://cdn.other.com/favicon.png">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://cdn.other.com/favicon.png"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://cdn.other.com/favicon.png")
+        );
     }
 
     #[test]
     fn protocol_relative_url() {
         let html = br#"<link rel="icon" href="//cdn.example.com/fav.ico">"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://cdn.example.com/fav.ico"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://cdn.example.com/fav.ico")
+        );
     }
 
     #[test]
     fn relative_url_resolved() {
         let html = br#"<link rel="icon" href="images/fav.png">"#;
         let result = extract_favicons(html, "https://example.com/blog/post");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/blog/images/fav.png"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/blog/images/fav.png")
+        );
     }
 
     #[test]
@@ -824,7 +867,12 @@ mod tests {
     fn single_quoted_attributes() {
         let html = br#"<link rel='icon' href='/favicon.png'>"#;
         let result = extract_favicons(html, "https://example.com/");
-        assert!(result.urls.iter().any(|u| u == "https://example.com/favicon.png"));
+        assert!(
+            result
+                .urls
+                .iter()
+                .any(|u| u == "https://example.com/favicon.png")
+        );
     }
 
     #[test]

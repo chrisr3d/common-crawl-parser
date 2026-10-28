@@ -183,7 +183,11 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
                 return Some(Err(e));
             }
 
-            return Some(Ok(WarcRecord { body, target_uri, date }));
+            return Some(Ok(WarcRecord {
+                body,
+                target_uri,
+                date,
+            }));
         }
     }
 }
@@ -196,9 +200,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
 fn trim_header<'a>(line: &'a str, header: &str) -> Option<&'a str> {
     // Case-insensitive prefix match: WARC spec allows mixed case headers,
     // though Common Crawl is consistent. Being defensive costs almost nothing.
-    if line.len() >= header.len()
-        && line[..header.len()].eq_ignore_ascii_case(header)
-    {
+    if line.len() >= header.len() && line[..header.len()].eq_ignore_ascii_case(header) {
         Some(line[header.len()..].trim())
     } else {
         None
@@ -360,14 +362,19 @@ impl<'a> Iterator for WarcSliceIter<'a> {
 
 /// Case-insensitive prefix check on byte slices.
 fn starts_with_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.len() >= needle.len()
-        && haystack[..needle.len()].eq_ignore_ascii_case(needle)
+    haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
 /// Trim leading/trailing ASCII whitespace from a byte slice.
 fn trim_bytes(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(s.len());
-    let end = s.iter().rposition(|&b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+    let start = s
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|&b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
     &s[start..end]
 }
 
@@ -434,7 +441,10 @@ mod tests {
         // A warcinfo record (should be skipped)
         stream.extend_from_slice(&make_warc_record("warcinfo", b"software: test"));
         // A request record (should be skipped)
-        stream.extend_from_slice(&make_warc_record("request", b"GET / HTTP/1.1\r\nHost: example.com"));
+        stream.extend_from_slice(&make_warc_record(
+            "request",
+            b"GET / HTTP/1.1\r\nHost: example.com",
+        ));
         // A response record (should be returned) — with metadata
         stream.extend_from_slice(&make_warc_record_with_meta(
             "response",
@@ -462,11 +472,19 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(records.len(), 2, "Should return only the 2 response records");
-        assert!(records[0].body.windows(6).any(|w| w == b".onion"),
-            "First response should contain .onion");
-        assert!(records[1].body.windows(7).any(|w| w == b"Another"),
-            "Second response should contain 'Another'");
+        assert_eq!(
+            records.len(),
+            2,
+            "Should return only the 2 response records"
+        );
+        assert!(
+            records[0].body.windows(6).any(|w| w == b".onion"),
+            "First response should contain .onion"
+        );
+        assert!(
+            records[1].body.windows(7).any(|w| w == b"Another"),
+            "Second response should contain 'Another'"
+        );
     }
 
     #[test]
@@ -488,9 +506,15 @@ mod tests {
         let data = make_warc_stream();
         let records: Vec<_> = WarcSliceIter::new(&data, "response").collect();
 
-        assert_eq!(records.len(), 2, "Should return only the 2 response records");
-        assert!(records[0].body.windows(6).any(|w| w == b".onion"),
-            "First response should contain .onion");
+        assert_eq!(
+            records.len(),
+            2,
+            "Should return only the 2 response records"
+        );
+        assert!(
+            records[0].body.windows(6).any(|w| w == b".onion"),
+            "First response should contain .onion"
+        );
     }
 
     #[test]

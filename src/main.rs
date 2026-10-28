@@ -24,11 +24,10 @@ use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 
 use cc_extract::{
+    ArchivePath, ArtifactKind, DEFAULT_OUTPUT_DIR, Extractor, FaviconExtractor, Findings, Format,
+    FormatSet, InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, Shard, Transport,
     download_archive, download_archive_to_memory, download_path, load_processed_from,
     load_sightings_from, merge_sightings_from, parse_archive, save_sightings_to, save_then_mark,
-    ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
-    InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, Shard, Transport,
-    DEFAULT_OUTPUT_DIR,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,10 +135,7 @@ fn get_available_memory() -> Option<u64> {
     // Returns 0 if the key doesn't exist on this macOS version, so
     // optional sysctl keys degrade gracefully.
     fn sysctl_value(key: &str) -> Option<u64> {
-        let output = Command::new("sysctl")
-            .args(["-n", key])
-            .output()
-            .ok()?;
+        let output = Command::new("sysctl").args(["-n", key]).output().ok()?;
         // If the key is unknown, sysctl exits with an error — treat as 0.
         String::from_utf8_lossy(&output.stdout)
             .trim()
@@ -223,7 +219,9 @@ fn get_available_memory() -> Option<u64> {
 // Only the `merge` subcommand requires an explicit keyword.
 #[derive(Parser)]
 #[command(name = "cc-extract")]
-#[command(about = "Extract artifacts, such as .onion addresses and favicon URLs, from Common Crawl archives")]
+#[command(
+    about = "Extract artifacts, such as .onion addresses and favicon URLs, from Common Crawl archives"
+)]
 struct Config {
     /// Path to a WARC, WAT or WET paths file (supports .gz) — omit when using `merge`
     ///
@@ -271,7 +269,13 @@ struct Config {
     // parsed through `ArtifactKind`'s `ValueEnum` derive. The default is
     // written as the user would type it and split the same way, so
     // `--help` shows `[default: onion,favicon]`.
-    #[arg(short, long, value_enum, value_delimiter = ',', default_value = "onion,favicon")]
+    #[arg(
+        short,
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "onion,favicon"
+    )]
     extract: Vec<ArtifactKind>,
 
     /// Formats to download for every Shard, comma-separated (default: the
@@ -355,7 +359,7 @@ struct ShardResult {
     /// The Archives that were downloaded and parsed.
     parsed: Vec<ArchivePath>,
     download_time: Duration,
-    parse_time: Duration
+    parse_time: Duration,
 }
 
 /// Download one Archive, unless the file Transports find it already in
@@ -462,7 +466,11 @@ async fn main() {
     let config = Config::parse();
 
     // --- Dispatch: merge subcommand or default crawl pipeline ---
-    if let Some(Command::Merge { input_dirs, output_dir }) = config.command {
+    if let Some(Command::Merge {
+        input_dirs,
+        output_dir,
+    }) = config.command
+    {
         run_merge(&input_dirs, &output_dir);
         return;
     }
@@ -552,7 +560,7 @@ fn save_all(results: &BTreeMap<ArtifactKind, Findings>, output_dir: &str) {
 async fn run_crawl(input: String, config: Config) {
     let limit_display = match config.limit {
         Some(n) => format!("{}", n),
-        None => "all".to_string()
+        None => "all".to_string(),
     };
 
     // `-e onion,onion` would otherwise run two onion extractors.
@@ -619,8 +627,16 @@ async fn run_crawl(input: String, config: Config) {
     eprintln!(
         "Reading paths from '{}' (extract: {}{}, limit: {}{}, jobs: {}, delete after: {}, \
          transport: {}, onion engine: {}{})",
-        input, kind_list(&kinds), formats_display, limit_display, offset_display, capped_jobs,
-        config.delete, cli_name(&transport_choice), cli_name(&onion_engine), output_dir_display
+        input,
+        kind_list(&kinds),
+        formats_display,
+        limit_display,
+        offset_display,
+        capped_jobs,
+        config.delete,
+        cli_name(&transport_choice),
+        cli_name(&onion_engine),
+        output_dir_display
     );
 
     // --- Open and read the paths file ---
@@ -634,10 +650,7 @@ async fn run_crawl(input: String, config: Config) {
 
     let reader: Box<dyn BufRead> = if input.ends_with(".gz") {
         let decoder = libflate::gzip::Decoder::new(file).unwrap_or_else(|err| {
-            eprintln!(
-                "Error: failed to decompress '{}': {}",
-                input, err
-            );
+            eprintln!("Error: failed to decompress '{}': {}", input, err);
             process::exit(1);
         });
         Box::new(BufReader::new(decoder))
@@ -654,14 +667,21 @@ async fn run_crawl(input: String, config: Config) {
         .collect();
 
     if uris.is_empty() {
-        eprintln!("No paths found in '{}' (after offset {})", input, config.offset);
+        eprintln!(
+            "No paths found in '{}' (after offset {})",
+            input, config.offset
+        );
         process::exit(1);
     }
 
     eprintln!(
         "Found {} path(s) in file{}",
         uris.len(),
-        if config.offset > 0 { format!(" (after skipping {})", config.offset) } else { String::new() }
+        if config.offset > 0 {
+            format!(" (after skipping {})", config.offset)
+        } else {
+            String::new()
+        }
     );
 
     // --- Load persistent state ---
@@ -672,13 +692,22 @@ async fn run_crawl(input: String, config: Config) {
     let processed = load_processed_from(&config.output_dir);
     let mut results: BTreeMap<ArtifactKind, Findings> = kinds
         .iter()
-        .map(|&kind| (kind, load_or_exit(load_sightings_from(kind, &config.output_dir))))
+        .map(|&kind| {
+            (
+                kind,
+                load_or_exit(load_sightings_from(kind, &config.output_dir)),
+            )
+        })
         .collect();
 
     eprintln!(
         "State: {} (Shard, kind) pair(s) done; {} in results\n",
         processed.len(),
-        count_list(results.iter().map(|(&kind, findings)| (kind, findings.len())))
+        count_list(
+            results
+                .iter()
+                .map(|(&kind, findings)| (kind, findings.len()))
+        )
     );
 
     // --- Schedule: the requested kinds still missing for each Shard ---
@@ -729,17 +758,27 @@ async fn run_crawl(input: String, config: Config) {
 
         // `collect` into `Option<Vec<_>>` gives `None` if any Format's path
         // can't be derived.
-        let archives: Option<Vec<ArchivePath>> =
-            plan.formats().iter().map(|format| path.in_format(format)).collect();
+        let archives: Option<Vec<ArchivePath>> = plan
+            .formats()
+            .iter()
+            .map(|format| path.in_format(format))
+            .collect();
         let Some(archives) = archives else {
             eprintln!(
                 "[{}] {}: cannot derive the paths of {} from it",
-                i + 1, uri, plan.formats()
+                i + 1,
+                uri,
+                plan.formats()
             );
             continue;
         };
 
-        work_items.push(ScheduledShard { index: i + 1, shard, plan, archives });
+        work_items.push(ScheduledShard {
+            index: i + 1,
+            shard,
+            plan,
+            archives,
+        });
     }
 
     let output_dir = config.output_dir;
@@ -747,13 +786,14 @@ async fn run_crawl(input: String, config: Config) {
     if work_items.is_empty() {
         eprintln!("No Shards to process.");
         save_all(&results, &output_dir);
-        eprintln!(
-            "\nSummary: 0 processed, {} skipped, 0 failed",
-            skip_count
-        );
+        eprintln!("\nSummary: 0 processed, {} skipped, 0 failed", skip_count);
         eprintln!(
             "Total in results: {}",
-            count_list(results.iter().map(|(&kind, findings)| (kind, findings.len())))
+            count_list(
+                results
+                    .iter()
+                    .map(|(&kind, findings)| (kind, findings.len()))
+            )
         );
         return;
     }
@@ -802,7 +842,11 @@ async fn run_crawl(input: String, config: Config) {
         capped_jobs // Archives go to disk — no memory concern
     };
 
-    eprintln!("Processing {} Shard(s) with {} concurrent job(s)\n", work_items.len(), effective_jobs);
+    eprintln!(
+        "Processing {} Shard(s) with {} concurrent job(s)\n",
+        work_items.len(),
+        effective_jobs
+    );
 
     // --- Create a shared HTTP client ---
     //
@@ -834,117 +878,146 @@ async fn run_crawl(input: String, config: Config) {
     // "Unordered" means faster Shards finish first — we don't block
     // waiting for a slow download just because it started earlier.
     let shard_stream = stream::iter(work_items)
-        .map(|ScheduledShard { index: idx, shard, plan, archives }| {
-            // Clone the shared client for this task. `reqwest::Client` is
-            // an `Arc` inside, so the clone is cheap (just increments a
-            // reference count) and shares the connection pool.
-            let client = client.clone();
+        .map(
+            |ScheduledShard {
+                 index: idx,
+                 shard,
+                 plan,
+                 archives,
+             }| {
+                // Clone the shared client for this task. `reqwest::Client` is
+                // an `Arc` inside, so the clone is cheap (just increments a
+                // reference count) and shares the connection pool.
+                let client = client.clone();
 
-            async move {
-                let kinds = plan.kinds();
-                eprintln!(
-                    "[{}] {}: extracting {} from {}",
-                    idx, shard, kind_list(&kinds), plan.formats()
-                );
+                async move {
+                    let kinds = plan.kinds();
+                    eprintln!(
+                        "[{}] {}: extracting {} from {}",
+                        idx,
+                        shard,
+                        kind_list(&kinds),
+                        plan.formats()
+                    );
 
-                // --- Download phase ---
-                //
-                // Every Archive of the Plan, one after the other (Shards
-                // already download concurrently). A failed download is
-                // reported and the Shard carries on: the kinds that don't
-                // read that Archive can still finish.
-                let download_start = Instant::now();
-                let mut downloaded: Vec<(ArchivePath, Transport)> = Vec::new();
-                for archive in archives {
-                    match fetch(&client, &archive, transport_choice).await {
-                        Ok(transport) => downloaded.push((archive, transport)),
-                        Err(err) => eprintln!("  [{}] Download error: {}", archive.file_name(), err),
+                    // --- Download phase ---
+                    //
+                    // Every Archive of the Plan, one after the other (Shards
+                    // already download concurrently). A failed download is
+                    // reported and the Shard carries on: the kinds that don't
+                    // read that Archive can still finish.
+                    let download_start = Instant::now();
+                    let mut downloaded: Vec<(ArchivePath, Transport)> = Vec::new();
+                    for archive in archives {
+                        match fetch(&client, &archive, transport_choice).await {
+                            Ok(transport) => downloaded.push((archive, transport)),
+                            Err(err) => {
+                                eprintln!("  [{}] Download error: {}", archive.file_name(), err)
+                            }
+                        }
+                    }
+                    let download_time = download_start.elapsed();
+                    eprintln!(
+                        "  [{}] Download time: {:.1}s",
+                        shard,
+                        download_time.as_secs_f64()
+                    );
+
+                    if downloaded.is_empty() {
+                        return ShardResult {
+                            shard,
+                            found: Vec::new(),
+                            undone: kinds,
+                            parsed: Vec::new(),
+                            download_time,
+                            parse_time: Duration::ZERO,
+                        };
+                    }
+
+                    // --- Parse on the blocking thread pool ---
+                    //
+                    // ## `spawn_blocking` — bridging sync and async
+                    //
+                    // `parse_archive` is CPU-bound (gzip decompression + search).
+                    // Running it directly on an async task would block the Tokio
+                    // worker thread, starving other async tasks (downloads).
+                    //
+                    // `spawn_blocking` moves the work to Tokio's dedicated
+                    // blocking thread pool, which has many more threads and
+                    // expects blocking work. The `.await` here suspends the
+                    // async task until the blocking work finishes, freeing the
+                    // worker thread for other downloads.
+                    //
+                    // With the memory Transport, the `Vec<u8>` inside each
+                    // `Transport::Memory` is *moved* into the blocking closure —
+                    // a zero-cost ownership transfer (no data copying). After the
+                    // move, the async task no longer owns the buffers, and the
+                    // compiler prevents use-after-move.
+                    //
+                    // The closure takes ownership of what it captures; the
+                    // clones keep a `shard` and a `plan` here for the result.
+                    let parse_shard = shard.clone();
+                    let parse_plan = plan.clone();
+
+                    let parse_start = Instant::now();
+                    let parse_result = tokio::task::spawn_blocking(move || {
+                        parse_archives(
+                            downloaded,
+                            &parse_shard,
+                            &parse_plan,
+                            onion_engine,
+                            transport_choice,
+                        )
+                    })
+                    .await;
+                    let parse_time = parse_start.elapsed();
+
+                    // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
+                    // the task panicked: then no Archive counts as parsed.
+                    let (mut by_kind, parsed) = parse_result.unwrap_or_else(|err| {
+                        eprintln!("  [{}] Task panic: {}", shard, err);
+                        (BTreeMap::new(), Vec::new())
+                    });
+                    eprintln!(
+                        "  [{}] Parsing time: {:.1}s",
+                        shard,
+                        parse_time.as_secs_f64()
+                    );
+
+                    // A kind is done only if every Archive it reads parsed; the
+                    // others' partial Sightings are dropped.
+                    let parsed_formats: FormatSet =
+                        parsed.iter().map(ArchivePath::format).collect();
+                    let (done, undone) = plan.split_done(parsed_formats);
+                    let found: Vec<(ArtifactKind, Findings)> = done
+                        .into_iter()
+                        .map(|kind| {
+                            let findings = by_kind.remove(&kind);
+                            (kind, findings.unwrap_or_else(|| Findings::empty(kind)))
+                        })
+                        .collect();
+
+                    if !found.is_empty() {
+                        eprintln!(
+                            "  [{}] Found {}",
+                            shard,
+                            count_list(
+                                found.iter().map(|(kind, findings)| (*kind, findings.len()))
+                            )
+                        );
+                    }
+
+                    ShardResult {
+                        shard,
+                        found,
+                        undone,
+                        parsed,
+                        download_time,
+                        parse_time,
                     }
                 }
-                let download_time = download_start.elapsed();
-                eprintln!("  [{}] Download time: {:.1}s", shard, download_time.as_secs_f64());
-
-                if downloaded.is_empty() {
-                    return ShardResult {
-                        shard,
-                        found: Vec::new(),
-                        undone: kinds,
-                        parsed: Vec::new(),
-                        download_time,
-                        parse_time: Duration::ZERO
-                    };
-                }
-
-                // --- Parse on the blocking thread pool ---
-                //
-                // ## `spawn_blocking` — bridging sync and async
-                //
-                // `parse_archive` is CPU-bound (gzip decompression + search).
-                // Running it directly on an async task would block the Tokio
-                // worker thread, starving other async tasks (downloads).
-                //
-                // `spawn_blocking` moves the work to Tokio's dedicated
-                // blocking thread pool, which has many more threads and
-                // expects blocking work. The `.await` here suspends the
-                // async task until the blocking work finishes, freeing the
-                // worker thread for other downloads.
-                //
-                // With the memory Transport, the `Vec<u8>` inside each
-                // `Transport::Memory` is *moved* into the blocking closure —
-                // a zero-cost ownership transfer (no data copying). After the
-                // move, the async task no longer owns the buffers, and the
-                // compiler prevents use-after-move.
-                //
-                // The closure takes ownership of what it captures; the
-                // clones keep a `shard` and a `plan` here for the result.
-                let parse_shard = shard.clone();
-                let parse_plan = plan.clone();
-
-                let parse_start = Instant::now();
-                let parse_result = tokio::task::spawn_blocking(move || {
-                    parse_archives(downloaded, &parse_shard, &parse_plan, onion_engine, transport_choice)
-                })
-                .await;
-                let parse_time = parse_start.elapsed();
-
-                // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
-                // the task panicked: then no Archive counts as parsed.
-                let (mut by_kind, parsed) = parse_result.unwrap_or_else(|err| {
-                    eprintln!("  [{}] Task panic: {}", shard, err);
-                    (BTreeMap::new(), Vec::new())
-                });
-                eprintln!("  [{}] Parsing time: {:.1}s", shard, parse_time.as_secs_f64());
-
-                // A kind is done only if every Archive it reads parsed; the
-                // others' partial Sightings are dropped.
-                let parsed_formats: FormatSet = parsed.iter().map(ArchivePath::format).collect();
-                let (done, undone) = plan.split_done(parsed_formats);
-                let found: Vec<(ArtifactKind, Findings)> = done
-                    .into_iter()
-                    .map(|kind| {
-                        let findings = by_kind.remove(&kind);
-                        (kind, findings.unwrap_or_else(|| Findings::empty(kind)))
-                    })
-                    .collect();
-
-                if !found.is_empty() {
-                    eprintln!(
-                        "  [{}] Found {}",
-                        shard,
-                        count_list(found.iter().map(|(kind, findings)| (*kind, findings.len())))
-                    );
-                }
-
-                ShardResult {
-                    shard,
-                    found,
-                    undone,
-                    parsed,
-                    download_time,
-                    parse_time
-                }
-            }
-        })
+            },
+        )
         .buffer_unordered(effective_jobs);
 
     // --- Collect results back on the main task ---
@@ -1012,7 +1085,7 @@ async fn run_crawl(input: String, config: Config) {
                 let local_path = download_path(archive);
                 match fs::remove_file(&local_path) {
                     Ok(()) => eprintln!("  [{}] Deleted {}", result.shard, local_path.display()),
-                    Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", result.shard, err)
+                    Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", result.shard, err),
                 }
             }
         }
@@ -1033,7 +1106,11 @@ async fn run_crawl(input: String, config: Config) {
     );
     eprintln!(
         "Total in results: {}",
-        count_list(results.iter().map(|(&kind, findings)| (kind, findings.len())))
+        count_list(
+            results
+                .iter()
+                .map(|(&kind, findings)| (kind, findings.len()))
+        )
     );
     if process_count > 0 {
         let avg_dl = total_download.as_secs_f64() / process_count as f64;

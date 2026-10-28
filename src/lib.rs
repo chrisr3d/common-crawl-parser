@@ -42,8 +42,8 @@ pub use extractor::{
 };
 pub use format::{ArchivePath, Dataset, Format, FormatSet};
 pub use inline_favicon::{InlineFavicon, InlineFavicons};
-pub use plan::{FormatRequirement, Plan, PlanError};
 pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
+pub use plan::{FormatRequirement, Plan, PlanError};
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -681,10 +681,7 @@ pub fn load_processed_from(output_dir: &str) -> HashSet<(Shard, ArtifactKind)> {
 fn mark_processed_in(shard: &Shard, kind: ArtifactKind, output_dir: &str) -> io::Result<()> {
     fs::create_dir_all(output_dir)?;
     let path = Path::new(output_dir).join(PROCESSED_FILENAME);
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
     writeln!(file, "{} {}", shard, kind)
 }
 
