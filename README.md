@@ -140,8 +140,8 @@ Options:
   -h, --help                     Print help (see more with '--help')
 ```
 
-`--help` adds a paragraph to some options and describes each possible value. `tests/cli_help.rs`
-fails when the two blocks above no longer match the binary.
+`--help` adds a paragraph to some options, describes each possible value and lists the exit
+statuses. `tests/cli_help.rs` fails when the two blocks above no longer match the binary.
 
 ## Artifact Kinds and Plans
 

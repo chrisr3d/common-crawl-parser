@@ -368,13 +368,15 @@ A kind's file is saved before its `<shard> <kind>` line is appended, so a crash
 in between leaves the pair undone and the next run extracts it again;
 deduplication makes that redo change nothing. A later run with more kinds
 extracts only the new ones for the Shards already done. A Shard whose download
-or parse failed is not marked for the kinds reading the failed Archive, and is
-retried on the next run. Lines `processed.log` can't read (such as bare Archive
-names, written before kinds were tracked) are ignored, so those Shards are
-processed again.
+or parse failed is not marked for the kinds reading the failed Archive, nor for
+a kind whose file failed to save, and is retried on the next run. Lines
+`processed.log` can't read (such as bare Archive names, written before kinds
+were tracked) are ignored, so those Shards are processed again.
 
-The summary at the end reports processed, skipped and failed Shards, new and
-total Artifacts per kind, and average download and parse time per Shard.
+The summary at the end reports processed, skipped and failed Shards (a Shard
+left with any kind undone, by a failed download, parse or save), new and total
+Artifacts per kind, and average download and parse time per Shard. The exit
+status tells whether any Shard failed (see section 11).
 
 ## 10. HPC batch mode
 
@@ -396,6 +398,9 @@ account, partition and paths, to be replaced first:
   (`--exclusive`), each running 20 processes over 500 paths (`--transport
   memory`, the node's cores shared out as `--jobs`), so 100,000 paths in total.
   Output goes to `<output root>/<task>/<process>/`.
+  Its report tells processes that finished with Shards to retry (exit 3) from
+  those that stopped early (any other non-zero exit). It exits with 0 either
+  way, so `afterok` starts the merge on the results so far.
 - `examples/slurm/merge.sh`: merges every `<output root>/<task>/<process>/`
   directory into `<output root>`. Meant to run after the crawl job, with
   `--dependency=afterok`.
@@ -415,6 +420,23 @@ account, partition and paths, to be replaced first:
 | `--onion-engine E` | `memchr` | `memchr` or `regex` |
 | `--output-dir DIR` | `output` | Where state and results are read and written |
 | `merge DIR... [-o OUT]` | | Merge result directories into `OUT` (default `output`) |
+
+The exit status (listed by `--help` too) tells a script whether to run the same
+command again:
+
+| Code | Meaning | Run again? |
+|---|---|---|
+| 0 | Every Shard taken on done for every requested kind | No need |
+| 1 | Stopped early, such as on a missing or unreadable paths or results file, an `--offset` past the end, or a Plan no Shard can meet | Once the cause is fixed |
+| 2 | Invalid option or value (`clap`'s code for usage errors) | Once the command is fixed |
+| 3 | Ran to the end with some Shards left with kinds undone: a failed download, parse or save | Yes, the same command |
+
+Early stops come before anything is downloaded or written. Shards that fail
+don't stop the run: the others go on, and the run exits with 3 at the end.
+Paths file lines the run can't use (not a Common Crawl path, or one whose other
+Formats' paths can't be derived) are reported and skipped: they are no Shard
+to retry, and leave the exit status at 0.
+`merge` exits with 0, or 1 when it has nothing to merge or can't save.
 
 ## Known limitations
 
@@ -439,10 +461,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   `--offset` and `--limit` after some of its Shards are done goes on past the
   slice's end, into the next process's paths. `merge` deduplicates, so this
   costs time, not correctness.
-- **Failed Shards don't change the exit status.** A run exits with 0 even when
-  Shards failed (they are counted in the summary and retried next run); it
-  exits with 1 only when it stops early, such as on an unreadable results file
-  or an `--offset` past the end of the paths file.
 - **The RAM guard sees the whole machine.** Each process divides the free RAM by
   its largest Plan on its own, so several processes on one node can together
   schedule more in-memory Shards than fit.

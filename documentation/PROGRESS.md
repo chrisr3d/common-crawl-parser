@@ -2223,3 +2223,70 @@ lets one of them change it through a shared handle, with the borrow rules checke
 time (`borrow_mut` panics if the value is already borrowed) instead of at compile time.
 Neither is thread-safe (that would be `Arc<Mutex<..>>`); `parse_archive` runs on the
 test's own thread, so they need not be.
+
+## Step 23: An Exit Status for Shards Left Undone
+
+### What we built
+
+A run that went to the end exited with 0 even when some Shards failed: their kinds were
+left undone, counted in the summary and retried by the next run, but nothing outside the
+logs showed it. On a cluster, `sacct` listed every task as COMPLETED. A script or scheduler
+can now tell from the exit status alone what to do next:
+
+| Code | Meaning | Run again? |
+|---|---|---|
+| 0 | Every Shard taken on done for every requested kind | No need |
+| 1 | Stopped early (missing or unreadable paths or results file, `--offset` past the end, ...) | Once the cause is fixed |
+| 2 | Invalid option or value | Once the command is fixed |
+| 3 | Ran to the end with some Shards left with kinds undone | Yes, the same command |
+
+- **3, not 2.** `clap` already exits with 2 on invalid arguments (`--jobs abc`, an unknown
+  flag), as `grep`, `diff` and shell builtins do for misuse. A wrapper retrying on 2 would
+  retry a typo forever, so Shards to retry got the next free code.
+- **Failed saves count.** A kind whose results file can't be saved, or whose
+  `processed.log` line can't be appended, was only a warning; it is now added to the
+  Shard's undone kinds, like a kind whose Archive failed to download or parse, so the
+  Shard counts as failed in the summary and in the exit status. The final save of every
+  file stays a safety net and doesn't count: each kind it saves was either saved after its
+  Shard already, or failed to save then and already counts as undone.
+- **`--help`** lists the exit statuses after the options (`after_long_help`); `-h`, which the
+  README shows verbatim, is unchanged.
+- **`examples/slurm/crawl.sh`** reports, per process, "finished with Shards to retry"
+  (exit 3) or "stopped early" (any other non-zero exit, a kill by a signal included), and
+  counts both in its final line. It still exits with 0, so `--dependency=afterok` starts
+  `merge.sh` on the results so far.
+- **Tests** (`tests/crawl_cli.rs`): a WET Archive that isn't gzip leaves `onion` undone
+  while `favicon` finishes from WAT, and the run exits with 3, counting one failed Shard; a
+  directory in the way of `favicons.json.tmp` makes the save fail, with the same outcome
+  and no `processed.log` line. The early stop on `--formats` that can't serve a kind is
+  pinned to exit 1.
+
+### Rust concepts introduced
+
+**`ExitCode` and the `Termination` trait**
+`main` can return any type implementing `std::process::Termination`, whose `report` method
+turns it into the process's exit status. `()` reports success (0); `Result<(), E>` reports
+1 on `Err`, after printing the error with `Debug`; `ExitCode` reports its own value.
+`ExitCode::SUCCESS` and `ExitCode::FAILURE` are the portable 0 and 1, and
+`ExitCode::from(3u8)` builds any other: a `u8`, because only the low 8 bits of an exit
+status reach the parent process on Unix. `#[tokio::main]` passes `main`'s return type
+through, so `async fn main() -> ExitCode` works as the synchronous one does. `run_crawl`
+returns the `ExitCode` and `main` returns it in turn.
+
+**Why `process::exit` skips `Drop`**
+`process::exit` ends the process on the spot: it never returns (its type is `!`), so the
+stack frames above it are never unwound and no value in them is dropped. Buffered writers
+lose what they hold, temporary files guarded by a `Drop` (the `TempFile` of Step 20) stay
+behind, and the Tokio runtime is not shut down. Returning from `main` instead drops every
+local first, in reverse order of declaration, then exits with the code `main` returned.
+The early stops still call `process::exit(1)`: the crawl's come before anything is
+downloaded or written, and `merge`'s after a failed save has already removed its temporary
+file, so no destructor has work left to do there. Turning each of them into a returned
+`ExitCode` would thread a value through closures like `unwrap_or_else` for no gain.
+
+**`after_help` and `after_long_help`**
+`clap` prints `after_help` at the end of both `-h` and `--help`, and `after_long_help`
+at the end of `--help` only, replacing `after_help` there. Set on `Config` with
+`#[command(after_long_help = "...")]`, the exit statuses stay out of the short help. A
+string starting with `"\` and a newline skips that first line break, so the text starts at
+the left margin of the next line.
