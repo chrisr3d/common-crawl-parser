@@ -168,7 +168,19 @@ the same results:
 |---|---|
 | `disk` (default) | Stream-decompress `download/<file name>` (`WarcRecordIter` over a file) |
 | `memory` | Stream-decompress the downloaded `Vec<u8>` (`WarcRecordIter` over a `Cursor`) |
-| `mmap` | Decompress to a temporary file next to the Archive (3 to 5 GB for a WARC), memory-map it and read records as slices into it (`WarcSliceIter`); the file is deleted afterwards, after an error too |
+| `mmap` | Decompress to a copy next to the Archive (3 to 5 GB for a WARC) that no other process can open, memory-map it and read records as slices into it (`WarcSliceIter`) |
+
+The mmap copy is created as `<file name>.<process id>.mmap` and that name is
+removed at once, before anything is written to it. The process keeps the file
+open and mapped; the kernel frees its space once the process closes it, after a
+successful parse, an error, or a kill. So the copy never shows in `download/`,
+processes parsing the same Archive each have their own, and a killed process
+leaves nothing behind. While the parse runs, its 3 to 5 GB still take disk
+space: `df` counts them, `ls` and `du` don't see them. On NFS the client keeps
+the copy as a hidden `.nfsXXXX` file in `download/` (`ls -a` shows it) and
+removes it once it is closed, after a kill too (only a crash of the node leaves
+one); Lustre and GPFS keep such files on their servers. Windows can't remove an open file: there the copy keeps its
+name until the parse ends, and a killed process leaves it behind.
 
 ## 5. Onion extraction
 
@@ -434,14 +446,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **The RAM guard sees the whole machine.** Each process divides the free RAM by
   its largest Plan on its own, so several processes on one node can together
   schedule more in-memory Shards than fit.
-- **Processes sharing a `download/` can clash on the mmap copy.** With
-  `-t mmap`, an Archive is decompressed to `download/<file name without
-  .gz>.warc`, the same name in every process. Two processes parsing the same
-  Shard at once (overlapping slices on a re-run, see `--limit` above) write
-  the same file, and the first can be killed by `SIGBUS` when the second
-  truncates the copy it has mapped. A killed process also leaves its copy
-  (3 to 5 GB for a WARC) until the Shard is parsed with mmap again or the file
-  is deleted. `-t disk` and `-t memory` are not affected.
 - **CC-NEWS's Formats are unverified.** That CC-NEWS publishes WARC only was
   written from memory, commoncrawl.org being unreachable at the time. If it
   publishes WAT or WET too, its Plans are more expensive than they need to be.

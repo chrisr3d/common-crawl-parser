@@ -2128,3 +2128,98 @@ hides the error, making the silent truncation official.
 As with `Plan::within` (Step 14), collecting the `Result`s into `Result<Vec<String>, _>`
 stops at the first `Err` and returns it, or returns every line in a `Vec`. `unwrap_or_else`
 then reports the error and exits, as the opening of the file does a few lines above.
+
+## Step 22: The mmap Copy Without a Name
+
+### What we built
+
+The `mmap` Transport decompresses an Archive to a copy it can map. That copy was
+`download/<file name without .gz>.warc`, the same name in every process, removed by a
+`TempFile` guard when `parse_mmap` returned. Two problems remained:
+
+- **Processes sharing a `download/` clashed on it.** Overlapping slices on a re-run can
+  bring two processes to the same Shard at once. The second one's `File::create`
+  truncated the file the first had mapped, and the first was killed by `SIGBUS` as soon
+  as it read a mapped page past the new end.
+- **A killed process left its copy behind**, 3 to 5 GB for a WARC Archive, until the
+  Shard was parsed with mmap again, which may never happen.
+
+A name unique per process, as the `.part` downloads have, solves the first and worsens
+the second: every kill would leave a multi-GB file that no later run overwrites. So the
+copy now gets a unique name, `<file name>.<process id>.mmap`, only for the instant it is
+created: `parse_mmap` opens it with `create_new`, removes the name at once, decompresses
+into the open `File` and maps that same `File`. The copy never shows in `download/`, no
+other process can open it, and the kernel frees its space when the parse ends or the
+process dies. `parse_mmap` no longer needs the `TempFile` guard on Unix; downloads and
+results files still use it.
+
+Windows can't remove an open file, so there (`#[cfg(not(unix))]`) the copy keeps its
+name, and the guard removes it when the function returns, as before; a killed process
+leaves it behind.
+
+- **Tests** (`tests/mmap_transport.rs`): an extractor that lists the Archive's directory
+  when handed the first page shows only the Archive there while the parse runs, which
+  failed before the change (the `.warc` copy was listed); a parse failing on an Archive
+  cut short leaves only the Archive too.
+
+### Rust concepts introduced
+
+**Unlinked open files: when the kernel frees a file**
+On Unix, a file and its name are separate things. A directory entry points to the file
+(its inode), and `fs::remove_file` (`unlink`) only removes that entry. The kernel frees
+the file's blocks once two counts reach zero: the names pointing to it, and the open
+handles and memory mappings on it. Removing the name of a file that is still open
+therefore changes nothing for the process holding it: reads, writes and mappings go on.
+What changes is that nobody else can reach the file, and that its space is reclaimed as
+soon as the last handle goes away, whichever way it goes away: `drop` closing the `File`,
+an error returned through `?`, or the kernel closing every handle of a killed process. No
+`Drop` guard is needed, and a kill, which runs no destructors, leaves nothing. While the
+parse runs, the space is still used: `df` counts it, but `ls` and `du`, which walk names,
+don't see it.
+
+Network filesystems emulate this. An NFS client asked to remove a file it still has open
+renames it to a hidden `.nfsXXXX` (`ls -a` shows it, but no run looks for that name) and
+removes that once the file is closed, after a kill too; only a crash of the client machine
+leaves one. Lustre and GPFS keep such files on
+their servers.
+
+**`OpenOptions::create_new`: create, never open**
+`OpenOptions::new().read(true).write(true).create_new(true).open(path)` creates the file
+and fails with `ErrorKind::AlreadyExists` if the name exists, where `File::create` would
+open the existing file and truncate it. The check and the creation are one system call
+(`O_CREAT | O_EXCL`), so no other process can slip in between. With a name unique per
+process the error should never happen; it is what makes sure that, if two machines
+sharing `download/` ever pick the same process id at the same instant, the second gets an
+error rather than the first one's file. `read(true)` is needed too: the same `File` is
+then mapped for reading, which the system allows only through a handle opened for reading
+(`EACCES` otherwise).
+
+**Mapping a file that has no name**
+`memmap2::Mmap::map(&file)` takes an open `File`, not a path: it maps whatever that handle
+refers to, named or not. The bytes written through the `File` and the mapped pages are
+the same page cache, so the mapping sees everything `io::copy` wrote without a flush (a
+`File` has no buffer of its own in user space). `copy.metadata()` asks the open handle
+for the size (`fstat`), where `fs::metadata(path)` would need the name. The mapping
+stays `unsafe`: the compiler can't know that no one changes the file while it is mapped.
+With no name, no other process can open it to do so; that is what made the `SIGBUS`
+above impossible.
+
+**`#[cfg]` on statements, and a guard declared before it is assigned**
+`#[cfg(unix)]` and `#[cfg(not(unix))]` can mark a single statement, not only an item:
+`#[cfg(unix)] fs::remove_file(&copy_path)?;` exists only in Unix builds, and the Windows
+guard only in the others. That guard is declared first, `let _copy_name: TempFile;`, and
+assigned only once `create_new` succeeded. Locals are dropped in reverse order of
+*declaration*, so it is dropped last, after the mapping and the `File`; and a variable
+never assigned is never dropped, so when `create_new` fails (the name belongs to another
+process) the guard doesn't remove that other process's file. `_copy_name`, unlike `_`, is
+a real binding: the guard lives until the end of the function, where `let _ = ..` would
+drop it, and remove the file, on the spot.
+
+**Sharing a value with a boxed trait object: `Rc<RefCell<..>>`**
+The test's extractor goes into `parse_archive` as a `Box<dyn Extractor>`, and the trait
+hands nothing back but `Findings`. To read the directory listing it took, the test keeps a
+second handle on it: `Rc` (reference counted) gives a value several owners, and `RefCell`
+lets one of them change it through a shared handle, with the borrow rules checked at run
+time (`borrow_mut` panics if the value is already borrowed) instead of at compile time.
+Neither is thread-safe (that would be `Arc<Mutex<..>>`); `parse_archive` runs on the
+test's own thread, so they need not be.
