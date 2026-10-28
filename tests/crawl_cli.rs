@@ -286,6 +286,66 @@ fn favicon_alone_reads_only_wat() {
     );
 }
 
+/// The exit status of a run that went to the end but left some (Shard, kind)
+/// pairs undone: re-running the same command retries them.
+const EXIT_UNDONE: i32 = 3;
+
+/// An Archive that fails to parse leaves the kinds reading it undone, and
+/// the run, which goes on to the end, exits with `EXIT_UNDONE`. Here the
+/// WET Archive isn't gzip: `onion` (WAT + WET) is left undone, `favicon`
+/// (WAT only) is done.
+#[test]
+fn an_archive_failing_to_parse_exits_undone() {
+    let dir = workspace(
+        "an_archive_failing_to_parse_exits_undone",
+        &[(WAT_NAME, wat_archive()), (WET_NAME, b"not gzip".to_vec())],
+    );
+
+    let output = cc_extract(&dir).args(["--jobs", "1"]).output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_UNDONE),
+        "cc-extract should exit undone:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Summary: 0 processed, 0 skipped, 1 failed"),
+        "the summary should count the Shard as failed:\n{stderr}"
+    );
+    assert_eq!(
+        saved_state(&dir.join("output")).1,
+        [format!("{SHARD} favicon")]
+    );
+}
+
+/// A kind whose results file can't be saved is left undone too. A directory
+/// in the way of `favicons.json.tmp`, where the file is written before it is
+/// renamed, makes the save fail.
+#[test]
+fn a_failed_save_exits_undone() {
+    let dir = workspace("a_failed_save_exits_undone", &[(WAT_NAME, wat_archive())]);
+    let output_dir = dir.join("output");
+    fs::create_dir_all(output_dir.join("favicons.json.tmp")).unwrap();
+
+    let output = cc_extract(&dir)
+        .args(["--jobs", "1", "-e", "favicon"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_UNDONE),
+        "cc-extract should exit undone:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Summary: 0 processed, 0 skipped, 1 failed"),
+        "the summary should count the Shard as failed:\n{stderr}"
+    );
+    assert!(!output_dir.join(PROCESSED_FILENAME).exists());
+}
+
 /// `--formats` that can't serve a requested kind stop the run at startup,
 /// before anything is downloaded or written.
 #[test]
@@ -301,8 +361,9 @@ fn formats_that_cannot_serve_a_kind_are_rejected() {
         .unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(1),
         "cc-extract should fail:\n{stderr}"
     );
     assert!(
