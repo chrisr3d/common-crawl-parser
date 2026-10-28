@@ -753,11 +753,11 @@ async fn run_crawl(input: String, config: Config) {
             continue;
         }
 
-        if let Some(limit) = config.limit {
-            if work_items.len() >= limit {
-                eprintln!("Reached processing limit of {}. Stopping.", limit);
-                break;
-            }
+        if let Some(limit) = config.limit
+            && work_items.len() >= limit
+        {
+            eprintln!("Reached processing limit of {}. Stopping.", limit);
+            break;
         }
 
         // A Plan fails only on a configuration no Shard of this Dataset can
