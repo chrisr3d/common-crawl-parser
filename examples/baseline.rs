@@ -9,8 +9,10 @@
 //     cargo run --release --example baseline -- download/CC-NEWS-...warc.gz
 //
 // Compare its time and count with the main pipeline on the same Archive.
-// It uses the same `ONION_PATTERN` as the extractors, so the counts match
-// and only the reading technique differs.
+// It uses the same `ONION_PATTERN` as the extractors, and keeps a match only
+// once `checked_address` accepts it (a v3 checksum and version) and has
+// written it lowercase, as the extractors do, so the counts match and only
+// the reading technique differs.
 //
 // ## Examples and dev-dependencies
 //
@@ -27,7 +29,7 @@ use std::error::Error;
 use std::process;
 use std::time::Instant;
 
-use cc_extract::onion_search::ONION_PATTERN;
+use cc_extract::onion_search::{ONION_PATTERN, checked_address};
 use regex::Regex;
 use warc::{RecordType, WarcReader};
 
@@ -57,7 +59,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         // `String` (replacing invalid UTF-8) before searching it.
         let body = String::from_utf8_lossy(record.body());
         for m in onion_re.find_iter(&body) {
-            onions.insert(m.as_str().to_string());
+            if let Some(onion) = checked_address(m.as_str().as_bytes()) {
+                onions.insert(onion);
+            }
         }
     }
 

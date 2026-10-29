@@ -6,13 +6,13 @@
 // more `impl Extractor`, without touching the parsing loop.
 
 use clap::ValueEnum;
-use memchr::memmem;
 use regex::bytes::Regex;
 
 use crate::artifact::{
     ArtifactEntry, ArtifactKind, Findings, Shard, Sighting, Sightings, add_sightings,
 };
 use crate::inline_favicon::{InlineFavicon, InlineFavicons, sha256_hex};
+use crate::onion_search::SuffixFinder;
 use crate::page_record::PageRecord;
 use crate::{favicon_search, onion_search};
 
@@ -74,17 +74,27 @@ pub struct OnionExtractor {
     sightings: Sightings,
 }
 
-/// An `OnionEngine`, ready to run: the `Finder` or `Regex` is built once per
-/// extractor, not once per record.
+/// An `OnionEngine`, ready to run: the `SuffixFinder` or `Regex` is built
+/// once per extractor, not once per record.
+///
+/// An enum is as large as its largest variant, and Clippy warns when one
+/// variant dwarfs the others (two `Finder`s here, against a `Regex` that is
+/// a handle to shared state): each value of the enum wastes the difference.
+/// `#[expect]` silences the warning, with the reason, and itself warns if
+/// the lint ever stops firing, where `#[allow]` would stay silently.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value per extractor, already on the heap in a Box<dyn Extractor>"
+)]
 enum OnionSearch {
-    Memchr(memmem::Finder<'static>),
+    Memchr(SuffixFinder),
     Regex(Regex),
 }
 
 impl OnionExtractor {
     pub fn new(engine: OnionEngine) -> Self {
         let search = match engine {
-            OnionEngine::Memchr => OnionSearch::Memchr(memmem::Finder::new(b".onion")),
+            OnionEngine::Memchr => OnionSearch::Memchr(SuffixFinder::new()),
             OnionEngine::Regex => OnionSearch::Regex(
                 Regex::new(onion_search::ONION_PATTERN).expect("ONION_PATTERN is a valid regex"),
             ),
@@ -107,7 +117,7 @@ impl Extractor for OnionExtractor {
             // onions found sit in headers such as `Onion-Location`.
             PageRecord::Warc(response) => response.http_response,
             // The raw JSON, searched like the HTTP response: an address is
-            // made of `[a-z2-7.]` only, which ia-web-commons doesn't
+            // made of `[a-zA-Z2-7.]` only, which ia-web-commons doesn't
             // escape, and the bytes around it (`"`, `/`, `:`, space) are
             // word boundaries, so the addresses WAT kept are found as in
             // the WARC record. Three differences: onions only in the

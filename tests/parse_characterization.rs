@@ -39,9 +39,10 @@ const HEADER_V3: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wi
 const BODY_V3: &str = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
 /// v2 (16 chars), twice in page A's body and once in page B's.
 const BODY_V2: &str = "3g2upl4pq6kufc4m.onion";
-/// v3 address in uppercase, in page A's body. The `.onion` suffix stays
-/// lowercase so the memchr engine finds it and has to reject the address.
-const UPPERCASE_V3: &str = "BBCNEWSD73HKZNO2INI43T4GBLXVYCYAC5AW4GNV7T2RCCIJH7745UQD.onion";
+/// v3 address in uppercase, `.ONION` included, in page A's body.
+const UPPERCASE_V3: &str = "BBCNEWSD73HKZNO2INI43T4GBLXVYCYAC5AW4GNV7T2RCCIJH7745UQD.ONION";
+/// `UPPERCASE_V3` as it is recorded: the Artifact key is always lowercase.
+const UPPERCASE_V3_KEY: &str = "bbcnewsd73hkzno2ini43t4gblxvycyac5aw4gnv7t2rccijh7745uqd.onion";
 /// v2, only inside `request` and `metadata` records.
 const NON_RESPONSE_V2: &str = "expyuzz4wqqyqhjn.onion";
 /// v3, in page C, a `text/plain` response.
@@ -164,13 +165,14 @@ fn expected_snapshot() -> Snapshot {
     };
 
     Snapshot {
-        // Not extracted:
-        // - UPPERCASE_V3: both onion engines match lowercase only.
-        // - NON_RESPONSE_V2: only `response` records are searched.
+        // Not extracted: NON_RESPONSE_V2, as only `response` records are
+        // searched.
         onions: string_keys(vec![
             // The whole HTTP response is searched, headers included.
             (HEADER_V3, on_a()),
             (BODY_V3, on_a()),
+            // Found in any case, recorded lowercase.
+            (UPPERCASE_V3_KEY, on_a()),
             // Twice on page A but one Sighting per page; then page B.
             (BODY_V2, [on_a(), on_b()].concat()),
             // ASCII word boundaries: `é` before the address is a boundary.

@@ -16,6 +16,7 @@ memchr = "2"       # SIMD-accelerated byte/substring search (ripgrep's core tech
 memmap2 = "0.9"    # memory-mapped file I/O for zero-copy parsing
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }  # SIMD-optimized gzip via zlib-ng
 sha2 = "0.11"      # SHA-256, the key inline favicons are saved under
+sha3 = "0.12"      # SHA3-256, the checksum inside v3 onion addresses
 
 # Only for examples, tests and benchmarks: never compiled into the library or
 # the binary. `warc` powers `examples/baseline.rs`, the original parser kept
