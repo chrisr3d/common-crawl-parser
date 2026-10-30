@@ -808,7 +808,8 @@ now agree: on `https://example.net/docs/page.html` with `<base href="/static/">`
 `icons/fav.png` becomes `https://example.net/static/icons/fav.png` in both. The scan for
 `<base>` runs only once a favicon URL needs resolving, so pages without favicons pay nothing;
 `document_base_url` is the one rule both Formats call. `tests/wat_archive.rs` pins a page with a
-relative `<base>`.
+relative `<base>`. Step 25 replaced the separate scan and `DocumentBase`: its single pass finds
+the first `<base href>` along the way, and the `url` crate resolves it.
 
 ### Rust concepts introduced
 
@@ -1160,3 +1161,103 @@ once the lint stops firing.
 Like `checked_add`, `checked_address` returns `None` rather than a wrong value.
 `valid.then(|| ...)` is `Some` of the closure's result when `true`, and `None`, without running
 it, when `false`; `filter_map` then keeps the `Some`s.
+
+---
+
+## Step 25: Favicon Tags Read as a Browser Reads Them
+
+### What we built
+
+The WARC favicon scanner searched for six literals (`<link `, `<LINK `, `<meta `, ...) with SIMD,
+one pass each, and read each match loosely. Compared with WAT over 99 Shards, it missed tags a
+browser reads (`<Link`, `<link` then a newline, `rel="icon"href=…`, a bare `href=/i.png`, every
+tag after one that didn't close within 4 KB or after a stray quote), kept wrong URLs (`&#038;`
+left in, `href=https://cdn…` cut to `https:`), and read tags a browser ignores (in comments and
+scripts). Now:
+
+- **One forward pass** (`scan_page`): `memchr` jumps to each `<`. `<link>`, `<meta>` and `<base>`
+  start tags are read attribute by attribute (`Attributes`, following the HTML tokenizer's
+  states: a quote opens a value only after `=`, a bare value runs to whitespace or `>`, a name may
+  follow a closing quote directly). Comments are skipped to their `-->` (or `--!>`), bogus ones
+  (`<?php`, `<![CDATA[`, `</` without a letter) to the first `>`, the contents of `script`,
+  `style`, `xmp`, `iframe`, `noembed`, `noframes`, `title` and `textarea` to their end tag; any
+  other tag is passed over at its `<`. No length cap: a tag ends at its first `>` outside quotes,
+  and one still open at the end of the page is dropped. The pass finds the first `<base href>`
+  on the way, so the lazy `<base>` scan of Step 17 went.
+- **Entities decoded** in the values read (`decode_entities`): numeric references, decimal or
+  hex, `;` optional, and `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`. Any other `&` stays.
+- **`rel` as a token list**, in WARC and WAT: a favicon when any token is `icon`,
+  `apple-touch-icon`, `apple-touch-icon-precomposed` or `mask-icon`, ignoring case. `shortcut
+  icon` and `alternate icon` match through `icon`; `fluid-icon` is no favicon.
+- **The `url` crate** resolves every URL, in WARC and WAT, replacing the hand-written
+  `resolve_url`: `..` and `.` removed, `?v=2` against the whole path, `HTTPS://` absolute, `\`
+  read as `/`, the host lowercased. A value that is no URL is dropped. `url` was already built
+  for `reqwest`; it is now a direct dependency.
+- **No HTML crate**: `html5ever` needs UTF-8 and allocates per token on every page, `lol_html` is a
+  large dependency. Where the scanner still reads differently from a browser (a `<link>` inside
+  another tag's quoted attribute, which it reads), the WARC-versus-WAT comparison shows it.
+- **Tests** at two seams: WARC and WAT on the same page (`<Link`, `<link` + newline, `rel`
+  tokens, `../`, `HTTPS://`, `?v=2`, a 5 KB `data:` tag before a normal one), WARC against WAT's
+  decoded form (entities, bare values, no whitespace between attributes, comments, scripts, a
+  stray quote), and WARC alone (`&#38` without `;`, `&copy;` kept, `<textarea>`, `<title>`,
+  `<style>`, `<noscript>`, a 100 KB inline favicon, a tag open at the end of the page).
+
+As with Step 24, `processed.log` doesn't record the rules, so they apply to the Shards extracted
+from now on. Favicon keys are now URLs as `url` writes them, so a file merged across the change
+can hold one favicon under two keys.
+
+**Measured** over the 99 Shards of the earlier WARC-versus-WAT comparison, extracted again in
+both Formats: they now share 99.9 % of WARC's favicon Sightings, against 97.6 %; 3,880 are found
+only in WARC (117,222 before), 1,109 only in WAT (154,942). No URL keeps an entity WAT decoded,
+none ends in `/https:`. Of 38 differing pages read back, nearly all are pages WARC doesn't scan as
+HTML (no HTML `Content-Type`, UTF-16) or comments WAT's parser misreads (`--->`, runs of dashes).
+That sample also found the bogus-comment rule missing: an icon `<link>` after `<?php` is inside a
+comment to a browser.
+
+**Timings** (`-e favicon,inline-favicon --formats warc`, parse time, release builds, before and
+after in alternation):
+
+| Archive | Before | After |
+|---|---|---|
+| CC-MAIN 0.9 GB, memory | 6.0, 5.9 s | 5.9, 5.7 s |
+| CC-MAIN 0.9 GB, disk, 3 rounds | 5.9–6.0 s | 5.8–6.0 s |
+| CC-NEWS 1 GB, disk, 3 rounds | 7.7 s | 7.2–7.3 s |
+
+One `memchr` jump per `<` costs no more than the six SIMD scans for fixed literals it replaces.
+The CC-MAIN Archive gives 45,848 favicon URLs instead of 44,057 and 24 inline favicons instead of
+18; the CC-NEWS one 5,588 URLs instead of 4,884.
+
+### Rust concepts introduced
+
+**An iterator with a result at the end**
+`Attributes` yields `(name, value)` pairs, and its `end` field says, once it is done, where the
+tag ended, or `None` if the page ended first. `for (name, value) in &mut attributes` iterates
+through a mutable borrow (`&mut I` is itself an `Iterator` when `I` is one), so the iterator is
+still there after the loop to read `attributes.end`.
+
+**Const generics and array patterns**
+`read_attributes(page, from, [b"rel", b"href"])` takes the names as `[&[u8]; N]` and returns a
+`StartTag<'a, N>` whose `values` is `[Option<Cow<'a, [u8]>>; N]`. The caller destructures it
+with an array pattern, `let StartTag { values: [rel, href], end } = ...?;`, checked at compile
+time to have `N` elements. `[None; N]` needs a `Copy` element, which `Option<&[u8]>` is and
+`Option<Cow<[u8]>>` isn't: the values are collected as slices, then decoded at once with
+`values.map(|value| value.map(decode_entities))` (`[T; N]::map`).
+
+**`Cow<[u8]>`: decoded only when needed**
+`decode_entities` returns `Cow::Borrowed(value)` when the value holds no `&` (a `memchr`), and
+a new `Vec` (`Cow::Owned`) only otherwise. `PageTags` keeps either, borrowed from the page.
+
+**`char` from a number**
+`char::from_u32(code)` is `None` for a surrogate or a number past U+10FFFF, which HTML reads as
+`char::REPLACEMENT_CHARACTER`; `character.encode_utf8(&mut [0; 4])` writes its UTF-8 bytes into
+a buffer on the stack. `saturating_mul` and `saturating_add` keep a long run of digits from
+overflowing: stuck at `u32::MAX`, it is past Unicode as well.
+
+**`url::Url` and `ParseOptions`**
+`Url::options().base_url(base).parse(value)` is `base.join(value)` with an `Option<&Url>` base:
+with `None`, only an absolute value parses. `String::from(url)` takes the serialization without
+copying it.
+
+**Clippy's `type_complexity`**
+`Option<([Option<Cow<'a, [u8]>>; N], usize)>` drew the lint; a named struct with documented
+fields (`StartTag`) reads better than the tuple it replaced.

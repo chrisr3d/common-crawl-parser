@@ -254,8 +254,9 @@ WAT and WET records, yield one.
 
 Code: `src/favicon_search.rs` (scanning), `FaviconExtractor` in
 `src/extractor.rs`. The rules mirror AIL Framework's
-`extract_favicon_from_html()`, but WARC pages are scanned as bytes with
-`memchr` instead of building a DOM.
+`extract_favicon_from_html()`, but a WARC page is read in one pass over its
+bytes, by HTML's own rules for the few tags that matter, instead of building a
+DOM.
 
 **Which pages.**
 
@@ -272,34 +273,76 @@ page, not only on pages that mention an onion.
 
 | Tag | Attribute matched | Value taken |
 |---|---|---|
-| `<link>` | `rel` equal to `icon`, `shortcut icon`, `mask-icon` or `apple-touch-icon` (case-insensitive) | `href` |
+| `<link>` | a `rel` token equal to `icon`, `apple-touch-icon`, `apple-touch-icon-precomposed` or `mask-icon` (case-insensitive) | `href` |
 | `<meta>` | `name="msapplication-TileImage"` (case-insensitive) | `content` |
 
-In WARC, attribute values may be double-quoted, single-quoted or bare, in any
-order inside the tag. A `>` inside a quoted value does not end the tag. Each
-tag name (`<link `, `<LINK `, `<meta `, `<META `) is scanned for separately; if
-one of its tags doesn't close within 4 KB, that scan treats the page as
-truncated and stops there, while the others carry on.
+As in HTML, `rel` is a list of tokens separated by whitespace: `shortcut icon`
+and `alternate icon` are favicons through their `icon` token. `fluid-icon` is
+not a favicon.
 
-**URL resolution.** Each value is turned into an absolute URL as a browser
-would: against the page's `<base href>` (itself resolved against the page URL)
-when it has one, else against the page URL (`WARC-Target-URI`). In WARC the
-first `<base>` with an `href` counts, and it is only looked for once the page
-declares a favicon; in WAT it is ia-web-commons' `Head.Base`.
+**How a WARC page is read.** `memchr` jumps from one `<` to the next, and the
+`<link>`, `<meta>` and `<base>` tags are read as a browser reads them:
 
-- `https://cdn.example/fav.png` is kept as is;
+- tag names in any case, followed by any whitespace (a newline or a tab too),
+  `/` or `>`;
+- attributes in any order, double-quoted, single-quoted or bare. A bare value
+  runs to whitespace or `>`, `/` included (`href=https://cdn.example/i.png`,
+  `href=/i.png`). A quoted value needs no whitespace after it
+  (`rel="icon"href="…"`). A quote opens a value only after `=`, so a stray one
+  (`<link rel=preload crossorigin">`) hides nothing. Of a repeated attribute,
+  the first counts;
+- a tag ends at the first `>` outside a quoted value, however long the tag (an
+  inline image of any size). A tag still open at the end of the page is
+  dropped, as a browser drops it;
+- entities are decoded in values: numeric ones, decimal (`&#38;`) or hex
+  (`&#x26;`), the closing `;` optional, and `&amp;`, `&lt;`, `&gt;`, `&quot;`,
+  `&apos;`. Any other named one (`&copy;`) is kept as written;
+- nothing is read inside HTML comments (`<!-- … -->`, closed by `--->` or
+  `--!>` too), nor inside `<script>`, `<style>`, `<title>`, `<textarea>`,
+  `<iframe>`, `<xmp>`, `<noembed>` and `<noframes>`, up to their end tag: a
+  browser reads their contents as text. `<?php …`, `<![CDATA[ …` and `</`
+  without a letter after it are *bogus comments* to HTML, which end at the
+  first `>`, even one closing a tag written inside them; `<!DOCTYPE …>` ends at
+  its first `>` too. `<noscript>` and `<template>` are read as any markup. A comment or one
+  of these elements left open hides the rest of the page.
+
+Any other tag is passed over at its `<` without reading its attributes (see
+Known limitations). One pass reads each part of the page once, so the scan
+stays linear however large a tag or comment.
+
+In WAT, the token rule and the URL resolution below are the same; nothing is
+decoded or skipped, since ia-web-commons has already decoded the values and
+lists no tag from comments or scripts.
+
+**URL resolution.** Each value is resolved with the `url` crate, by the URL
+standard browsers follow: against the page's `<base href>` (itself resolved
+against the page URL) when it has one, else against the page URL
+(`WARC-Target-URI`). In WARC the first `<base>` with an `href` counts, wherever
+it is on the page; in WAT it is ia-web-commons' `Head.Base`. A `<base href>`
+that is no URL leaves the page URL, as in a browser.
+
+- `https://cdn.example/fav.png` is kept as is, `HTTPS://CDN.Example/fav.png`
+  written `https://cdn.example/fav.png`;
 - `//cdn.example/fav.png` gets the base's scheme;
 - `/icons/fav.png` gets the base's scheme and host;
-- `fav.png` is resolved against the base's directory.
+- `fav.png` and `../fav.png` are resolved against the base's directory, `.`
+  and `..` segments removed; a `/` in the base's query or fragment is no
+  directory;
+- `?v=2` keeps the base's whole path;
+- backslashes read as `/`, spaces are percent-encoded, a default port
+  (`:443`) is dropped.
+
+A value that is no URL (`https://`) is dropped, an empty one skipped. URLs are
+recorded as `url` writes them, which is what a browser requests.
 
 **No root guess.** Unlike AIL, no `{scheme}://{host}/favicon.ico` is added for
 pages that declare nothing: only declared favicons are recorded. A guessed URL
 was never checked to exist, and with one per HTML page such guesses made up
 nearly a third of the URLs in `favicons.json`.
 
-**`data:` values** are not favicon URLs. In WARC, base64 ones are handed to the
-`inline-favicon` kind (next section); in WAT they are skipped, since
-ia-web-commons cuts every `data:` URL after its first comma.
+**`data:` values** (the scheme in any case) are not favicon URLs. In WARC,
+base64 ones are handed to the `inline-favicon` kind (next section); in WAT they
+are skipped, since ia-web-commons cuts every `data:` URL after its first comma.
 
 **What it records.** `favicons.json` maps each absolute favicon URL to its
 Sightings, deduplicated on `(page_url, shard)`, as for onions.
@@ -394,9 +437,13 @@ were tracked) are ignored, so those Shards are processed again.
 
 A `<shard> <kind>` line doesn't say which matching rules extracted the pair, so
 a change to the rules (such as onions found in any case and v3 checksums
-verified) applies to the Shards extracted from then on: the pairs already done
-keep what the older rules found, and nothing redoes them. Results under one set
-of rules take a fresh `--output-dir`.
+verified, or favicon tags read as HTML reads them) applies to the Shards
+extracted from then on: the pairs already done keep what the older rules found,
+and nothing redoes them. Results under one set of rules take a fresh
+`--output-dir`. Favicon URLs are keys written by the `url` crate since its
+rules came in (host in lowercase, `..` removed, entities decoded): a file
+merged across that change can hold one favicon under two keys, its old
+spelling and its new one.
 
 The summary at the end reports processed, skipped and failed Shards (a Shard
 left with any kind undone, by a failed download, parse or save), new and total
@@ -479,12 +526,23 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   found, since the JSON repeats the WARC headers (WARC only searches the HTTP
   response). `--formats warc` finds them all, for about 4 times the download
   (`RESEARCH-warc-wat-wet.md`, section 4.7).
-- **Favicons differ between WARC and WAT, and WAT is the more accurate.**
-  Over the same 99 Shards they share 97.6 % of WARC's Sightings; most of the
-  rest are the WARC scanner's defects (below). ia-web-commons reads the page
-  with its own parser and keeps the *last* `<base>` of a page, where the
-  scanner keeps the first (the HTML standard's choice). It also misses the
-  icon tags of a few pages its parser fails on.
+- **Favicons differ slightly between WARC and WAT.** Over 99 Shards of
+  CC-MAIN-2026-34 they share 99.9 % of WARC's Sightings; 3,880 are found only
+  in WARC, 1,109 only in WAT. What still differs, from a sample of the pages:
+  - WARC only scans responses whose `Content-Type` says HTML, as bytes:
+    ia-web-commons also reads pages sent without that header (none,
+    `charset=utf-8` alone, `text/plain`) and pages in UTF-16. A URL value that
+    isn't UTF-8 (on a Latin-1 page) is dropped in WARC.
+  - ia-web-commons' parser misreads comments HTML closes at `--->` or `--!>`,
+    or written with runs of dashes (`<!-----`), and leaves out the tags after
+    them; it fails on a few pages altogether, and keeps the *last* `<base>`
+    of a page, where HTML (and the scanner) use the first. WARC finds those
+    favicons.
+  - It also lists a tag written right after a quoted value
+    (`href="…"<link rel="icon" …>`), which HTML reads as attributes of the
+    tag before.
+
+  Details in `RESEARCH-warc-wat-wet.md`, section 4.7.
 - **Results files are rewritten whole after every Shard.** A large
   `favicons.json` makes each save slower as the run goes on, on the one task
   that merges results.
@@ -498,26 +556,20 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **Onion Sightings keep no context.** The output records which page mentioned
   the address, not where on the page or in what role (link, header, plain
   text).
-- **Favicon tag matching in WARC is narrower than HTML.**
-  - Only `<link ` and `<LINK ` are found (likewise `<meta `, `<base `), so mixed
-    case (`<Link`) and a newline or tab right after the tag name are missed.
-  - `rel` must equal one of the four values exactly, which misses
-    `apple-touch-icon-precomposed`, `alternate icon`, and `icon` with extra
-    spaces.
-  - `../` segments are not normalised.
-  - HTML entities aren't decoded: `&#038;` and `&amp;` stay in the URL
-    (`…?a=1&#038;b=2`), and a path written `&#x2F;&#x2F;cdn…` resolves as a
-    relative one. Over 99 Shards, 94,204 Sightings (1.9 % of WARC's).
-  - An unquoted value ends at the first `/`: `href=/favicon.ico` gives
-    nothing, `href=https://cdn…` gives `https:`. HTML ends it only at
-    whitespace or `>`.
-  - Attributes not separated by whitespace (`rel="icon"href="…"`) are missed.
-  - Tags inside HTML comments and `<script>` are read as if the page declared
-    them.
-  - A `<link>` or `<meta>` tag that doesn't close within 4 KB stops the scan
-    for that tag name (such as `<link `) in the rest of the page. Quotes are
-    counted, so one unbalanced quote in an earlier tag does it too. Large
-    inline `data:` favicons can hit this.
+- **The WARC favicon scanner reads only the tags it needs.**
+  - Start tags other than `<link>`, `<meta>`, `<base>` and the text-only
+    elements are passed over at their `<`, their attributes unread. Markup
+    written inside one of their quoted values is read as if it were the
+    page's: a `<link>` there (`<div data-html='<link …>'>`) is taken for a
+    favicon, and a `<!--`, `<script` or `<title` there starts a skip that can
+    hide the favicons after it. A browser sees text in both cases.
+  - `<noscript>` is read as markup, as a browser without scripts reads it. An
+    `<iframe … />` inside one, never closed by `</iframe>`, then hides the rest
+    of the page, where a browser running scripts reads the `<noscript>` as text
+    and finds the favicons after it.
+  - Of the named entities, only `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&apos;`
+    are decoded, and numeric ones from 128 to 159 are not mapped to
+    Windows-1252 characters as HTML maps them.
 - **One bad record drops the Archive.** A read or decompression error aborts
   the Archive, dropping everything found in it; the kinds reading it are left
   undone and retried on the next run.
