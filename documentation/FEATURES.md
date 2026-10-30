@@ -227,8 +227,9 @@ lowercasing (`onion_search::checked_address`), so they count the same onions.
   digits and `.`, which JSON never escapes, so it is found as in WARC.
 - WET: the page's text.
 
-Together, WAT and WET hold the places an onion was found in the research
-sample; [Known limitations](#known-limitations) lists the places they don't.
+Together, WAT and WET hold most places an onion is found: over 99 Shards they
+found 208 of the 215 distinct onions WARC found.
+[Known limitations](#known-limitations) lists where the rest were.
 
 **What it records.** For each address, one Sighting per distinct
 `(page_url, shard)` pair:
@@ -466,18 +467,24 @@ to retry, and leave the exit status at 0.
 
 Behaviour that is surprising or incomplete today, roughly in order of impact.
 
-- **WAT + WET don't see everything WARC does.** They drop some places an onion
-  can hide: inline `<script>` bodies, HTML comments, `<style>`, the bodies of
-  non-HTML responses (JavaScript, JSON, CSS, PDF, plain text) and request
-  records. None of the matches in the research sample lived there, but the
-  sample holds 38 onions. In WAT, an address right after a JSON escape (`\n`,
-  `\u2003`) is missed, the escape's last character reading as part of it, and
-  one in the page URL itself is found, since the JSON repeats the WARC
-  headers (WARC only searches the HTTP response). For favicons, ia-web-commons
-  reads the `<head>` with its own parser, so the two Formats can differ where
-  the byte scanner is narrower (below), and it probably keeps the *last*
-  `<base>` of a page where the scanner keeps the first. `--formats warc` runs a
-  WARC spot-check.
+- **WAT + WET miss some onions WARC finds.** Over 99 Shards of
+  CC-MAIN-2026-34, the default Plan missed 7 of the 215 distinct onions WARC
+  found (3.3 %) and 21 of its 1,470 Sightings (1.4 %). Every one sat where
+  WAT and WET keep nothing: inline scripts, JSON inside `<script>`,
+  attributes WAT doesn't keep (`<input value>`, `data-*`) and HTML comments.
+  Several were a site's own Tor mirror. The bodies of non-HTML responses
+  (JavaScript, JSON, CSS, PDF, plain text) are dropped too. In WAT, an address
+  right after a JSON escape of a control character (`\n`, `\t`) is missed, the
+  escape's last letter reading as part of it; one in the page URL itself is
+  found, since the JSON repeats the WARC headers (WARC only searches the HTTP
+  response). `--formats warc` finds them all, for about 4 times the download
+  (`RESEARCH-warc-wat-wet.md`, section 4.7).
+- **Favicons differ between WARC and WAT, and WAT is the more accurate.**
+  Over the same 99 Shards they share 97.6 % of WARC's Sightings; most of the
+  rest are the WARC scanner's defects (below). ia-web-commons reads the page
+  with its own parser and keeps the *last* `<base>` of a page, where the
+  scanner keeps the first (the HTML standard's choice). It also misses the
+  icon tags of a few pages its parser fails on.
 - **Results files are rewritten whole after every Shard.** A large
   `favicons.json` makes each save slower as the run goes on, on the one task
   that merges results.
@@ -498,9 +505,19 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
     `apple-touch-icon-precomposed`, `alternate icon`, and `icon` with extra
     spaces.
   - `../` segments are not normalised.
+  - HTML entities aren't decoded: `&#038;` and `&amp;` stay in the URL
+    (`…?a=1&#038;b=2`), and a path written `&#x2F;&#x2F;cdn…` resolves as a
+    relative one. Over 99 Shards, 94,204 Sightings (1.9 % of WARC's).
+  - An unquoted value ends at the first `/`: `href=/favicon.ico` gives
+    nothing, `href=https://cdn…` gives `https:`. HTML ends it only at
+    whitespace or `>`.
+  - Attributes not separated by whitespace (`rel="icon"href="…"`) are missed.
+  - Tags inside HTML comments and `<script>` are read as if the page declared
+    them.
   - A `<link>` or `<meta>` tag that doesn't close within 4 KB stops the scan
-    for that tag name (such as `<link `) in the rest of the page. Large inline
-    `data:` favicons can hit this.
+    for that tag name (such as `<link `) in the rest of the page. Quotes are
+    counted, so one unbalanced quote in an earlier tag does it too. Large
+    inline `data:` favicons can hit this.
 - **One bad record drops the Archive.** A read or decompression error aborts
   the Archive, dropping everything found in it; the kinds reading it are left
   undone and retried on the next run.

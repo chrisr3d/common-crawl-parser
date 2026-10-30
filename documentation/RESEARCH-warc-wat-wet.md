@@ -48,7 +48,11 @@ what exactly would be lost, and whether the size saving is worth it.
   (JavaScript, JSON, CSS, PDF, plain text) and request records. None of the 104
   matches in the sample lived in any of those places, but the sample is small
   (38 unique onions). A periodic WARC spot-check is advisable if the goal is
-  exhaustive discovery.
+  exhaustive discovery. **Measured since (section 4.7):** over 99 Shards, WAT
+  + WET missed 7 of 215 distinct onions (3.3 %) and 21 of 1,470 Sightings
+  (1.4 %), all in inline scripts, attributes WAT does not keep and HTML
+  comments; for favicon URLs, WAT turned out more accurate than the WARC
+  scanner.
 - **Blocking bug.** The current `WarcRecordIter` in `src/warc_parser.rs` crashes
   with a stack overflow on any WAT or WET file (it recurses once per skipped
   non-`response` record; WAT files contain 63,523 consecutive `metadata`
@@ -501,6 +505,120 @@ ones available. They show the local pipeline is download-bound by roughly 3x
 to 5x, and that even the parse phase is dominated by gzip decompression (3.4 s
 of the 5.1 s), not by the onion or favicon scan.
 
+### 4.7 At scale: 99 Shards, `cc-extract` against itself
+
+Added 2026-10-29. The five segments above held 38 onions, too few to size a
+loss. This run measures it with the binary itself, over 100 Shards.
+
+**Method.**
+
+- **Sample:** 100 Shards of CC-MAIN-2026-34, one per segment (every
+  1,000th line of `wat.paths.gz`), so they spread over the crawl's days.
+- **Two runs of `cc-extract`** over the same paths file, same machine,
+  `-t memory`, default `-j`, default kinds (`onion,favicon`), each into its
+  own `--output-dir`:
+  - `--formats warc`;
+  - the default Plan, WAT + WET.
+- **One Shard failed** in the WARC run (its error message was not kept), so
+  both runs are compared over the 99 Shards each one marked done in
+  `processed.log`.
+- **Comparison:** sets of `(Artifact, page_url, shard)` Sightings from
+  `onions.json` and `favicons.json`.
+- **Where each difference lives:** for every onion Sighting one run found and
+  the other did not, the page's WARC `response`, WAT `metadata` and WET
+  `conversion` records were read back from that Shard's three Archives (the
+  Archives streamed, only those pages' records kept), and every occurrence of
+  the address located. For favicons, 60 differing pages were sampled the same
+  way: 15 from each group in the favicon section below, all from 4 Shards.
+
+**Time.** Wall clock 23 min 25 s for WARC, 6 min 54 s for WAT + WET (3.4x).
+Per Shard, as `cc-extract` reports it with jobs running side by side:
+
+| | WARC | WAT + WET |
+|---|---|---|
+| Download | 208.5 s | 53.6 s |
+| Parse | 6.3 s | 4.3 s |
+
+Both runs are download-bound. Parsing WAT + WET is only a third faster than
+WARC for a quarter of the bytes: decompression shrinks with the bytes (3.4 s
+against 1.0 s in 4.6), but WAT's JSON is decoded record by record, which costs
+more per byte than WARC's byte scan, and WAT has as many records as the WARC.
+
+**Onions.**
+
+| | WARC | WAT + WET | Both | Only WARC | Only WAT + WET |
+|---|---|---|---|---|---|
+| Distinct onions | 215 | 209 | 208 | 7 (3.3 %) | 1 |
+| Sightings | 1,470 | 1,450 | 1,449 | 21 (1.4 %) | 1 |
+
+Every one of the 21 Sightings only WARC found sits where WAT and WET keep
+nothing; in each, neither the WAT nor the WET record of the page holds the
+address:
+
+| Where on the page | Sightings | Onions (site) |
+|---|---|---|
+| Inline JavaScript | 11 | `nnmclub2vv…4id.onion` (nnmclub.to, 10: a footer link written by a script), `gfonxmohva…fyd.onion` (i2p.net) |
+| JSON inside `<script>` | 7 | `xhamsteropoffvdm.onion` (xhamster, 5: a site configuration listing its own domains), `facebookcorewwwi.onion` (addons.mozilla.org, `application/json` state), `silkroad6ownowfk.onion` (reason.com, JSON-LD) |
+| An attribute WAT does not keep | 2 | `5dk6evicej…oqd.onion` (cheeserobot.org, `<input value="…@….onion:9735">`), `marvamxeq4…rad.onion` (solucionesmarva.com, `<button data-tor-url="…">`, and an inline script) |
+| HTML comment | 1 | `jthnx5wyvjvzsxtu.onion` (9ch.net, a commented-out link; WAT + WET found this address on other pages) |
+
+None came from a JSON escape in WAT, a truncated record, a non-HTML payload or
+a request record. The one Sighting only WAT + WET found is the page URL itself
+(a web gateway host `<address>.onion.ly`): WAT repeats the WARC headers, while
+WARC is searched in the HTTP response only.
+
+So the 0 of 38 lost in section 4.2 does not hold at scale: the default Plan
+loses 3.3 % of distinct onions, by construction, and nothing in this parser
+can win them back from WAT or WET. Several of the lost addresses are a site's
+own Tor mirror (nnmclub, xhamster, i2p, solucionesmarva), which sites tend to
+put in scripts and buttons rather than in plain links.
+
+**Favicons.**
+
+| | WARC | WAT | Both | Only WARC | Only WAT |
+|---|---|---|---|---|---|
+| Distinct favicons | 3,205,879 | 3,222,509 | 3,120,722 | 85,157 | 101,787 |
+| Sightings | 4,858,279 | 4,895,999 | 4,741,057 (97.6 % of WARC) | 117,222 | 154,942 |
+| Pages with a favicon | 1,671,605 | 1,682,222 | 1,669,262 | 2,343 | 12,960 |
+
+Most differences are the same favicon, written differently by the two sides,
+and WAT's form is the right one:
+
+- **HTML entities.** 94,204 of the 117,222 Sightings only WARC found (80 %)
+  hold an HTML entity the WARC scanner left undecoded, where WAT, as a browser
+  does, decoded it: `…?fit=32%2C32&#038;ssl=1` against `…?fit=32%2C32&ssl=1`.
+  The most frequent are `&#038;` (WordPress), `&amp;`, `&#x2F;` (a path
+  written `&#x2F;&#x2F;cdn…` then resolves as a relative one), `&#x3D;` and
+  `&#47;`.
+- **Unquoted values cut at `/`.** 2,512 end in `/https:` or `/http:`: the
+  scanner ends an unquoted value at the first `/`, so
+  `href=https://cdn.example/favicon.ico` gives `https:`, resolved against the
+  page. HTML ends an unquoted value only at whitespace or `>`.
+
+The 60 sampled pages, by group (a page can show more than one cause):
+
+| Group | Pages | Cause |
+|---|---|---|
+| Favicons only WAT found, on pages where WARC found none | 15 | WARC scanner: unquoted value cut at `/` (9), newline after `<link` (6), no space between attributes (2), entity in `rel` (1) |
+| Favicons only WAT found, on pages where WARC found others | 15 | WARC scanner: an earlier `<link>` without a closing `>` within 4 KB, counting quotes, stops the scan (11); no space between attributes (1); newline after `<link` (1); unexplained (2) |
+| Favicons only WARC found, on pages where WAT found none | 15 | WARC scanner false positive, the tag inside an HTML comment (6) or a `<script>` (2); WAT's parser did not list well-formed icon tags (6, cause not determined; on 4 of them WAT's `Head` holds no `Link`, `Meta` or `Title` at all); WAT record without `HTML-Metadata` (1) |
+| Favicons only WARC found, on pages where WAT found others | 15 | WARC scanner false positive, the tag inside an HTML comment (14); unexplained (1) |
+
+So for favicon URLs, WAT is today the more accurate of the two. The WARC
+scanner misses tags a browser reads and reads tags a browser ignores; WAT
+misses the icon tags of a few pages its own parser fails on.
+
+**Recommendation on the default Plan.** The data does not settle it alone:
+it weighs 3.3 % of distinct onions, mostly sites' own mirrors, against about
+4 times the bytes (3.4 times the wall clock on this machine, less where the
+link is faster). Two points hold either way:
+
+- The WARC favicon scanner's defects above are worth fixing first. If onions
+  move to WARC, the cheapest Plan serving `onion,favicon` is WARC alone, and
+  favicons would then come from the scanner that is less accurate today.
+- Keeping WAT + WET as the default stays sound for favicons; a run that wants
+  every onion it can get passes `--formats warc`.
+
 ## 5. Implementation implications
 
 **Fix the recursion first.** Replace the `return self.next();` at
@@ -579,6 +697,7 @@ archive kinds so a WAT and its WARC are not confused as "already processed".
   onions in inline scripts, comments and non-HTML payloads (JavaScript bundles,
   JSON APIs, PDFs) in the full crawl is unknown. A larger run over, say, 100
   WARC segments with the record-level attribution script would settle it.
+  Settled by section 4.7: 3.3 % of distinct onions lost over 99 Shards.
 - **Anchor-text truncation.** WAT caps `Links[].text` at 128 characters. A v3
   address (62 characters) inside a long link text could be cut. Not observed
   in the sample, but not excluded.
