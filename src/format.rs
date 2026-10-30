@@ -237,8 +237,8 @@ impl Dataset {
     pub fn available_formats(self) -> FormatSet {
         match self {
             Dataset::CcMain => FormatSet::of(&[Format::Warc, Format::Wat, Format::Wet]),
-            // Unverified: written from memory, commoncrawl.org was not
-            // reachable to check that CC-NEWS publishes no WAT or WET.
+            // Each CC-NEWS month has a `warc.paths.gz`, and no `wat.paths.gz`
+            // or `wet.paths.gz`: its crawler writes WARC only.
             Dataset::CcNews => FormatSet::of(&[Format::Warc]),
         }
     }

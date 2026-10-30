@@ -156,7 +156,7 @@ the cheapest of its own accepted Formats inside the Plan:
 | `onion` | WAT + WET | ~240 MB |
 | anything with `inline-favicon` | WARC: every kind reads it | ~1 GB |
 
-CC-NEWS is taken to publish WARC only (not yet verified), so its Plan is always WARC.
+CC-NEWS publishes WARC only, so its Plan is always WARC.
 `--formats` forces the Formats
 downloaded; it is rejected if they can't serve a requested kind
 (`cannot extract favicon from wet: it needs warc or wat`). WARC and WAT + WET find the same

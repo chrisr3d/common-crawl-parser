@@ -89,8 +89,8 @@ combinations:
 | `favicon` | WAT (~170 MB) | `favicon` WAT |
 | anything with `inline-favicon` | WARC (~1 GB) | every kind WARC |
 
-CC-MAIN publishes all three Formats; CC-NEWS is taken to publish WARC only, so
-its Plan is always WARC (see [Known limitations](#known-limitations)). Since the
+CC-MAIN publishes all three Formats; CC-NEWS publishes WARC only, so its Plan
+is always WARC. Since the
 Plan depends on the kinds still to do, two Shards of one run can have different
 Plans.
 
@@ -488,9 +488,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **The RAM guard sees the whole machine.** Each process divides the free RAM by
   its largest Plan on its own, so several processes on one node can together
   schedule more in-memory Shards than fit.
-- **CC-NEWS's Formats are unverified.** That CC-NEWS publishes WARC only was
-  written from memory, commoncrawl.org being unreachable at the time. If it
-  publishes WAT or WET too, its Plans are more expensive than they need to be.
 - **Onion Sightings keep no context.** The output records which page mentioned
   the address, not where on the page or in what role (link, header, plain
   text).
