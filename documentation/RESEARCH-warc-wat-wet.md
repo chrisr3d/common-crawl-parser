@@ -52,7 +52,8 @@ what exactly would be lost, and whether the size saving is worth it.
   + WET missed 7 of 215 distinct onions (3.3 %) and 21 of 1,470 Sightings
   (1.4 %), all in inline scripts, attributes WAT does not keep and HTML
   comments; for favicon URLs, WAT turned out more accurate than the WARC
-  scanner.
+  scanner, until the scanner was reworked: the two now share 99.9 % of WARC's
+  Sightings.
 - **Blocking bug.** The current `WarcRecordIter` in `src/warc_parser.rs` crashes
   with a stack overflow on any WAT or WET file (it recurses once per skipped
   non-`response` record; WAT files contain 63,523 consecutive `metadata`
@@ -604,18 +605,80 @@ The 60 sampled pages, by group (a page can show more than one cause):
 | Favicons only WARC found, on pages where WAT found none | 15 | WARC scanner false positive, the tag inside an HTML comment (6) or a `<script>` (2); WAT's parser did not list well-formed icon tags (6, cause not determined; on 4 of them WAT's `Head` holds no `Link`, `Meta` or `Title` at all); WAT record without `HTML-Metadata` (1) |
 | Favicons only WARC found, on pages where WAT found others | 15 | WARC scanner false positive, the tag inside an HTML comment (14); unexplained (1) |
 
-So for favicon URLs, WAT is today the more accurate of the two. The WARC
-scanner misses tags a browser reads and reads tags a browser ignores; WAT
+So for favicon URLs, WAT was then the more accurate of the two. The WARC
+scanner missed tags a browser reads and read tags a browser ignores; WAT
 misses the icon tags of a few pages its own parser fails on.
+
+**Favicons after the scanner rework.** Added 2026-10-30. The WARC scanner was
+rewritten to read tags as the HTML standard does: one pass over the page, tag
+names in any case and followed by any whitespace, attributes read by the
+tokenizer's rules (bare values to whitespace or `>`, no whitespace needed
+after a quoted value, a quote opening a value only after `=`), no length cap,
+entities decoded in values, and nothing read inside comments, bogus comments
+(`<?php …`, `<![CDATA[ …`) or the text-only elements (`<script>`, `<style>`,
+`<title>`, `<textarea>`, …). In both Formats, `rel` became a token list
+(`alternate icon`, `apple-touch-icon-precomposed` now count) and URLs are
+resolved by the `url` crate, by the URL standard browsers follow. Same 100
+Shards, same machine, `-t memory -e favicon`, once `--formats warc`, once the
+default Plan (WAT alone, for `favicon`), each into a fresh `--output-dir`. Both
+runs marked all 100 Shards done; the figures below are over the 99 Shards of
+the comparison above, Sightings as `(favicon, page_url, shard)` sets:
+
+| | Before | After |
+|---|---|---|
+| Sightings, WARC | 4,858,279 | 5,029,658 |
+| Sightings, WAT | 4,895,999 | 5,026,887 |
+| Both | 4,741,057 (97.6 % of WARC) | 5,025,778 (99.9 % of WARC) |
+| Only WARC | 117,222 | 3,880 |
+| Only WAT | 154,942 | 1,109 |
+| Distinct favicons, only WARC / only WAT | 85,157 / 101,787 | 2,292 / 606 |
+| Pages with a favicon in WARC only / in WAT only | 2,343 / 12,960 | 1,228 / 365 |
+| Only-WARC Sightings holding `&#` or `&amp;` (94,204 holding any entity) | 93,979 | 0 |
+| Only-WARC Sightings ending in `/https:` or `/http:` | 2,512 | 0 |
+
+WAT's own figures moved too, from the `rel` tokens and the URLs `url` writes
+(host in lowercase, `..` removed). 48 Sightings still hold `&#` or `&amp;` on
+both sides alike: the page encodes the `&` twice (`&amp;amp;`), and both
+decode it once, as a browser does. Over all 100 Shards: 5,080,080 Sightings
+in WARC, 5,077,269 in WAT, 99.9 % of WARC's shared.
+
+38 differing pages were read back from their WARC and WAT records, all from 4
+Shards: up to 15 per group, as in the sample above (the second and fourth
+groups had no more in those Shards).
+
+| Group | Pages | Cause |
+|---|---|---|
+| Favicons only WAT found, on pages where WARC found none | 15 | Not scanned as HTML by WARC: `Content-Type` missing (2), `charset=utf-8` alone (4), `text/plain` (1), a first `Content-Type: application/octet-stream` (1); page in UTF-16 (5); the URL value in Latin-1, not UTF-8 (1); WARC scanner, an `<iframe … />` inside `<noscript>` never closed hiding the rest of the page (1) |
+| Favicons only WAT found, on pages where WARC found others | 1 | `href="…"<link rel="shortcut icon" …>`: HTML reads the second tag as attributes of the first, ia-web-commons lists it |
+| Favicons only WARC found, on pages where WAT found none | 15 | ia-web-commons' parser: icon tags after a comment HTML closes at `--->` or `--!>`, or written with runs of dashes (13); no `Head` at all (1); icon tags right after an inline script holding `P<Modernizr`, probably read as a tag (1) |
+| Favicons only WARC found, on pages where WAT found others | 7 | ia-web-commons' parser: a `--->` comment, as above (7) |
+
+The sample first held an eighth page in the last group, an icon `<link>`
+written after `<?php` in the page: a bogus comment to HTML, running to that
+tag's `>`, so WAT was right. The scanner now reads `<?`, `<!` and `</` without
+a letter as bogus comments; the run above is with that change (it removed 7
+Sightings and added 3 over the 100 Shards).
+
+So nearly all of what still differs lies outside the scanner's reading of
+tags: pages WARC doesn't take as HTML, encodings it doesn't decode, and
+comments ia-web-commons misreads. The WARC scanner is now the more accurate of
+the two for pages it scans; WAT reads a few pages the scanner never sees.
+
+**Timing.** No measurable cost: on one CC-MAIN Archive (0.9 GB),
+`-e favicon,inline-favicon --formats warc -t memory` parsed in 6.0 and 5.9 s
+before, 5.9 and 5.7 s after, run in alternation (5.9 to 6.0 s against 5.8 to
+6.0 s from disk). The scanner found 45,848 favicon URLs on that Archive
+instead of 44,057, and 24 inline favicons instead of 18.
 
 **Recommendation on the default Plan.** The data does not settle it alone:
 it weighs 3.3 % of distinct onions, mostly sites' own mirrors, against about
 4 times the bytes (3.4 times the wall clock on this machine, less where the
 link is faster). Two points hold either way:
 
-- The WARC favicon scanner's defects above are worth fixing first. If onions
+- The WARC favicon scanner's defects above were worth fixing first: if onions
   move to WARC, the cheapest Plan serving `onion,favicon` is WARC alone, and
-  favicons would then come from the scanner that is less accurate today.
+  favicons then come from the scanner. They are fixed (see the rework above),
+  so either Plan now gives nearly the same favicon URLs.
 - Keeping WAT + WET as the default stays sound for favicons; a run that wants
   every onion it can get passes `--formats warc`.
 
