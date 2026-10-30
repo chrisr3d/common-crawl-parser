@@ -25,9 +25,10 @@ use futures::stream::{self, StreamExt};
 
 use cc_extract::{
     ArchivePath, ArtifactKind, DEFAULT_OUTPUT_DIR, Extractor, FaviconExtractor, Findings, Format,
-    FormatSet, InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, Shard, Transport,
-    download_archive, download_archive_to_memory, download_path, load_processed_from,
-    load_sightings_from, merge_sightings_from, parse_archive, save_sightings_to, save_then_mark,
+    FormatSet, HttpClient, InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, READ_TIMEOUT,
+    Shard, Transport, download_archive, download_archive_to_memory, download_path,
+    load_processed_from, load_sightings_from, merge_sightings_from, parse_archive,
+    save_sightings_to, save_then_mark,
 };
 
 // ---------------------------------------------------------------------------
@@ -378,7 +379,7 @@ struct ShardResult {
 /// (`Vec<u8>`) instead of disk: the compressed bytes stay in RAM and are
 /// passed directly to the parser.
 async fn fetch(
-    client: &reqwest::Client,
+    client: &HttpClient,
     archive: &ArchivePath,
     transport_choice: TransportChoice,
 ) -> Result<Transport, Box<dyn Error + Send + Sync>> {
@@ -891,14 +892,12 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
 
     // --- Create a shared HTTP client ---
     //
-    // `reqwest::Client` maintains a connection pool internally. Sharing one
-    // client across all tasks lets them reuse TCP connections to the same
-    // server (HTTP keep-alive), which is faster than each task opening its
-    // own connection.
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("Failed to build HTTP client");
+    // `reqwest::Client`, inside `HttpClient`, maintains a connection pool.
+    // Sharing one client across all tasks lets them reuse TCP connections to
+    // the same server (HTTP keep-alive), which is faster than each task
+    // opening its own connection. A download receiving no data for
+    // `READ_TIMEOUT` fails like any other download error.
+    let client = HttpClient::new(READ_TIMEOUT).expect("Failed to build HTTP client");
 
     let delete = config.delete;
 
@@ -926,9 +925,10 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
                  plan,
                  archives,
              }| {
-                // Clone the shared client for this task. `reqwest::Client` is
-                // an `Arc` inside, so the clone is cheap (just increments a
-                // reference count) and shares the connection pool.
+                // Clone the shared client for this task. The `reqwest::Client`
+                // in `HttpClient` is an `Arc` inside, so the clone is cheap
+                // (just increments a reference count) and shares the
+                // connection pool.
                 let client = client.clone();
 
                 async move {

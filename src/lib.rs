@@ -49,9 +49,11 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read, Write};
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process;
+use std::time::Duration;
 
 use flate2::read::MultiGzDecoder;
 use futures::stream::{self, Stream, TryStreamExt};
@@ -140,6 +142,116 @@ impl Drop for TempFile {
 // Download Logic
 // ---------------------------------------------------------------------------
 
+/// How long the crawl's downloads wait for data before failing.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long connecting to the server may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client the downloads go through, with the read timeout it was
+/// built with.
+///
+/// ## A download that stops receiving data fails
+///
+/// By default, a connected `reqwest::Client` waits for data as long as it
+/// takes. A server (or something between it and us) that stops sending without
+/// closing the connection would keep the download, its Shard's task and so
+/// the whole run waiting forever. TCP keepalive, which `reqwest` enables,
+/// only fails a connection whose peer is gone, not one whose peer still
+/// answers but sends nothing.
+///
+/// So the client has a read timeout: a download fails when its response
+/// headers haven't arrived that long after the request was sent (connecting
+/// included), or when the next chunk of the body hasn't, that long after the
+/// one before. The wait starts over at each chunk, so a slow download that
+/// keeps receiving data is never cut, however long it takes in all; a
+/// timeout on the whole request (`ClientBuilder::timeout`) would cut a slow
+/// but healthy 1 GB Archive.
+///
+/// The client keeps the bound to say what happened (`download_error`):
+/// `reqwest`'s own message, `error decoding response body` (`error sending
+/// request` while waiting for the headers), doesn't.
+///
+/// ## Cheap to clone
+///
+/// `reqwest::Client` keeps its connection pool behind an `Arc`, so cloning
+/// it, and this struct with it, only increments a reference count: every
+/// clone shares the pool.
+#[derive(Clone)]
+pub struct HttpClient {
+    client: reqwest::Client,
+    read_timeout: Duration,
+}
+
+impl HttpClient {
+    /// A client whose connections time out after 30 s, and whose reads
+    /// after `read_timeout` without data. The crawl uses `READ_TIMEOUT`.
+    pub fn new(read_timeout: Duration) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(read_timeout)
+            .build()?;
+        Ok(HttpClient {
+            client,
+            read_timeout,
+        })
+    }
+
+    /// Request `url`, and return the response once its headers arrived. An
+    /// HTTP error status (404, 503, ...) is an error.
+    async fn get(&self, url: &str) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+        self.client
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|err| self.download_error(err.into()))
+    }
+
+    /// `err` as a download reports it: the read timeout says that no data
+    /// came, and for how long. Every other error is kept as it is.
+    ///
+    /// ## Looking inside a `Box<dyn Error>`
+    ///
+    /// `downcast_ref::<T>()` returns the error as a `&T` if it is a `T`, and
+    /// `None` otherwise. `?` boxes a `reqwest::Error` as it is, so one coming
+    /// back from `save_archive` is still found.
+    fn download_error(&self, err: Box<dyn Error + Send + Sync>) -> Box<dyn Error + Send + Sync> {
+        let timed_out = err
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(is_read_timeout);
+        if timed_out {
+            format!("no data received for {} s", self.read_timeout.as_secs_f64()).into()
+        } else {
+            err
+        }
+    }
+}
+
+/// Whether `err` is the client's read timeout.
+///
+/// `is_timeout` holds for any timeout found among the errors `err` wraps.
+/// Two others are kept apart: the connect timeout (`is_connect`), and the
+/// system's own, an `io::Error` of kind `TimedOut` (TCP keepalive or
+/// retransmissions giving up), which say something else happened.
+///
+/// ## Walking an error's causes
+///
+/// `source()` returns the error this one wraps, if any. `iter::successors`
+/// turns that chain into an iterator: it starts from the first value and
+/// computes each next one from the one before, until `None`. The closure is
+/// handed a reference to that value, itself a reference (`&&dyn Error`):
+/// the `&cause` pattern copies the inner one out, so the next cause borrows
+/// from `err`, not from the closure's argument, gone once it returns.
+fn is_read_timeout(err: &reqwest::Error) -> bool {
+    let system_timeout = iter::successors(err.source(), |&cause| cause.source()).any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|cause| cause.kind() == io::ErrorKind::TimedOut)
+    });
+    err.is_timeout() && !err.is_connect() && !system_timeout
+}
+
 /// Directory where the disk and mmap Transports keep downloaded Archives,
 /// under the current directory.
 const DOWNLOAD_DIR: &str = "download";
@@ -149,12 +261,24 @@ pub fn download_path(archive: &ArchivePath) -> PathBuf {
     Path::new(DOWNLOAD_DIR).join(archive.file_name())
 }
 
-/// Download one Archive from Common Crawl to `download/` using async I/O,
-/// unless it is there already, and return its path there.
+/// Download one Archive from Common Crawl to `download/`, unless it is there
+/// already, and return its path there (see `download_to`).
+pub async fn download_archive(
+    client: &HttpClient,
+    archive: &ArchivePath,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
+    let local_path = download_path(archive);
+    download_to(client, &url, &local_path).await?;
+    Ok(local_path)
+}
+
+/// Download the Archive at `url` to `local_path` using async I/O, unless a
+/// file is there already.
 ///
 /// The one place that decides whether an Archive is downloaded: a file at
-/// its name in `download/` is the Archive, complete, since `save_archive`
-/// puts one there only once every byte arrived.
+/// `local_path` is the Archive, complete, since `save_archive` puts one
+/// there only once every byte arrived.
 ///
 /// ## Why `reqwest` instead of `ureq`
 ///
@@ -166,28 +290,29 @@ pub fn download_path(archive: &ArchivePath) -> PathBuf {
 /// released during network waits and can run other tasks. With 4 concurrent
 /// downloads, we use ~1 thread instead of 4 blocked threads. This is the
 /// core benefit of async for I/O-bound work.
-pub async fn download_archive(
-    client: &reqwest::Client,
-    archive: &ArchivePath,
-) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
-    let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
-    let filename = archive.file_name();
-    let local_path = download_path(archive);
+pub async fn download_to(
+    client: &HttpClient,
+    url: &str,
+    local_path: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let filename = local_path.file_name().unwrap_or_default().to_string_lossy();
 
     if local_path.exists() {
         eprintln!("  [{}] Already downloaded, skipping download", filename);
-        return Ok(local_path);
+        return Ok(());
     }
 
     // `tokio::fs::create_dir_all` is the async version of `fs::create_dir_all`.
     // For file system operations, async doesn't help much (disk I/O is fast),
     // but it avoids blocking the Tokio runtime thread.
-    tokio::fs::create_dir_all(DOWNLOAD_DIR).await?;
+    if let Some(dir) = local_path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
 
     eprintln!("  [{}] Downloading...", filename);
     eprintln!("  [{}] URL: {}", filename, url);
 
-    let response = client.get(&url).send().await?.error_for_status()?;
+    let response = client.get(url).await?;
 
     // Content-Length header tells us the total size (if the server provides it).
     let total_size = response.content_length();
@@ -204,9 +329,9 @@ pub async fn download_archive(
         let chunk = response.chunk().await?;
         Ok::<_, reqwest::Error>(chunk.map(|chunk| (chunk, response)))
     });
-    save_archive(chunks, total_size, &local_path).await?;
-
-    Ok(local_path)
+    save_archive(chunks, total_size, local_path)
+        .await
+        .map_err(|err| client.download_error(err))
 }
 
 /// Save an Archive's body, arriving as a stream of `chunks`, to
@@ -329,7 +454,17 @@ where
     Ok(())
 }
 
-/// Download one Archive into memory instead of to disk.
+/// Download one Archive from Common Crawl into memory instead of to disk
+/// (see `download_to_memory`).
+pub async fn download_archive_to_memory(
+    client: &HttpClient,
+    archive: &ArchivePath,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
+    download_to_memory(client, &url).await
+}
+
+/// Download the Archive at `url` into memory instead of to disk.
 ///
 /// ## Why in-memory?
 ///
@@ -351,17 +486,17 @@ where
 /// This is acceptable for modern machines and comparable to what the `mmap`
 /// Transport uses in virtual memory. The benefit is zero disk usage in the
 /// `download/` directory.
-pub async fn download_archive_to_memory(
-    client: &reqwest::Client,
-    archive: &ArchivePath,
+pub async fn download_to_memory(
+    client: &HttpClient,
+    url: &str,
 ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    let url = format!("{}{}", COMMONCRAWL_BASE, archive.uri());
-    let filename = archive.file_name();
+    // The log lines name the Archive by the URL's last component.
+    let filename = url.rsplit('/').next().unwrap_or(url);
 
     eprintln!("  [{}] Downloading to memory...", filename);
     eprintln!("  [{}] URL: {}", filename, url);
 
-    let mut response = client.get(&url).send().await?.error_for_status()?;
+    let mut response = client.get(url).await?;
 
     let total_size = response.content_length();
     if let Some(size) = total_size {
@@ -374,7 +509,11 @@ pub async fn download_archive_to_memory(
     let mut bytes_read: u64 = 0;
     let mut last_report: u64 = 0;
 
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| client.download_error(err.into()))?
+    {
         buffer.extend_from_slice(&chunk);
         bytes_read += chunk.len() as u64;
 

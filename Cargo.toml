@@ -24,6 +24,7 @@ url = "2"          # URL resolution as browsers do it (WHATWG); already built fo
 # as a speed and count yardstick.
 [dev-dependencies]
 warc = "0.4"
+tokio = { version = "1", features = ["time"] }  # `tokio::time::timeout`: a hung download fails its test
 
 # Optimize all dependencies even in debug builds.
 # Our code (gzip decompression, regex) spends 99% of CPU time inside
