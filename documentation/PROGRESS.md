@@ -1261,3 +1261,40 @@ copying it.
 **Clippy's `type_complexity`**
 `Option<([Option<Cow<'a, [u8]>>; N], usize)>` drew the lint; a named struct with documented
 fields (`StartTag`) reads better than the tuple it replaced.
+
+---
+
+## Step 26: A Stalled Download Fails
+
+During a 100-Shard run, 15 downloads stopped receiving data at once, and the run waited for 38
+minutes without an error until it was stopped by hand. The shared client had a connect timeout
+only: once connected, `reqwest` waits for data forever. TCP keepalive, which `reqwest` enables,
+fails a connection whose peer is gone, not one whose peer answers the probes but sends nothing.
+The client now has a 60 s read timeout (`READ_TIMEOUT`): when the response headers haven't
+arrived that long after the request, or the next chunk of the body that long after the one
+before, the download fails like any other
+download error (partial file removed, Shard left undone, exit 3, downloaded again on the next
+run), with `no data received for 60 s` instead of `reqwest`'s `error decoding response body`.
+The wait starts over with each chunk, so a slow download still receiving data is never cut;
+a timeout on the whole request would cut a slow but healthy 1 GB Archive.
+
+The library now builds the client: `HttpClient::new(read_timeout)` holds the `reqwest::Client`
+and its bound, so the message can state it. The downloads gained inner forms taking the URL
+(and on disk the local path), `download_to` and `download_to_memory`, so
+`tests/download.rs` downloads from a server of its own on 127.0.0.1: one that sends half the
+body and goes silent, one that sends it all in small chunks, slowly. `download_archive` and
+`download_archive_to_memory` build the Common Crawl URL and the `download/` path, then call
+them.
+
+- **`ClientBuilder::read_timeout` vs `timeout`**: the first bounds each read, its timer reset
+  by every chunk received; the second bounds the whole request, body included.
+- **`downcast_ref` on a `Box<dyn Error>`**: `Some(&T)` if the boxed error is a `T`. `?` boxes
+  a `reqwest::Error` as it is, so it can still be found after passing through `save_archive`.
+- **`Error::source` and `iter::successors`**: an error may wrap another, its cause;
+  `successors(first, |&cause| cause.source())` walks that chain as an iterator. `is_timeout`
+  holds for any timeout in the chain, so the system's own (`io::ErrorKind::TimedOut`) and the
+  connect timeout are told apart from the read timeout.
+- **`tokio::time::timeout` in tests**: a future that fails with `Elapsed` once its bound
+  passes, so a download that hangs fails its test rather than `cargo test`.
+- **`TcpListener::bind("127.0.0.1:0")`**: port 0 asks the system for a free port, read back
+  with `local_addr`, so tests running in parallel never collide.

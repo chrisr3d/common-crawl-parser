@@ -136,6 +136,22 @@ section):
 - **`memory`.** The Archive is collected into a `Vec<u8>` (pre-sized from
   `Content-Length`) and handed to the parser without touching the disk.
 
+A download that stops receiving data fails, on every Transport. Connecting may
+take 30 s, and the response headers must arrive within 60 s of the request,
+connecting included; then each chunk of the body must arrive within 60 s of
+the one before. When nothing arrives for that long, the download fails like
+any other, with
+`Download error: no data received for 60 s`: on `disk` and `mmap` its `.part`
+file is removed, so nothing appears at the Archive's name; the kinds reading
+that Archive are left undone, the run carries on with the other Shards and
+exits with 3, and the next run downloads the Archive again. The wait starts
+over with each chunk, so a slow download that keeps receiving data is never
+cut, however long it takes in all. A connection whose peer is gone is already
+failed by TCP keepalive (on in `reqwest`: a probe after 15 s idle, then every
+15 s, 3 unanswered in a row fail it, about a minute in all); the 60 s read
+timeout catches a peer that still answers the probes but sends nothing. The
+bound is fixed, with no option to change it.
+
 ## 4. Reading records
 
 Code: `src/warc_parser.rs` (records), `src/page_record.rs` (pages), `parse_archive`
@@ -573,3 +589,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **One bad record drops the Archive.** A read or decompression error aborts
   the Archive, dropping everything found in it; the kinds reading it are left
   undone and retried on the next run.
+- **A download is cut only when no data comes at all.** A server sending a
+  few bytes now and then, each within 60 s, keeps a download going however
+  slow it is: there is no minimum speed.
