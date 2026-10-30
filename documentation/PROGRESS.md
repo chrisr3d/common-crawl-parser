@@ -1,1215 +1,552 @@
 # Progress Journal
 
-## Step 1: Project Scaffolding — Read WARC Paths File
+What each step changed, and the Rust concepts it introduced. A feature that a later step
+replaced is described in a line or two, naming what replaced it; its concepts stay, as they
+still hold. Fixes get a short paragraph each.
+
+## Steps 1–2: Reading the Paths File, Downloading Archives
 
 ### What we built
 
-A minimal Rust binary that reads a file of WARC archive paths (one per line) and prints
-each path with its line number. Accepts any path file as a CLI argument, defaulting to
-`warc.paths`. This is the foundation that all subsequent steps build on.
+A binary that reads a paths file (one Archive path per line) and downloads each Archive from
+`https://data.commoncrawl.org/` into `download/`, streamed to disk, skipping the files already
+there, with `--limit N`. The first downloader used the blocking `ureq` crate, replaced by async
+`reqwest` in Step 6; `std::env::args()` gave way to `clap` after 1.0.0.
 
 ### Rust concepts introduced
 
-**`std::env::args()` — CLI argument parsing**
-Returns an iterator over the command-line arguments passed to the program. Index 0 is
-the program name, index 1 is the first user argument. We use `.nth(1)` to grab it as
-an `Option<String>`, then `unwrap_or_else` to provide a default value.
+**`Result<T, E>` and `?`**
+Rust has no exceptions: a function that can fail returns `Ok(value)` or `Err(error)`. `?`
+returns the error from the current function, or unwraps the value, converting the error type
+on the way when the function returns `Box<dyn Error>`.
 
-**`Result<T, E>` — Error handling without exceptions**
-Rust has no exceptions. Functions that can fail return `Result`, which is either `Ok(value)`
-or `Err(error)`. `File::open` returns `Result<File, io::Error>`. We handle the error case
-explicitly with `unwrap_or_else`, printing to stderr and exiting with a non-zero code.
+**`Box<dyn Error>`**
+A heap pointer to any type implementing `Error`, so one function can fail with an `io::Error`,
+an HTTP error or anything else through one return type, still printable with `Display`.
 
-**`BufReader` — Buffered I/O**
-Reading a file byte-by-byte (or line-by-line without buffering) triggers a system call per
-read. `BufReader` wraps a `File` with an 8 KB in-memory buffer, so the OS reads in large
-chunks and our code consumes from the buffer. Same result, far fewer syscalls.
+**`match`**
+Exhaustive pattern matching: the compiler checks that every variant is handled, such as
+`Ok(line)` and `Err(err)`.
 
-**`.lines().enumerate()` — Iterator composition**
-`.lines()` on a `BufReader` returns an iterator that lazily yields one `Result<String>` per
-line. `.enumerate()` wraps each item as `(index, value)`. No vector is allocated — lines
-are processed one at a time (this is what Rust calls a "zero-cost abstraction").
+**`BufReader` and lazy iterators**
+`BufReader` reads a file in 8 KB chunks instead of one system call per read. `.lines()` yields
+one line at a time, `.enumerate()` pairs each with its index and `.take(n)` stops after `n`;
+nothing is collected into a `Vec` (a *zero-cost abstraction*).
 
-**`match` — Pattern matching**
-Rust's `match` is an exhaustive pattern-matching expression. The compiler ensures every
-variant is handled. We match on `Ok(line)` and `Err(err)` to process good lines and
-report bad ones without crashing.
+**`println!` vs `eprintln!`**
+Data goes to stdout, diagnostics to stderr, so `cargo run | head -5` shows only the data.
+`{:>4}` right-aligns a value in a 4-character field.
 
-**`println!` vs `eprintln!` — stdout vs stderr**
-`println!` writes to stdout (the data stream). `eprintln!` writes to stderr (diagnostics).
-This separation matters when piping: `cargo run | head -5` shows only paths, not the
-summary line.
+**`Path` / `PathBuf`, `create_dir_all`, `File::open` / `File::create`**
+`Path` and `PathBuf` are a borrowed and an owned path, as `&str` and `String`; `.join()` adds a
+component with the OS's separator. `fs::create_dir_all` is `mkdir -p`: it succeeds when the
+directory exists, so the program works on its first run and its hundredth. `File::open` reads;
+`File::create` writes, creating or truncating the file.
 
-**`{:>4}` — Format specifiers**
-Rust's formatting mini-language in `println!` supports alignment and width. `{:>4}` means
-"right-align in a 4-character field", producing neatly columned output like `   1 | ...`.
+**`impl Trait` parameters, `Read` and `Write`**
+`fn download_with_progress(reader: impl Read, writer: impl Write, ...)` accepts any reader and
+any writer: the compiler builds one copy per concrete type (generics, written more briefly).
+Written against the traits, the function works with files, network streams or memory buffers.
 
-### What's next
+**`str::parse::<T>()`**
+The turbofish `::<usize>` names the type to parse into; bad input comes back as an `Err`, not
+a panic.
 
-Step 2: Download WARC archives over HTTP.
+**Temporaries in method chains**
+In `.into_body().with_config().reader()`, each intermediate value must live as long as the next
+call borrows it. Splitting the chain into `let` bindings lets the borrow checker see that it
+does.
 
 ---
 
-## Step 2: HTTP Download of WARC Archives
+## Steps 3–5: WARC Parsing, Onion Extraction, Deduplication
 
 ### What we built
 
-An HTTP downloader that fetches Common Crawl WARC archives to a local `download/` directory.
-Each URI from `warc.paths` is prepended with `https://data.commoncrawl.org/` to form the
-full URL. Archives are streamed to disk (never fully loaded into memory), already-downloaded
-files are skipped, and a `--limit N` flag caps how many files to fetch per run.
+Each Archive is decompressed, its `response` records searched for `.onion` addresses with a
+regex, and the results saved to `output/onions.json`. `output/processed.log` lists the Archives
+done: a run skips those, parses an Archive already in `download/`, and downloads the rest.
+`--delete` removes an Archive once parsed. Two fixes followed: an Archive parsed twice no longer
+lists itself twice under an onion (`Vec::contains` before pushing: on 1 to 5 entries a linear
+scan beats hashing, and keeps the order), and results are saved after each Archive, not once at
+the end.
+
+Since replaced: the `warc` crate by our own parser (Step 7; `warc` lives on in
+`examples/baseline.rs`), the JSON shape (Steps 8 and 12), the log's lines and the order of
+saving and marking (Step 13).
 
 ### Rust concepts introduced
 
-**External crates (`Cargo.toml` dependencies)**
-Rust's package manager Cargo resolves dependencies declared in `Cargo.toml`. Adding
-`ureq = "3"` pulls the `ureq` HTTP client and all its transitive dependencies. We chose
-`ureq` over `reqwest` because it's blocking-only with minimal dependencies — no hidden
-async runtime. This keeps the code simple while we learn fundamentals.
+**`HashMap` and the entry API**
+`results.entry(onion).or_default()` returns the value for a key, inserting a default first if
+it is missing: one lookup instead of two.
 
-**`Box<dyn Error>` — trait objects for error handling**
-`Box<dyn Error>` is a heap-allocated pointer to *any* type implementing the `Error` trait.
-This lets a function return different error types (io::Error, ureq::Error, etc.) through
-a single return type. The caller doesn't need to know the concrete type — it can still
-print the error message via the `Display` trait.
+**`HashSet`**
+Unique values with average O(1) lookup: the Archives already done, the onions already found in
+one Archive.
 
-**The `?` operator — early return on error**
-`?` is syntactic sugar for: "if this Result is Err, return the error from the current
-function; otherwise, unwrap the Ok value." It replaces verbose `match` blocks and makes
-error propagation concise. It also automatically converts error types when the function
-returns `Box<dyn Error>`.
+**Use the data's structure**
+The `warc` crate parses record boundaries and headers, so only `response` records are searched,
+30 to 50 % of the data. Scanning every decompressed byte had also fed images and fonts,
+multi-megabyte "lines" without a newline, to the regex.
 
-**`Path` / `PathBuf` — cross-platform file paths**
-`Path` is a borrowed path slice (like `&str`), `PathBuf` is the owned version (like
-`String`). `.join()` appends path components with the correct OS separator. Unlike raw
-strings, these types handle platform differences (e.g., `/` vs `\`) correctly.
+**Compile a `Regex` once**
+`Regex::new` builds an automaton, which is costly: once, outside the loop. `find_iter` then
+yields every non-overlapping match.
 
-**`fs::create_dir_all` — idempotent directory creation**
-Like `mkdir -p` in Unix: creates the directory and all parents if needed, silently
-succeeds if the directory already exists. Idempotent operations like this are great for
-robustness — the program works whether it's the first run or the hundredth.
+**`serde_json` without derives**
+`serde_json::to_string_pretty` takes any `Serialize` type; `HashMap`, `Vec` and `String`
+implement it already (blanket implementations).
 
-**`File::create` vs `File::open`**
-`File::open` opens a file for reading. `File::create` opens for writing, creating the
-file if it doesn't exist or truncating it if it does. Two separate functions make the
-intent explicit at the call site.
+**`OpenOptions`**
+Combines opening flags: `.append(true).create(true)` is the shell's `>>`, so the log never loses
+earlier lines.
 
-**`impl Trait` in function parameters**
-`fn download_with_progress(reader: impl Read, writer: impl Write, ...)` accepts *any*
-type implementing `Read` or `Write`. This is compile-time polymorphism — the compiler
-generates specialized code for each concrete type used. It's Rust's equivalent of
-generics with trait bounds, written in a more readable form.
-
-**`Read` / `Write` traits — streaming I/O**
-The `Read` trait provides `.read(&mut buf)` for pulling bytes from a source. The `Write`
-trait provides `.write_all(&buf)` for pushing bytes to a destination. By programming
-against traits (not concrete types), our download function works with files, network
-streams, or in-memory buffers.
-
-**`.take(n)` on iterators — lazy limiting**
-`.take(n)` wraps an iterator so it yields at most `n` items, then stops. It's lazy —
-it doesn't collect or allocate, just stops pulling from the inner iterator. We use it
-to cap downloads: `.lines().filter(...).take(limit)`.
-
-**`str::parse::<T>()` — parsing strings into typed values**
-The turbofish syntax `::<usize>` tells the compiler what type to parse into. `.parse()`
-returns `Result<T, ParseError>`, so invalid input is caught at runtime without panicking.
-
-**Borrow checker and temporary lifetimes**
-When chaining method calls like `.into_body().with_config().reader()`, each intermediate
-value must live long enough for the next call to borrow from it. We split the chain into
-separate `let` bindings so the borrow checker can verify that each reference is valid.
-This is a common Rust pattern — explicit bindings make lifetimes clear.
-
-### What's next
-
-Step 3: Decompress the downloaded `.warc.gz` files and parse WARC records to extract
-their content for further processing.
+**`Cow<str>` from `String::from_utf8_lossy`**
+*Clone on write*: it borrows the bytes when they are valid UTF-8, and allocates a `String`, with
+U+FFFD for each invalid sequence, only when they are not.
 
 ---
 
-## Steps 3–5: WARC Parsing, .onion Extraction, and Deduplication
+## Performance: the Cost of `(?i)`
 
-### What we built
+Parsing a 1 GB Archive took ~2.5 minutes in a release build, against ~17 s for the old crawler;
+decompression and WARC parsing were ~15 s of it, the regex the rest. Its `(?i)` combined with
+Unicode `\b` pushes the `regex` crate off its fast DFA and its literal search for `.onion`, to
+run the full automaton at every byte. The old crawler's case-sensitive pattern was 1,250x
+faster:
 
-A complete processing pipeline that decompresses WARC archives, scans for `.onion`
-addresses using regex, deduplicates results, and persists them to JSON. The program now
-implements a three-state model for each archive:
-
-1. **Already processed** (in `output/processed.log`) → skip entirely
-2. **Downloaded but not parsed** (file exists in `download/`) → parse it
-3. **Not downloaded** → download first, then parse
-
-Results are stored in `output/onions.json` as a map from each `.onion` address to the
-list of archives it was found in. A `--delete` flag optionally removes archives after
-parsing to save disk space.
-
-### Rust concepts introduced
-
-**`HashMap<K, V>` — key-value hash table**
-Rust's standard hash map provides O(1) average-case lookup and insertion. We use
-`HashMap<String, Vec<String>>` to map each `.onion` address to its source archives.
-The `entry().or_default()` pattern is the idiomatic way to do "get-or-insert" — it
-avoids a double lookup (one to check existence, one to insert).
-
-**`HashSet<T>` — unique membership collection**
-`HashSet` stores unique values with O(1) average-case lookup via hashing. We use it
-in two places: to track already-processed filenames (skip-if-processed logic), and for
-per-archive deduplication of `.onion` addresses during parsing.
-
-**The `warc` crate — structured WARC parsing**
-Instead of raw byte scanning with `flate2` + `read_until`, we use the `warc` crate
-which understands the WARC archive format. `WarcReader::from_path_gzip` handles gzip
-decompression internally and parses record boundaries, headers, and bodies. Each record
-is yielded as a typed struct with a `warc_type()` (Response, Request, Metadata, etc.)
-and a `body()` payload. By filtering to only `RecordType::Response`, we skip binary
-content, request records, and metadata — processing ~30–50% of the data instead of 100%.
-
-**`RecordType` enum — WARC record types**
-WARC records are typed: Response (HTTP response bodies), Request (HTTP requests),
-Metadata, WarcInfo, etc. Only Response records contain the HTML/JS content where
-`.onion` links appear. Pattern matching on the enum lets us skip everything else.
-
-**Why structured parsing beats raw scanning**
-The previous approach decompressed every byte and scanned it through regex — including
-binary content (images, fonts) that produced multi-megabyte "lines" with no newlines.
-Working at the right abstraction level (WARC records instead of raw bytes) is a general
-performance lesson: when data has structure, use it.
-
-**`Regex` compilation and `find_iter` — pattern matching**
-`Regex::new()` compiles a pattern string into an efficient automaton. This compilation
-is expensive, so we do it once outside the loop. `find_iter()` returns an iterator of
-all non-overlapping matches in a string, which we use to scan each line for `.onion`
-patterns. Our regex matches both v2 (16-char) and v3 (56-char) onion addresses using
-base32 character classes.
-
-**`serde_json` — JSON serialization without derive macros**
-`serde_json::to_string_pretty` serializes any type that implements serde's `Serialize`
-trait. Standard library types like `HashMap`, `Vec`, and `String` get this automatically
-through blanket implementations — no `#[derive(Serialize)]` needed.
-
-**`OpenOptions` — fine-grained file opening**
-Unlike `File::create` (which truncates) or `File::open` (read-only), `OpenOptions`
-lets us combine flags: `.append(true)` positions writes at the end (like `>>` in shell),
-`.create(true)` creates the file if it doesn't exist. We use this for the processed log
-so we never lose previously logged entries.
-
-**`Cow<str>` via `String::from_utf8_lossy` — zero-cost when possible**
-`from_utf8_lossy` returns `Cow<str>` (Copy-on-Write). If the input bytes are valid
-UTF-8 (the common case), it borrows the original data with no allocation. If bytes
-contain invalid sequences, it allocates a new String with U+FFFD replacement characters.
-We use this to convert WARC response bodies (which are `&[u8]`) to strings for regex
-scanning.
-
-### Correctness fixes applied later
-
-**Duplicate archive names in results** — The original `results.entry(onion).or_default().push()`
-blindly appended the archive filename. If an archive was reprocessed (interrupted run, manual
-re-run), the same filename would appear multiple times. Fixed with `Vec::contains` before
-inserting. We chose `Vec::contains` (linear scan) over `HashSet` because the lists are tiny
-(1–5 entries per onion) — for small N, a linear scan beats the hashing overhead, and `Vec`
-preserves insertion order for stable JSON output.
-
-**Incremental result persistence** — Originally, `save_results` ran once after the loop while
-`mark_processed` ran per-archive. A crash between the two could cause results and processed
-state to diverge. Now both run per-archive: if either fails, the next run reprocesses that
-archive (safe, just redundant). The final `save_results` after the loop remains as a safety
-net. This "save after each unit of work" pattern is standard for batch jobs where interruption
-is expected.
-
-### What's next
-
-Performance optimization: benchmark and fix regex performance, optimize debug builds.
-
----
-
-## Performance Fixes
-
-### Root cause: catastrophic regex performance with `(?i)` flag
-
-The crawler was taking ~2.5 minutes (release) to parse a 1GB WARC archive, while the
-old crawler did it in ~17 seconds. Isolating the bottleneck via a minimal benchmark
-revealed that WARC parsing + gzip decompression takes only ~15s — the entire slowdown
-was in the regex.
-
-The original regex `(?i)\b[a-z2-7]{16}\.onion\b|\b[a-z2-7]{56}\.onion\b` used the
-case-insensitive `(?i)` flag. When combined with `\b` (word boundary assertions), this
-forces the `regex` crate off its fast DFA (deterministic finite automaton) path into a
-much slower execution mode. The engine can no longer use literal prefix optimizations
-(scanning for `.onion` as a fixed string) and must evaluate the full automaton at every
-byte position across 4.5GB of decompressed text.
-
-The fix was switching to the old crawler's pattern: `\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b`
-(case-sensitive). Since `.onion` addresses are base32 and conventionally lowercase, and
-our code already calls `.to_lowercase()` on matches, case-insensitive matching was
-unnecessary. This regex is **1,250x faster** on the same data.
-
-| Regex | Time (4.5GB text, release) |
+| Regex | Time (4.5 GB text, release) |
 |---|---|
-| `(?i)\b[a-z2-7]{16}\.onion\b\|\b[a-z2-7]{56}\.onion\b` | 125.6s |
-| `\b([a-z2-7]{16}\|[a-z2-7]{56})\.onion\b` | 0.1s |
+| `(?i)\b[a-z2-7]{16}\.onion\b\|\b[a-z2-7]{56}\.onion\b` | 125.6 s |
+| `\b([a-z2-7]{16}\|[a-z2-7]{56})\.onion\b` | 0.1 s |
 
-**Lesson: regex performance is not intuitive.** Small flag changes (`(?i)`) can cause
-orders-of-magnitude slowdowns depending on how the regex engine optimizes internally.
-When performance matters, benchmark the actual regex against real data. The `regex` crate
-has excellent documentation on its optimization strategies in the
-[`regex` crate docs](https://docs.rs/regex/latest/regex/#performance).
+Regex performance is not intuitive: benchmark the pattern on real data (the
+[`regex` docs](https://docs.rs/regex/latest/regex/#performance) describe its strategies).
+Step 24 matches any case again, with classes listing both cases instead of `(?i)`.
 
-### Optimized dependency compilation in debug mode
-
-Even with the fast regex, debug builds are slower because dependency code (gzip
-decompression, regex automaton, WARC parsing) runs without optimization. The standard
-Rust fix is to optimize dependencies at `-O2` while keeping our own code in debug mode:
+**`[profile.dev.package."*"]`: optimized dependencies in debug builds**
+`opt-level = 2` under this profile optimizes every dependency (decompression, regex, parsing)
+while our own crate stays debuggable. A 1 GB Archive: ~16 s in release, ~1 min 20 s in debug.
 
 ```toml
 [profile.dev.package."*"]
 opt-level = 2
 ```
 
-**`[profile.dev.package."*"]` — per-package profile overrides**
-Cargo allows overriding compiler optimization levels on a per-package basis within a
-profile. `dev` is the profile used by `cargo build` and `cargo run`. `package."*"` is a
-wildcard matching all dependency crates (but not our own crate). `opt-level = 2` is the
-same optimization level used by the `release` profile. This gives us the best of both
-worlds: fast dependency code + debuggable application code.
-
-Final measured results on a 1GB WARC archive (~30,000 records, ~15,000 responses):
-- **Release build**: ~16s (matching old crawler's ~17s)
-- **Debug build with `opt-level = 2` on deps**: ~1m 20s
-- **Debug build without optimization**: would be significantly slower
-
-### What's next
-
-Step 6: Concurrent downloads and processing with async/tokio.
-
 ---
 
-## Step 6: Concurrent Downloads & Processing with Tokio
+## Step 6: Concurrent Downloads and Parsing with Tokio
 
 ### What we built
 
-A concurrent processing pipeline that downloads and parses multiple WARC archives in
-parallel. The sequential bottleneck (download 1 → parse 1 → download 2 → parse 2) is
-replaced with a pipeline where up to N archives download simultaneously, and parsing
-starts immediately when each download completes. A `--jobs N` flag controls the
-concurrency level and `--limit N` caps the number of archives to process.
+Up to `--jobs N` Archives download and parse at once, each parse starting as soon as its
+download ends. `async fn main()` runs on Tokio's multi-threaded runtime, `reqwest` replaces
+`ureq`, parsing (CPU-bound) runs on Tokio's blocking pool, and results are merged on the main
+task, one Archive at a time. Then:
 
-Key architectural changes:
-- Replaced `ureq` (blocking HTTP) with `reqwest` (async HTTP with Tokio)
-- `main` is now `async fn main()` driven by the Tokio multi-threaded runtime
-- Downloads use async I/O — threads are released during network waits
-- WARC parsing (CPU-bound) runs on Tokio's blocking thread pool via `spawn_blocking`
-- `futures::stream::buffer_unordered` provides bounded concurrency
-- `Arc<Regex>` shares the compiled regex across concurrent tasks
+- `--jobs` defaults to the number of logical CPUs, and `--limit` to no limit.
+- Each Archive reports its download and parse times, and the summary their averages.
+- `reqwest` uses `rustls` instead of OpenSSL, so building needs no system TLS library:
+  `reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }`.
 
 ### Rust concepts introduced
 
-**`async`/`await` — cooperative multitasking**
-Async functions return `Future`s — values that represent incomplete computation. When
-you `.await` a future, the current task *suspends* and yields control back to the
-runtime, which can then run other tasks on the same thread. This is cooperative
-multitasking: tasks voluntarily give up the thread at `.await` points, unlike OS threads
-where the scheduler preempts them. The key benefit: thousands of concurrent I/O operations
-can share just a few OS threads, because most are waiting for network/disk, not using CPU.
+**`async` / `await`**
+An `async fn` returns a `Future`, a computation not yet finished. `.await` suspends the task and
+hands the thread back to the runtime, which runs another task meanwhile, so thousands of network
+waits share a few threads.
 
-**Tokio runtime — the async executor**
-Async code doesn't run by itself — it needs an *executor* to poll futures to completion.
-`#[tokio::main]` sets up a multi-threaded Tokio runtime (one worker thread per CPU core
-by default) and drives our `async fn main()` on it. The runtime manages task scheduling,
-I/O event notification (via `epoll`/`kqueue`), and timer events. It's the engine that
-makes `.await` actually work.
+**The Tokio runtime**
+Futures need an executor to poll them. `#[tokio::main]` starts a multi-threaded runtime (one
+worker per core) that schedules tasks and wakes them on I/O events (`epoll`, `kqueue`) and
+timers.
 
-**`spawn_blocking` — bridging sync and async worlds**
-Not everything can (or should) be async. The `warc` crate is synchronous and does
-CPU-heavy work (gzip decompression + parsing). Running this directly on an async worker
-thread would block it, starving other async tasks. `tokio::task::spawn_blocking` moves
-the work to a separate thread pool designed for blocking operations. The async task
-suspends at `.await` until the blocking work completes, keeping the async threads free.
-Rule of thumb: if a function does CPU work or blocking I/O for more than a few
-microseconds, use `spawn_blocking`.
+**`spawn_blocking`**
+CPU-heavy or blocking work on an async worker stalls every task sharing that thread.
+`tokio::task::spawn_blocking` moves it to a pool meant for blocking, and the async task awaits
+the result. Rule of thumb: anything that blocks for more than a few microseconds.
 
-**`reqwest` — async HTTP streaming**
-`reqwest` is Tokio-native: its `.send().await` releases the thread during the entire
-HTTP request/response cycle. The response body is consumed chunk-by-chunk with
-`.chunk().await`, where each `.await` releases the thread during network waits. Compare
-with `ureq` where the thread sits blocked during the entire transfer. For concurrent
-downloads, async means 4 downloads sharing 1 thread vs. 4 downloads needing 4 blocked
-threads.
+**`reqwest` streaming**
+`.send().await` and each `.chunk().await` release the thread while the network is slow, where
+four `ureq` downloads held four blocked threads.
 
-**`buffer_unordered(N)` — bounded concurrent stream processing**
-`futures::stream::buffer_unordered(N)` is a stream combinator that polls up to N futures
-simultaneously, yielding results as each completes (not in submission order). When one
-finishes, the next pending future starts. This gives us bounded concurrency without
-manual semaphore management. "Unordered" is key: a fast download isn't held up waiting
-for a slow one just because the slow one started first.
+**`buffer_unordered(N)`**
+A stream combinator that polls up to N futures at once and yields each result as it finishes,
+not in submission order, so a fast download never waits for a slow one: bounded concurrency
+without a semaphore.
 
-**`Arc<T>` — atomic reference counting for shared ownership**
-Each concurrent task needs access to the compiled regex and HTTP client. Normal references
-(`&Regex`) won't work because Tokio tasks require `'static` lifetimes (they could outlive
-the spawning scope). `Arc` (Atomic Reference Count) wraps a value in a thread-safe smart
-pointer: `Arc::clone()` is cheap (just increments an atomic counter), and the inner value
-is dropped when the last `Arc` goes away. `Arc` provides shared *immutable* access — for
-shared mutable state you'd combine it with a `Mutex` (`Arc<Mutex<T>>`), but we avoid that
-by merging results sequentially on the main task.
+**`Arc<T>`**
+Tokio tasks need `'static` data, so they can't borrow from `main`. `Arc` (atomic reference
+count) gives a value several owners: `Arc::clone` increments a counter, and the value is dropped
+with the last `Arc`. It shares read-only access; mutation would need `Arc<Mutex<T>>`, which
+merging on the main task avoids.
 
-**`pin_mut!` — pinning streams for polling**
-Async streams must be "pinned" (guaranteed not to move in memory) before they can be
-polled. `futures::pin_mut!` pins a value to the stack. This is a detail of Rust's async
-model: because futures are state machines that contain self-references, moving them after
-creation would invalidate those references. Pinning is the compiler's guarantee that this
-won't happen.
+**Pinning: `pin_mut!`**
+A future is a state machine that may point into itself, so it must not move once polled.
+`futures::pin_mut!` pins a stream on the stack before it is polled.
 
-**Concurrent work, sequential merging**
-The pipeline is concurrent for downloads and parsing, but result merging (updating the
-HashMap, writing files) is sequential on the main task. This avoids locks and race
-conditions entirely — the simplest correct approach. This is a common async pattern:
-fan out for independent work, fan in for shared state updates.
+**Fan out, fan in**
+Independent work runs concurrently; shared state (the results, the files) is updated on one
+task, in sequence: no locks, no races.
 
-### Dependencies changed
-
-- **Removed `ureq`**: blocking HTTP client, replaced by async `reqwest`
-- **Added `reqwest`**: async HTTP client native to Tokio, with streaming body support
-- **Added `tokio`**: the async runtime (multi-threaded executor, async I/O, timers,
-  blocking thread pool). Features: `rt-multi-thread`, `macros`, `fs`, `sync`
-- **Added `futures`**: stream utilities (`StreamExt`, `pin_mut!`, `buffer_unordered`)
-  that complement Tokio's core functionality
+**`available_parallelism` and `Instant`**
+`std::thread::available_parallelism()` returns the logical CPU count as a `NonZeroUsize`
+(at least 1; `.get()` gives the `usize`), replacing the `num_cpus` crate. `Instant::now()` and
+`.elapsed()` measure time on a monotonic clock, which NTP can't move backwards.
 
 ---
 
-## Additional Improvements
+## After 1.0.0: `clap`, Gzip Paths Files, a Library Crate
 
-### Smarter defaults for `--jobs` and `--limit`
+### What we built
 
-**Auto-detect CPU cores for `--jobs`** — The initial default of 4 concurrent jobs was
-an arbitrary constant. Replaced with `std::thread::available_parallelism()`, which
-queries the OS for the number of logical CPUs (hardware threads). The program now
-scales to the machine it runs on: a 16-core server uses 16 jobs, a 4-core laptop
-uses 4. Falls back to 1 if detection fails (e.g. constrained containers).
+- A `clap` derive struct replaces the hand-written argument loop; the paths file is a required
+  positional argument.
+- A paths file ending in `.gz`, as Common Crawl publishes them, is decompressed as it is read.
+- `main.rs` keeps the CLI and the orchestration; the rest moves to `lib.rs`.
 
-**`std::thread::available_parallelism()` — runtime hardware detection**
-Returns `Result<NonZeroUsize>` — a safe, non-panicking query with no side effects.
-It's the standard library's replacement for the `num_cpus` crate (stable since Rust
-1.59). `NonZeroUsize` guarantees the value is at least 1, and `.get()` converts it
-to a plain `usize`.
+### Rust concepts introduced
 
-**Remove processing limit** — The initial default of `--limit 1` meant the program
-only processed one archive per run unless explicitly overridden. Changed to unlimited
-by default (internally `limit = 0`, with the limit check guarded by `limit > 0`).
-The program now processes all unprocessed URIs in the paths file, which is the
-expected behavior for a batch processing tool. `--limit N` remains available for
-testing or resource-constrained runs.
-
-### Per-archive timing instrumentation
-
-Added wall-clock timing for each archive's download and parse phases using
-`std::time::Instant`. Each archive now reports its download time and parse time
-individually. The final summary includes average download and parse times across
-all processed archives, giving visibility into where time is spent.
-
-**`std::time::Instant` — monotonic clock for benchmarking**
-`Instant::now()` captures a point in time. `start.elapsed()` returns a `Duration`
-representing the wall-clock time since that instant. Unlike system clocks,
-`Instant` is monotonic — it never goes backwards (e.g. due to NTP adjustments),
-making it safe for measuring elapsed time. `Duration::as_secs_f64()` converts
-to a floating-point seconds value for display.
-
-### Portable TLS with `rustls`
-
-The default `reqwest` configuration uses OpenSSL for TLS, which requires system
-packages (`libssl-dev`, `pkg-config`) that may not be present on minimal Linux
-installations or Docker images. Switched to `rustls` — a pure-Rust TLS implementation:
-
-```toml
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-```
-
-This eliminates the system dependency entirely. The binary compiles on any platform
-with just the Rust toolchain, consistent with the project's portability goal.
-
----
-
-## Post-1.0.0: CLI, Gzip Paths, and Code Structure
-
-### `clap` derive for CLI argument parsing
-
-Replaced the hand-rolled `while` loop argument parser (~50 lines of repetitive
-`strip_prefix` / `==` checks) with `clap`'s derive macro. The entire CLI definition
-is now a struct with attributes:
+**`clap` derive**
+`#[derive(Parser)]` on a struct generates the parser: a field without `short`/`long` is
+positional, `#[arg(short, long)]` makes a flag, a `String` without a default is required, and
+types are parsed and `--help` written for free. `///` comments become the help text, so notes
+for the reader of the code use `//`.
 
 ```rust
 #[derive(Parser)]
-#[command(name = "onion-crawler")]
-#[command(about = "Extract .onion addresses from Common Crawl WARC archives")]
 struct Config {
     /// Path to the WARC-paths file (supports .gz)
     input: String,
-
     /// Maximum number of archives to process (default: all)
     #[arg(short, long)]
     limit: Option<usize>,
-
-    /// Number of concurrent download+parse tasks
-    #[arg(short, long, default_value_t = default_jobs())]
-    jobs: usize,
-
-    /// Delete archive files after parsing
-    #[arg(short, long)]
-    delete: bool,
 }
 ```
 
-### Rust concepts introduced
+**`Option` and `if let`**
+`limit: Option<usize>` puts "maybe absent" in the type, where `0` meant "no limit" before.
+`if let Some(limit) = config.limit { ... }` runs the block only for `Some`, with `limit` bound
+inside it.
 
-**`clap` derive macro — declarative CLI definitions**
-`#[derive(Parser)]` generates all argument parsing code from the struct definition.
-Each field becomes a CLI argument: positional fields (no `#[arg]` with `short`/`long`)
-are positional arguments, fields with `#[arg(short, long)]` become flags. `clap`
-handles `--flag value`, `--flag=value`, `-f value`, type parsing, error messages,
-and `--help` generation automatically.
-
-**`///` doc comments as help text**
-`clap` turns doc comments (`///`) on struct fields into the `--help` descriptions.
-This is why the struct-level explanation uses regular comments (`//`) instead —
-otherwise `clap` would include those in the help banner too. The `#[command(about)]`
-attribute explicitly sets the one-line program description shown in `--help`.
-
-**`Option<usize>` for optional arguments**
-`limit` is `Option<usize>` instead of the previous `usize` with 0-means-unlimited.
-`Option` is Rust's way of expressing "this value may or may not be present" — it's
-either `Some(value)` or `None`. This is more expressive than sentinel values (0, -1)
-because the type itself encodes the possibility of absence.
-
-**`if let Some(x)` — pattern matching on `Option`**
-To check and extract an `Option` value in one step:
-```rust
-if let Some(limit) = config.limit {
-    if work_items.len() >= limit { break; }
-}
-```
-`if let` tries to match the right side against the pattern on the left. If
-`config.limit` is `Some(5)`, the pattern matches and `limit` is bound to `5` as
-a new local variable scoped to the block. If it's `None`, the block is skipped.
-This replaces the previous `if config.limit > 0 && ...` guard. The variable `limit`
-doesn't exist before this line — it's created by the pattern match, similar to how
-function parameters are created from passed arguments.
-
-**Required positional argument**
-The input paths file changed from a hardcoded default (`"warc.paths"`) to a required
-positional argument. With `clap`, a `String` field without `default_value` is required —
-running the program without it shows a clear error message. This is better for
-explicitness: the user always knows which file is being processed.
-
-### Gzip-compressed paths file support
-
-Common Crawl distributes `warc.paths.gz` files. Rather than requiring manual
-decompression, the program now detects `.gz` extensions and decompresses transparently:
-
-```rust
-let reader: Box<dyn BufRead> = if config.input.ends_with(".gz") {
-    let decoder = libflate::gzip::Decoder::new(file)?;
-    Box::new(BufReader::new(decoder))
-} else {
-    Box::new(BufReader::new(file))
-};
-```
-
-**`Box<dyn BufRead>` — trait objects for runtime polymorphism**
-The two branches return different concrete types (`BufReader<Decoder<File>>` vs
-`BufReader<File>`), but both implement `BufRead`. `Box<dyn BufRead>` is a trait
-object — a heap-allocated pointer to *any* type implementing `BufRead`. This lets
-us assign either branch to the same variable. The `dyn` keyword means "dynamic
-dispatch": method calls go through a vtable (function pointer table) at runtime,
-unlike generic code which is resolved at compile time. The tiny runtime cost is
-irrelevant here since we read the paths file once at startup.
+**`Box<dyn BufRead>`**
+A gzip reader and a plain reader are different types; boxing either as a `dyn BufRead` lets one
+variable hold both. Calls go through a vtable at runtime, a cost that doesn't matter for a file
+read once.
 
 **Reusing transitive dependencies**
-`libflate` was already compiled as a transitive dependency of the `warc` crate.
-Adding `libflate = "1"` to `Cargo.toml` just makes it directly importable — no
-new download or compilation needed. This is a practical Rust tip: check `cargo tree`
-before adding a new crate — the functionality you need might already be in the
-dependency tree.
+`libflate` was already compiled for the `warc` crate; listing it in `Cargo.toml` only made it
+importable. `cargo tree` shows what is already there.
 
-### Binary + library crate structure
-
-Split the single `main.rs` into two files:
-- **`src/main.rs`** — CLI parsing with `clap` and pipeline orchestration (the coordinator)
-- **`src/lib.rs`** — all feature code: download, WARC parsing, state management
-
-**Why this structure?**
-Rust supports having both a binary (`main.rs`) and a library (`lib.rs`) in the same
-package. The binary is the executable entry point; the library holds reusable code.
-`main.rs` imports from the library using the crate name: `use onion_crawler::{...}`.
-This separation makes the code easier to navigate — the coordinator logic is separate
-from the feature implementations — and the library code could be reused by other
-binaries or tests.
-
-**`pub` visibility**
-Functions and constants in `lib.rs` that `main.rs` needs must be marked `pub` (public).
-By default, items in Rust are private to their module. `pub` makes them accessible from
-outside the crate. This is Rust's encapsulation: the library controls exactly what it
-exposes.
+**A binary and a library in one package; `pub`**
+`main.rs` imports the library by crate name. Items are private to their module unless `pub`, so
+the library decides what it exposes, and tests and other binaries can use it too.
 
 ---
 
-## Step 7: Ripgrep-Style Parsing Strategies
+## Step 7: Ripgrep-Style Parsing
 
 ### What we built
 
-Four progressively optimized parsing strategies inspired by how ripgrep achieves its
-speed, selectable at runtime via `-s` / `--strategy`. Each strategy produces identical
-results but uses different techniques, so they can be benchmarked against each other on
-the same archive. The default strategy (`memchr`) processes an 864MB archive in ~5.6s
-— down from ~16s with the baseline.
-
-| Strategy | Parser | Search | Performance |
-|----------|--------|--------|-------------|
-| `baseline` | `warc` crate | `regex::Regex` on UTF-8 `String` | ~16s/GB |
-| `bytes` | Custom streaming | `regex::bytes::Regex` on `&[u8]` | ~1.5-2x faster |
-| `memchr` | Custom streaming | SIMD `memmem` literal search | ~3-5x faster |
-| `mmap` | Custom slice (mmap) | SIMD `memmem` + zero-copy bodies | ~3-6x faster |
-
-Two new modules were added:
-- **`src/warc_parser.rs`** — Custom byte-level WARC parser (streaming + mmap slice)
-- **`src/onion_search.rs`** — Onion extraction strategies (regex-bytes, memchr)
+Techniques from ripgrep, each measurable on its own: a WARC parser of our own
+(`src/warc_parser.rs`), search on raw bytes, a SIMD search for the literal `.onion`
+(`src/onion_search.rs`), memory-mapped parsing, and SIMD gzip decompression. An 864 MB Archive
+went from ~16 s to ~5.6 s. They were four `--strategy` values (`baseline`, `bytes`, `memchr`,
+`mmap`), which Steps 12 and 13 split into the two choices they mixed: the Transport
+(`-t disk|memory|mmap`) and the onion engine (`--onion-engine memchr|regex`).
 
 ### Rust concepts introduced
 
-**`regex::bytes::Regex` — searching raw bytes without UTF-8 conversion**
-The `regex` crate has two modules most people don't know about: `regex::Regex` searches
-`&str` (requires valid UTF-8), while `regex::bytes::Regex` searches `&[u8]` (arbitrary
-bytes). ripgrep uses `regex::bytes` exclusively because real-world files contain invalid
-UTF-8. By searching `&[u8]` directly, the `bytes` strategy eliminates the
-`String::from_utf8_lossy()` allocation that the baseline makes for every record body —
-instead of converting hundreds of KB per record to a `String`, we search the raw bytes
-and only convert the 22-62 byte match.
+**`regex::bytes::Regex`**
+`regex::Regex` searches `&str`, valid UTF-8 only; `regex::bytes::Regex` searches any `&[u8]`.
+Searching the raw bytes saves converting each record body to a `String`: only the match, 22 to
+62 bytes, is converted.
 
-**`memchr::memmem::Finder` — SIMD-accelerated literal search**
-The core technique behind ripgrep's speed. `memmem::Finder::new(b".onion")` compiles a
-SIMD-accelerated searcher that scans bytes at 16-32 bytes per CPU cycle (SSE2/AVX2 on
-x86_64, NEON on ARM). Instead of running the regex NFA/DFA engine on every byte of every
-record body, we jump directly to `.onion` occurrences and validate the surrounding bytes
-with cheap comparisons. Since `.onion` is rare in typical web content (0-2 matches per
-50-500 KB body), the validator almost never runs.
+**`memchr::memmem::Finder`: find the literal, then validate**
+ripgrep's key idea: take the literal every match contains (`.onion`), find it with SIMD (16 to
+32 bytes per cycle with SSE2/AVX2 or NEON), and check the bytes around each hit with plain
+comparisons. `.onion` is rare (0 to 2 hits per 50 to 500 KB body), so the check almost never
+runs.
 
-This is ripgrep's key insight applied: **extract literal substrings from the regex
-pattern, use SIMD to find candidates, then validate only those positions.** Our pattern
-`\b[a-z2-7]{16,56}\.onion\b` has the fixed literal `.onion`, making it a perfect
-candidate for this optimization.
+**`#[inline(always)]`**
+For tiny predicates in hot loops (`is_onion_char`), it asks the compiler to inline the body at
+every call site, across modules too: no call, and the code is optimized within the loop.
 
-**`#[inline(always)]` — controlling function inlining**
-For tiny predicate functions like `is_onion_char(b: u8) -> bool` that are called in hot
-loops, `#[inline(always)]` tells the compiler to inline the function body at every call
-site. This eliminates function-call overhead (register push/pop, jump) and lets the
-compiler optimize the inlined code within the loop context — e.g., keeping the byte value
-in a register instead of passing it on the stack. Without the hint, the compiler might
-not inline across module boundaries.
+**Parse only what you need**
+The `warc` crate parses every header with `nom` into a `HashMap` per record. `WarcRecordIter`
+keeps only `WARC-Type` and `Content-Length` and skips other records' bodies through a stack
+buffer, so ~60 % of the decompressed data never reaches the heap. `parse_ascii_usize` reads
+`Content-Length` with a loop over ASCII digits, without the UTF-8 check, error type and generic
+dispatch of `str::parse`.
 
-**Custom `BufRead`-based WARC parser — selective parsing**
-The `warc` crate (v0.4) parses ALL headers with `nom` and allocates a `HashMap` per
-record. Our custom `WarcRecordIter` reads headers line-by-line and only extracts
-`WARC-Type` and `Content-Length` — everything else is ignored with zero allocation. For
-non-response records (request, metadata, warcinfo — ~60% of all records), the body is
-skipped entirely by reading and discarding `content_length` bytes through a stack buffer.
-This means ~60% of the decompressed data is never read into heap memory.
+**`memmap2::Mmap` and `unsafe`**
+Mapping a file puts its bytes in the process's address space: pages load on access, and body
+slices point into the mapping, uncopied. Gzip must be decompressed first, so the mmap path
+writes a decompressed copy, 3 to 5 times the Archive's size. `Mmap::map` is `unsafe` because
+another process could change the file while it is mapped, which the compiler can't rule out;
+`unsafe` means "the programmer upholds this", stated in a comment, in a block kept small.
 
-**`memmap2::Mmap` — memory-mapped file I/O**
-Memory mapping makes the OS map a file's contents directly into the process's virtual
-address space. Instead of explicit `read()` syscalls, data access happens through page
-faults handled by the kernel's virtual memory system. Benefits: zero-copy body slices
-(`&[u8]` into the mapped region, no `Vec<u8>` allocation), efficient page cache usage,
-and no read syscalls. The trade-off: gzip is a streaming format, so we must decompress
-the entire archive to a temporary file first, then mmap that. This costs disk space
-(~3-5x the compressed size) but enables the zero-copy parsing.
+**Zero-copy parsing: `WarcSliceIter`**
+On one contiguous `&[u8]`, the parser returns body slices instead of `Vec<u8>`s and finds the
+`\r\n\r\n` ending each header block with `memmem`. The streaming parser can't: it reuses its
+buffer.
 
-**`unsafe` blocks — controlled unsafety for `mmap`**
-`memmap2::Mmap::map()` requires an `unsafe` block because the OS could theoretically
-modify the mapped file while we're reading it (another process could write to it),
-causing undefined behavior. We document why our usage is safe: we created the temp file
-and no other process modifies it. `unsafe` doesn't mean "dangerous" — it means "the
-programmer is responsible for upholding invariants the compiler can't verify." Keeping
-`unsafe` blocks small and well-documented is idiomatic Rust.
-
-**`WarcSliceIter` — zero-copy parsing on contiguous slices**
-When data is in a contiguous `&[u8]` (from mmap), we can use a different parser that
-returns `&[u8]` body slices instead of owned `Vec<u8>`. This is zero-copy: the body
-bytes stay in the OS page cache and are never copied to the heap. The slice parser also
-uses `memmem` to find `\r\n\r\n` header boundaries (faster than line-by-line reading on
-contiguous data). This is only possible when the entire decompressed content is available
-at once — the streaming parser can't do this because buffers get reused.
-
-**`flate2` with `zlib-ng` — SIMD-optimized decompression**
-The default `flate2` backend is `miniz_oxide` (pure Rust). Switching to `zlib-ng` — a
-heavily SIMD-optimized C library for inflate — gave a significant decompression speedup.
-Since gzip decompression is the bottleneck for all strategies (not the search), this
-benefits every strategy equally:
+**`flate2` with `zlib-ng`**
+Decompression bounds every Transport, so the SIMD-optimized zlib-ng backend speeds all of them.
+It is built from C source, needing a C compiler and `cmake`; `libflate` stays for paths files.
 
 ```toml
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 ```
 
-This links against zlib-ng built from source via `cmake`. It requires a C compiler and
-cmake on the build machine, which is a trade-off for portability. The `libflate` crate
-is kept for paths-file decompression (small files where performance doesn't matter).
-
-**`clap::ValueEnum` — type-safe enum CLI arguments**
-`#[derive(ValueEnum)]` on the `Strategy` enum lets `clap` parse strategy names directly
-from the CLI (`--strategy memchr`). The derive macro auto-generates the list of valid
-values for `--help` and provides compile-time exhaustive matching in the dispatch code.
-Doc comments on enum variants become the help text for each option.
-
-**Manual ASCII digit parsing — avoiding hidden costs**
-`Content-Length` values in WARC headers are always ASCII digits. `parse_ascii_usize()`
-converts them to `usize` with a direct arithmetic loop instead of `str::parse::<usize>()`.
-This avoids: (1) UTF-8 validation (we know it's ASCII), (2) error type construction
-(we return 0 for malformed input), (3) generic trait dispatch. For a hot path called
-hundreds of thousands of times per archive, these micro-optimizations compound.
-
-### Architecture: why four strategies, not just the fastest?
-
-This is a teaching project. Having all four strategies in the same binary lets you:
-1. **Benchmark each optimization in isolation** — run the same archive with `-s baseline`
-   then `-s memchr` and compare timing directly
-2. **Understand what each technique buys** — the speedup from `baseline` to `bytes` is
-   purely about avoiding UTF-8 conversion; from `bytes` to `memchr` is about replacing
-   regex with SIMD literals
-3. **See the trade-offs** — `mmap` is theoretically fastest but needs 3-5x disk space
-   for the temp file and requires `unsafe`; `memchr` is nearly as fast with no downsides
-
-Runtime selection via CLI flag (not cargo features) means you build once and benchmark
-all four strategies without recompiling. The binary size cost of including all four is
-negligible.
-
-### Dependencies added
-
-- **`memchr`**: SIMD-accelerated byte/substring search — the engine behind ripgrep's
-  literal optimization. Provides `memmem::Finder` for searching byte slices.
-- **`memmap2`**: Memory-mapped file I/O. Maps files into virtual memory for zero-copy
-  access via `&[u8]` slices.
-- **`flate2`** (with `zlib-ng`): Gzip decompression wrapping the SIMD-optimized zlib-ng
-  C library. Replaces `libflate` for the custom parser's decompression path.
+**`clap::ValueEnum`**
+`#[derive(ValueEnum)]` lets `clap` parse an enum's variants as an option's values and list them
+in `--help`, each variant's doc comment as its help.
 
 ---
 
-## Step 8: WARC Metadata Extraction
+## Step 8: The Page and Date of Each Onion
 
 ### What we built
 
-Rich source context for every `.onion` address found. Previously, each onion mapped to
-a list of archive filenames (just "which WARC file"). Now each onion maps to a list of
-`OnionSource` structs containing three fields:
-
-- **`url`** — the clearnet page URL where the onion address appeared (from `WARC-Target-URI`)
-- **`date`** — when Common Crawl fetched that page (from `WARC-Date`)
-- **`archive`** — which WARC archive file contained the record
-
-This answers not just "which archive" but "which specific page, and when was it crawled?"
-— much more useful for analysis. The output format changed from flat to nested JSON:
-
-```json
-{
-  "example1234567890.onion": [
-    {
-      "url": "https://example.com/links",
-      "date": "2024-09-15T12:34:56Z",
-      "archive": "CC-NEWS-20240915.warc.gz"
-    }
-  ]
-}
-```
-
-Results are deduplicated on `(url, archive)` pairs — the same onion found on the same
-page in the same archive is recorded only once.
+Each onion maps to where it was seen: the page URL (`WARC-Target-URI`), the crawl date
+(`WARC-Date`) and the Archive, deduplicated on (URL, Archive). Both parsers read the two
+headers: as owned `String`s when streaming, as `&[u8]` slices into the mapping on the mmap path.
+Step 12 turned the record into `Sighting { page_url, date, shard }`, shared by every kind.
 
 ### Rust concepts introduced
 
-**`#[derive(Serialize, Deserialize)]` — serde derive macros**
-The `serde` crate provides Rust's standard serialization framework. Adding
-`#[derive(Serialize, Deserialize)]` to a struct auto-generates all the code needed to
-convert it to/from any supported format (JSON, TOML, YAML, etc.) at compile time. The
-struct field names become the JSON keys directly. This is zero-cost at runtime — the
-generated code is as efficient as hand-written serialization. We use `Serialize` in
-`save_results()` (struct → JSON) and `Deserialize` in `load_results()` (JSON → struct).
-
-**`serde` — serialize + deserialize framework**
-`serde` itself is format-agnostic — it defines the `Serialize` and `Deserialize` traits
-that describe how a type converts to/from an abstract data model. The actual format
-encoding comes from companion crates like `serde_json`. This separation means the same
-`#[derive(Serialize)]` works for JSON, TOML, MessagePack, etc. without changing the
-struct. Previously we didn't need derive macros because `HashMap<String, Vec<String>>`
-has blanket `Serialize` implementations — but custom structs like `OnionSource` need
-the derive.
-
-**Backwards-compatible deserialization with `unwrap_or_default`**
-When the output format changes (from `HashMap<String, Vec<String>>` to
-`HashMap<String, Vec<OnionSource>>`), old JSON files won't parse into the new type.
-Instead of crashing, `load_results()` uses `serde_json::from_str(&content).unwrap_or_default()`,
-which falls back to an empty `HashMap` if deserialization fails. This is a practical
-pattern for evolving data formats: the first run after the format change reprocesses
-archives (since their onions aren't in the new results), and old results are silently
-replaced rather than causing errors.
-
-**Extracting WARC headers from the custom parser**
-The custom `WarcRecordIter` (streaming) and `WarcSliceIter` (mmap) were extended to
-extract `WARC-Target-URI` and `WARC-Date` headers alongside the existing `WARC-Type`
-and `Content-Length`. The streaming parser stores them as owned `String` fields in
-`WarcRecord`; the slice parser stores them as borrowed `&[u8]` slices in `WarcSlice`
-(zero-copy from the mmap region). The baseline strategy reads the same headers from
-the `warc` crate via `record.header(warc::WarcHeader::TargetURI)`.
-
-**`Clone` derive for shared references in search functions**
-`OnionSource` derives `Clone` because the same source metadata may be referenced
-multiple times when a single WARC record body contains multiple distinct onion
-addresses. Each match gets its own copy of the source. For small structs (three
-`String` fields), cloning is cheap — the alternative (wrapping in `Rc` or `Arc`)
-would add complexity for negligible benefit.
-
-### What's next
-
-In-memory streaming mode to eliminate disk I/O from the pipeline.
+**`serde` and `#[derive(Serialize, Deserialize)]`**
+`serde` defines traits describing a type in an abstract data model, and companion crates
+(`serde_json`, `toml`, ...) write the formats. The derive generates that code at compile time,
+as fast as hand-written, field names becoming JSON keys. A struct of our own needs it, where
+`HashMap` and `Vec` didn't.
 
 ---
 
-## Step 9: In-Memory Streaming Mode (`--stream`)
+## Step 9: Parsing from Memory; Resource Guards
 
 ### What we built
 
-A `--stream` / `-m` CLI flag that downloads archives into memory instead of to disk,
-then parses directly from the in-memory buffer. The entire download/parse pipeline
-runs without touching the filesystem — no `download/` directory needed.
-
-The pipeline changes from:
-```
-HTTP chunks → write to disk → read from disk → decompress → parse
-```
-to:
-```
-HTTP chunks → collect in Vec<u8> → decompress from memory → parse
-```
-
-Three new functions in `lib.rs`:
-- `download_warc_to_memory` — streams HTTP chunks into a `Vec<u8>` instead of a file
-- `parse_warc_bytes_from_memory` — `Cursor<Vec<u8>>` → `MultiGzDecoder` → `WarcRecordIter` → regex search
-- `parse_warc_memchr_from_memory` — same pipeline with `memmem::Finder` search
-
-Compatible with `bytes` and `memchr` strategies only. Incompatible strategies
-(`baseline` — warc crate needs a file path; `mmap` — memory mapping needs a file
-descriptor) print a warning and fall back to disk mode automatically.
+`--stream` downloaded an Archive into a `Vec<u8>` and parsed it there, writing nothing to disk;
+it is `-t memory` since Step 13. With ~1 GB per job, many such jobs could exhaust RAM, so the
+number of jobs is capped at startup by the CPUs and, in memory, by the available RAM.
 
 ### Rust concepts introduced
 
-**`std::io::Cursor<T>` — the adapter pattern**
-`Cursor` wraps any `AsRef<[u8]>` type (like `Vec<u8>`) and implements `Read` + `Seek`,
-making it interchangeable with a `File`. This is trait-based polymorphism in action:
-`MultiGzDecoder<R: Read>` doesn't care whether `R` is a `File` or a `Cursor<Vec<u8>>`
-— it just calls `.read()`. The same interface, different backing store. This is why
-`WarcRecordIter<R: BufRead>` works seamlessly with both — the generic constraint was
-already in place from Step 7, so adding in-memory support required zero changes to the
-parser.
+**`std::io::Cursor`**
+Wraps a `Vec<u8>` (any `AsRef<[u8]>`) as a `Read` + `Seek`, like a `File`. `MultiGzDecoder<R:
+Read>` and `WarcRecordIter<R: BufRead>` were already generic, so reading from memory needed no
+change to the parser.
 
-**Ownership transfer with `move` into `spawn_blocking`**
-When we call `spawn_blocking(move || parse_warc_memchr_from_memory(data, &filename))`,
-the `data: Vec<u8>` (potentially 800 MB) is *moved* from the async task to the blocking
-thread. This is a zero-cost operation — Rust moves the pointer, length, and capacity
-(3 machine words), not the 800 MB of data. After the move, the async task no longer
-owns the buffer, and the compiler rejects any attempt to use it. This is a concrete
-example of why Rust's ownership model exists: the compiler prevents use-after-move at
-compile time, which would be a dangling-pointer bug in C/C++.
+**Moving into `spawn_blocking`**
+`spawn_blocking(move || parse(data))` hands the 800 MB `Vec` to the blocking thread by copying
+three words (pointer, length, capacity), never the bytes. The async task can't touch it
+afterwards; use after move, a dangling pointer in C, doesn't compile.
 
-**`Vec::with_capacity` — pre-allocation**
-When `Content-Length` is available from the HTTP response, we pre-allocate the buffer
-to the exact size: `Vec::with_capacity(total_size as usize)`. Without this, `Vec`
-uses geometric growth — it doubles capacity each time it runs out of space. For an
-800 MB download, that means approximately 30 reallocations, each copying all existing
-data to a new, larger allocation. Pre-allocating does it in one shot. This is a general
-Rust pattern: when you know the approximate size upfront, always use `with_capacity`.
+**`Vec::with_capacity`**
+With the `Content-Length` known, the buffer is allocated once at full size, where growing by
+doubling would reallocate and copy ~30 times on the way to 800 MB.
 
-**Graceful degradation — warning + fallback**
-When `--stream` is used with an incompatible strategy, we don't error out. Instead,
-we print a warning to stderr and fall back to disk mode. This is a good CLI UX pattern:
-the user's intent (parse this archive) is still achievable, just via a different path.
-The strategy incompatibility is a limitation, not a user error.
+**`#[cfg(target_os = "...")]`**
+Conditional compilation, checked by the compiler: the source has three `get_available_memory()`
+(macOS, Linux, fallback), and exactly one is compiled.
 
-**`Option<Vec<u8>>` for conditional data flow**
-The pipeline uses `Option<Vec<u8>>` to represent the in-memory buffer: `Some(buffer)`
-in stream mode, `None` in disk mode. The `spawn_blocking` closure then matches on
-`(strategy, memory_buffer)` — a tuple pattern match that dispatches to the right parse
-function based on both the strategy choice and whether we have in-memory data. This
-is idiomatic Rust: using the type system to make invalid states unrepresentable.
+**Asking the OS for free memory**
+macOS: `std::process::Command` runs `sysctl -n <key>` (~1 ms, once, no `unsafe` or C bindings),
+counting free, speculative and purgeable pages. Linux: `MemAvailable` from `/proc/meminfo`, read
+with `strip_prefix` and `trim`.
 
-### Resource Guards (Step 9b)
-
-After adding stream mode, an edge case emerged: running many concurrent stream jobs
-could exhaust available RAM (each archive is ~800 MB–1 GB in memory). We added
-layered resource guards to cap concurrency safely.
-
-**`std::thread::available_parallelism()` — querying CPU cores**
-This returns the number of hardware threads (logical cores) as a `NonZero<usize>`.
-We use it both as the default `-j` value and to compute the CPU cap at `2× cores`.
-The 2× factor allows N downloads (async, I/O-bound) to overlap with N parses
-(CPU-bound in `spawn_blocking`) without oversubscription.
-
-**`#[cfg(target_os = "...")]` — conditional compilation**
-Rust's `#[cfg]` attribute controls which code compiles on which platform. Unlike C's
-`#ifdef`, this is checked by the compiler, so typos in target names are caught. We
-define three `get_available_memory()` implementations — macOS, Linux, and a fallback —
-and exactly one compiles into the final binary. The other two don't exist at all.
-
-**`std::process::Command` — safe alternative to FFI (macOS)**
-macOS exposes memory info through `sysctl`, a command-line tool that queries kernel
-parameters. We spawn it as a subprocess via `Command::new("sysctl").args(["-n", key])`
-and parse its stdout. This is slower than a direct C FFI call (~1 ms vs ~1 μs) but
-requires no `unsafe` and no C bindings. At startup (one-time cost), this is negligible.
-We query page size, free pages, speculative pages, and purgeable pages — the latter
-two are immediately reclaimable, giving a more realistic estimate than free pages alone.
-
-**`/proc/meminfo` — Linux pseudo-filesystem**
-On Linux, kernel state is exposed as text files under `/proc`. `/proc/meminfo` contains
-memory statistics including `MemAvailable`, which accounts for free pages, reclaimable
-caches, and kernel buffers. We parse it with `strip_prefix` + `trim` — standard string
-processing, no external dependencies.
-
-**Layered caps — defense in depth**
-The three caps apply sequentially, each reducing the job count if needed:
-1. CPU cap: `min(config.jobs, 2 × cores)` — prevents `spawn_blocking` oversubscription
-2. RAM cap: `min(capped_jobs, available_ram / 1 GB)` — prevents OOM in stream mode
-3. `buffer_unordered(effective_jobs)` — backpressure: a finished job frees its buffer
-   before the next one allocates
-
-This pattern — check once at startup, pick the most restrictive limit — avoids
-runtime polling overhead while covering the common failure modes (too many CPU tasks,
-too many in-memory buffers).
-
-### What's next
-
-Analysis and visualization of the extracted metadata — correlating clearnet URLs
-with onion addresses across crawl dates.
+**Layered caps**
+Each guard can only lower the job count: 2x the cores (N downloads overlapping N parses), then
+the RAM, then `buffer_unordered`, under which a finished job frees its buffer before the next
+one fills its own. Checked once at startup. Step 14 divides the RAM by the largest Plan instead
+of 1 GB.
 
 ---
 
 ## Step 10: Loops Instead of Recursion in `WarcRecordIter`
 
-### What we built
+`WarcRecordIter::next` skipped each unwanted record with `return self.next();`, one stack frame
+per record. A WAT Archive holds 63,523 `metadata` records in a row, a WET Archive 20,614
+`conversion` records: enough to overflow the stack. The record parse now sits in a `loop` and
+skipping is `continue`, as in `WarcSliceIter`; a test feeds 100,000 `metadata` records, then one
+`response`.
 
-`WarcRecordIter::next` used to skip each non-`response` record by calling
-`return self.next();` — one extra stack frame per skipped record. A comment claimed
-Rust would optimize the tail call away. It doesn't have to, and here it didn't: a
-sampled WAT Archive contains 63,523 consecutive `metadata` records and a sampled WET
-Archive 20,614 consecutive `conversion` records, enough to blow the stack of the
-`bytes` and `memchr` strategies (`documentation/RESEARCH-warc-wat-wet.md` §4.5).
+**No guaranteed tail calls**
+Rust doesn't promise tail-call elimination: LLVM may apply it in release builds, not in debug
+ones (`become`, for explicit tail calls, is not stable in Rust 1.91). Here the call wasn't even
+in tail position: the `String` locals `target_uri` and `date` are dropped *after* it returns, so
+the frame had to stay.
 
-The fix wraps the whole record parse in an outer `loop` and replaces the recursive
-call with `continue`, the same shape `WarcSliceIter` (mmap) already used. A new unit
-test feeds 100,000 `metadata` records followed by one `response` through the
-iterator; the old code aborts with `has overflowed its stack`, the new code yields
-exactly the one record.
+**Stack overflow aborts**
+Threads get 2 MiB of stack by default, test threads and Tokio's blocking pool included. Running
+past it prints `fatal runtime error: stack overflow` and aborts the process: not a panic,
+nothing to catch, and every concurrent job dies with it.
 
-Also deleted `src/tmp_main.rs`: an untracked, uncompiled copy of `src/main.rs` from
-commit `683b654`.
-
-### Rust concepts introduced
-
-**No guaranteed tail-call elimination**
-Some languages (Scheme, Erlang) promise that a call in tail position reuses the
-caller's stack frame, so tail recursion runs in constant stack space. Rust makes no
-such promise. LLVM *may* turn a tail call into a jump in optimized builds, but not
-in debug builds, and nothing in the language requires it. Explicit tail calls (the
-reserved `become` keyword, RFC 3407) are not available on stable Rust 1.91.
-
-**Destructors make "tail calls" not tail calls**
-`return self.next();` looks like the last thing the function does, but it isn't:
-the locals `target_uri` and `date` are `String`s, and their destructors run *after*
-`self.next()` returns. The caller's frame must stay alive to run those destructors,
-so the call is not in tail position at all. In Rust, any live value with a
-destructor quietly defeats tail-call optimization.
-
-**Stack overflow is an abort, not a panic**
-Threads spawned by Rust currently get a 2 MiB stack by default — that includes test threads
-and Tokio's `spawn_blocking` pool, where our parsers run. When recursion runs past
-the guard page at the end of the stack, the runtime prints
-`fatal runtime error: stack overflow` and aborts the whole process. Unlike a panic,
-it can't be caught or unwound, so one pathological Archive would kill every
-concurrent job.
-
-**`loop` + `continue` — the iterator skipping idiom**
-An iterator that must skip uninteresting items should loop inside `next()` until it
-finds one to return, rather than recurse. The standard library does the same:
-`Filter::next` calls `find` on the inner iterator, which loops. Stack usage is then
-constant no matter how many items are skipped, and the final value leaves the loop
-with an explicit `return`.
-
-**`break` and `continue` target the innermost loop**
-`next()` now nests the header-reading loops inside the outer record loop. A `break`
-inside an inner loop exits only that loop; the `continue` in the skip branch sits
-directly in the outer loop's body, so it restarts the record parse. When a
-`continue` or `break` needs to reach an outer loop from inside an inner one, Rust
-uses labels: `'record: loop { ... continue 'record; ... }`.
+**`loop` and `continue` to skip items**
+An iterator's `next()` loops until it has an item, as `Filter::next` does: constant stack,
+however many items it skips. `break` and `continue` act on the innermost loop; a label
+(`'record: loop { ... continue 'record; }`) reaches an outer one.
 
 ---
 
-## Step 11: Characterization Tests for the Parse Functions
+## Step 11: Characterization Tests
 
 ### What we built
 
-Integration tests that pin what the six public parse functions (`parse_warc`,
-`parse_warc_bytes`, `parse_warc_memchr`, `parse_warc_mmap`,
-`parse_warc_bytes_from_memory`, `parse_warc_memchr_from_memory`) extract today. The
-next step replaces all six with one `parse_archive`; these tests show whether that
-changes the output, and where.
-
-- `tests/common/mod.rs` -- shared helpers. `WarcBuilder` writes WARC records
-  programmatically (computed `Content-Length`, unique `WARC-Record-ID`) and gzips
-  each record as its own gzip member, as Common Crawl does. `Snapshot` turns a
-  `ParseResult` into something comparable with `==`. `parse_with_every_function`
-  runs all six functions on one Archive and `assert_all_agree` compares them.
-- `tests/parse_characterization.rs` -- a hand-built fixture Archive of 10 records
-  (`warcinfo`, then `request` / `response` / `metadata` for three pages) and three
-  tests:
-  - `fixture_yields_pinned_artifacts`: the exact onions, favicon URLs and inline
-    favicons expected from the fixture, written out by hand.
-  - `every_parse_function_agrees_on_fixture`: all six functions return the same
-    `Snapshot`.
-  - `every_parse_function_agrees_on_real_archive` (`#[ignore]`): the same check on a
-    real downloaded Archive named by `REAL_WARC_ARCHIVE`.
-
-The fixture covers an onion in an `Onion-Location` HTTP header, v2 and v3 onions in
-the body (one twice on the same page, one in uppercase), `<link rel="icon">` with a
-relative `href`, `<link rel="apple-touch-icon">`, `<meta name="msapplication-TileImage">`,
-an inline `data:image/png;base64,...` favicon, a `text/plain` response containing
-favicon markup, and an onion that only appears in `request` and `metadata` records.
-
-Current behaviour the pinned test records, right or wrong:
-
-- Onion search covers the whole HTTP response, headers included, and ignores
-  `Content-Type`.
-- Uppercase onions are not extracted: both engines match `[a-z2-7]` only.
-- Favicon search only runs on `text/html` / `application/xhtml` responses, and adds
-  a root `/favicon.ico` guess for every HTML page (to be dropped).
-- Only `response` records are searched.
-
-Known gap, not covered by the fixture: the two onion engines disagree when a
-non-ASCII letter touches the address. In `café3g2upl4pq6kufc4m.onion`, the memchr
-engine sees `é`'s bytes as a word boundary and extracts the onion; `regex`'s Unicode
-`\b` treats `é` as a word character and doesn't. The fixture stays ASCII so the
-agreement test pins what the engines share.
-
-On `CC-NEWS-20251001002341-04358.warc.gz` (1 GB) all six functions agree: 1 onion,
-6,006 favicon URLs, 2 inline favicons; 54 s for all six in a release build.
+Tests pinning what the six `parse_warc*` functions extracted, before Step 12 replaced them with
+one. `tests/common/mod.rs` builds WARC records in code (`WarcBuilder`: `Content-Length`
+computed, one gzip member per record as Common Crawl writes them) and turns results into a
+comparable `Snapshot`. `tests/parse_characterization.rs` parses a 10-record fixture, checks the
+exact Artifacts and that every way of parsing agrees, and, when asked, checks the same on a real
+Archive:
 
 ```sh
-cargo test                                   # fixture tests; real-Archive test ignored
-REAL_WARC_ARCHIVE=download/CC-NEWS-...warc.gz \
-  cargo test --release -- --ignored --nocapture
+REAL_WARC_ARCHIVE=download/CC-NEWS-...warc.gz cargo test --release -- --ignored --nocapture
 ```
+
+The pinned values included behaviour to change later (a guessed `/favicon.ico` per HTML page,
+missed uppercase onions: Steps 12 and 24). The same tests now compare every Transport and onion
+engine.
 
 ### Rust concepts introduced
 
 **Integration tests in `tests/`**
-Unit tests live next to the code in `#[cfg(test)] mod tests` and can reach private
-items. Files in `tests/` are different: Cargo compiles each one as a separate crate
-that links against the library, so it sees only `pub` items, imported by crate name
-(`use onion_crawler::parse_warc_memchr;`). That is the right level for these tests:
-they only touch the public API, so a refactor has to update them only where that API
-changes, never because of internal changes.
-Integration tests can use every crate in `[dependencies]` and `[dev-dependencies]`;
-the fixture builder uses `flate2`'s `GzEncoder` without adding anything to
-`Cargo.toml`.
+Each file in `tests/` is a crate of its own linked to the library: it sees only `pub` items, by
+crate name, so internal refactors don't break it. It may use `[dev-dependencies]`, and
+`[dependencies]` too: the fixture is gzipped with `flate2`'s `GzEncoder`.
 
-**Shared test helpers: `tests/common/mod.rs`**
-Every `.rs` file directly inside `tests/` becomes its own test binary. A helper file
-at `tests/common.rs` would therefore show up as an empty test crate. Putting it in a
-subdirectory as `tests/common/mod.rs` stops Cargo from compiling it on its own; each
-test file that needs it declares `mod common;`. Each such test file compiles its own
-copy, so a helper that one file doesn't use produces a dead-code warning in that
-crate.
+**Shared helpers in `tests/common/mod.rs`**
+Every `.rs` file directly in `tests/` becomes a test binary; a subdirectory's `mod.rs` doesn't.
+Each test file declares `mod common;` and compiles its own copy, so helpers it doesn't use warn
+as dead code; `#[allow(dead_code)] mod common;` silences that for one file.
 
 **Characterization tests**
-A characterization test asserts what code *does*, not what it *should* do. The classic
-recipe (Michael Feathers, *Working Effectively with Legacy Code*) is to run the code
-and record its output. Here the expected values were written by hand from reading the
-fixture first, and the first run confirmed them; a value only copied from a run would
-also have pinned any behaviour nobody had noticed. The pinned values include behaviour
-we plan to change (the `/favicon.ico` guess), so when the refactor changes it, the
-test diff shows exactly that line and nothing else.
+They assert what code *does*, right or wrong (Michael Feathers, *Working Effectively with Legacy
+Code*). The expected values were written by hand from the fixture, then confirmed by a run:
+values copied from a run would also pin behaviour nobody noticed. When a refactor changes
+something on purpose, the test's diff shows that line alone.
 
 **`#[ignore = "reason"]`**
-Marks a test that `cargo test` skips and lists as `ignored, <reason>`.
-`cargo test -- --ignored` runs only the ignored tests; `-- --include-ignored` runs
-everything. The real-Archive test also checks its environment variable with
-`std::env::var_os` and returns early when it is unset, so `--ignored` passes cleanly
-on a machine without a downloaded Archive.
+`cargo test` skips the test and says why; `-- --ignored` runs only ignored tests,
+`-- --include-ignored` all of them. The real-Archive test also returns early when its variable is
+unset (`std::env::var_os`).
 
 **`CARGO_TARGET_TMPDIR`**
-Cargo sets this variable when compiling integration tests and benchmarks: a scratch
-directory inside `target/`. `env!("CARGO_TARGET_TMPDIR")` reads it at compile time,
-so no temp-dir crate is needed. Tests run in parallel threads, so each one writes its
-fixture to its own subdirectory; `parse_warc_mmap` also writes a decompressed `.warc`
-next to the Archive, which must not collide either.
+A scratch directory in `target/` that Cargo gives integration tests, read at compile time with
+`env!`: no temp-dir crate. Tests run in parallel, so each writes to its own subdirectory.
 
 **Consuming builders**
-`WarcBuilder`'s methods take `self` by value and return it, so an Archive reads as one
-chain: `WarcBuilder::new().warcinfo(..).request(..).response(..).finish()`. Taking
-ownership means a half-built value can't be reused by accident after `finish()`
-consumes it.
+`WarcBuilder`'s methods take and return `self`, so an Archive is one chain
+(`WarcBuilder::new().warcinfo(..).response(..).finish()`), and `finish()` consumes it: a
+half-built value can't be reused by accident.
 
-**Comparing values the library can't compare**
-`OnionSource` and `FaviconSource` don't derive `PartialEq`, and the refactor replaces
-them anyway. Rather than change production code for the tests, the tests convert a
-`ParseResult` into their own `Snapshot` type, and each source into their own
-`Sighting`. `impl From<ParseResult> for Snapshot` is allowed in the test crate because
-the orphan rule only needs *one* side of the impl to be local: here `Snapshot` is.
-When the library types change, the conversions change but the hand-written expected
-values don't. `Snapshot` uses `BTreeMap` instead of `HashMap`: equality is the same, but
-`Debug` prints keys in sorted order, so a failure prints the same diff every time.
-
-**Generic helper with an `Into` bound**
-`OnionSource` and `FaviconSource` each get an `impl From<...> for Sighting`. One
-function then converts lists of either: `fn sightings<T: Into<Sighting>>(sources:
-Vec<T>) -> Vec<Sighting>`. Implementing `From` gives `Into` for free (the standard
-library has a blanket `impl<T, U: From<T>> Into<U> for T`), so bounds are usually
-written with `Into`, the direction the caller needs.
+**Test-side types, `From`, and the orphan rule**
+Rather than change production code, the tests convert results into their own `Snapshot`, built
+on `BTreeMap` so `Debug` prints keys sorted and a failure shows the same diff every time. The
+`From` impl is allowed in the test crate because one side, `Snapshot`, is local (the *orphan
+rule*). Implementing `From` gives `Into` for free, so bounds are written `T: Into<Sighting>`.
 
 ---
 
-## Step 12: One `parse_archive`, Extractors per Artifact Kind
+## Step 12: One `parse_archive`, One Extractor per Artifact Kind
 
 ### What we built
 
-The six `parse_warc*` functions are gone. Each one hard-wired the onion and favicon
-searches into its own copy of the record loop, so adding an Artifact kind meant editing
-all six. They are replaced by one function that only connects three independent choices:
+The six `parse_warc*` functions, each wiring the onion and favicon searches into its own copy of
+the record loop, became one function connecting three independent choices (Step 15 added the
+Format as a parameter):
 
 ```rust
 pub fn parse_archive(
-    transport: Transport,                 // how the bytes arrive
-    shard: &Shard,                        // which Shard they belong to
+    transport: Transport,                  // how the bytes arrive
+    shard: &Shard,                         // which Shard they belong to
     extractors: &mut [Box<dyn Extractor>], // what to extract
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 ```
 
-- **Transport** (`lib.rs`): `Disk(PathBuf)`, `Memory(Vec<u8>)` or `Mmap(PathBuf)`. Disk
-  and Memory share one streaming loop (`File` and `Cursor<Vec<u8>>` are both `Read`);
-  Mmap decompresses to a temporary `.warc` and uses the slice parser.
-- **Format** (`page_record.rs`): every record becomes a `PageRecord::Warc(WarcResponse)`
-  (page URL, crawl date, full HTTP response) that borrows the parser's bytes.
-  `split_http_response` / `is_html_content` moved here, behind `WarcResponse::html_body()`.
-- **Artifact kind** (`extractor.rs`): `trait Extractor` with one implementation per kind.
-  `OnionExtractor` searches the whole HTTP response, headers included, with either engine
-  (`OnionEngine::Memchr` or `OnionEngine::Regex`); `FaviconExtractor` scans HTML bodies.
-  The loop hands each record to every extractor and never names a kind.
-- **Domain types** (`artifact.rs`): `ArtifactKind`, `Shard` (the Archive file name without
-  `.warc.gz`), and `Sighting { page_url, date, shard }`, which replaces both `OnionSource`
-  and `FaviconSource`. The "same page already listed?" check, previously copied in nine
-  places, now lives in one place: `add_sightings` (during extraction) and `merge_sightings`
-  (per-Archive merge in `main`, and the `merge` subcommand) both call it.
+- **Transport** (`lib.rs`): `Disk(PathBuf)`, `Memory(Vec<u8>)` or `Mmap(PathBuf)`. Disk and
+  Memory share the streaming loop; Mmap decompresses to a copy and uses the slice parser.
+- **Format** (`page_record.rs`): each record becomes a `PageRecord::Warc(WarcResponse)`
+  borrowing the parser's bytes; `WarcResponse::html_body()` holds the HTML check.
+- **Artifact kind** (`extractor.rs`): `trait Extractor`, one implementation per kind. The loop
+  hands every record to every extractor and never names a kind.
+- **Domain types** (`artifact.rs`): `ArtifactKind`, `Shard` (the Archive name without its
+  suffix) and `Sighting { page_url, date, shard }`. The "same page already listed?" check,
+  copied in nine places, is now in one.
 
-Behaviour changes, each visible as one line in the characterization test diff:
+Behaviour changes, each one line of the characterization test's diff:
 
-- JSON shape: `{"page_url", "date", "shard"}` instead of `{"url", "date", "archive"}`;
-  `shard` drops the `.warc.gz` suffix. Existing output files are not converted, and
-  are no longer silently lost either: `load_results_from` / `load_favicons_from` used
-  to turn any file they couldn't parse into an empty map, which the next save then
-  wrote over the old results. They now return an error naming the file, and the crawl
-  stops before writing anything (`tests/output_state.rs`).
-- No root `/favicon.ico` guess for every HTML page: only declared favicons. A guessed
-  URL was never checked to exist, and nearly a third of the URLs saved were guesses.
-- Inline `data:` favicons are no longer part of the parse result. They were never saved
-  anyway; they come back as their own Artifact kind.
-- Both onion engines use ASCII word boundaries. The regex pattern is now
-  `(?-u:\b)([a-z2-7]{16}|[a-z2-7]{56})\.onion(?-u:\b)`, matching memchr's
-  `is_word_boundary_byte`. Before, `café3g2upl4pq6kufc4m.onion` was found by memchr but
-  not by the regex engine, whose Unicode `\b` counts `é` as a word character. The
-  fixture now contains such a case, and every Transport × engine pair must agree on it.
+- The JSON is `{"page_url", "date", "shard"}`, where it was `{"url", "date", "archive"}`. A
+  results file that can't be parsed stops the run with its name, where it used to load as empty
+  and be overwritten by the next save.
+- No guessed root `/favicon.ico`: never checked to exist, it was nearly a third of the URLs
+  saved.
+- Inline `data:` favicons leave the results: never saved, they return in Step 18 as a kind.
+- Both onion engines use ASCII word boundaries, `(?-u:\b)` in the regex. Before,
+  `café3g2upl4pq6kufc4m.onion` was found by memchr only, the regex's Unicode `\b` counting `é` as
+  a letter; the fixture now pins it.
+- `-s baseline` is gone: the `warc`-crate parser is the benchmark `examples/baseline.rs`.
 
-The CLI is unchanged for now: `-s bytes` means the Regex engine, `-s memchr` the Memchr
-engine, `-s mmap` the Mmap Transport with Memchr, `-m` the Memory Transport. The next
-step replaces these with `--transport` and `--onion-engine`. `-s baseline` is gone: the
-original `warc`-crate parser is now a standalone benchmark,
-
-```sh
-cargo run --release --example baseline -- download/CC-NEWS-...warc.gz
-```
-
-On `CC-NEWS-20251001002341-04358.warc.gz` (1 GB, release build) all six Transport ×
-engine pairs agree: 1 onion and 4,884 favicon URLs (6,006 before: 1,122 root `/favicon.ico`
-URLs existed only as guesses, no page declared them). Disk and Memory take ~6.3 s each, Mmap ~9.7 s (it writes
-the decompressed copy first); the baseline example finds the same onion in 15.9 s.
+On a 1 GB CC-NEWS Archive all six Transport × engine pairs agree: 1 onion, 4,884 favicon URLs
+(6,006 before, 1,122 of them guesses). Disk and Memory take ~6.3 s, Mmap ~9.7 s (it writes the
+copy first), the baseline 15.9 s.
 
 ### Rust concepts introduced
 
 **Trait objects: `Box<dyn Extractor>`**
-`OnionExtractor` and `FaviconExtractor` are different types with different sizes, so a
-`Vec` can't hold both directly. `Box<dyn Extractor>` stores each on the heap behind a
-*fat pointer*: the data pointer plus a pointer to a *vtable*, a per-type table of the
-trait's methods. `extractor.extract(record, shard)` looks the method up in that table at
-runtime (*dynamic dispatch*). Generics (`fn parse_archive<E: Extractor>`) would dispatch
-statically and inline better, but one list could then hold only one extractor type; the
-set of kinds is chosen at runtime, which is exactly what trait objects are for. The cost,
-one indirect call per record per extractor, disappears next to gzip decompression.
+Extractor types differ in size, so a `Vec` can't hold them directly. A `Box<dyn Extractor>` is
+a *fat pointer*: the data, plus a *vtable* of the type's trait methods looked up at each call
+(*dynamic dispatch*). Generics dispatch statically but allow one type per list, and the kinds
+are chosen at runtime. One indirect call per record per extractor is nothing next to gzip.
 
-**`self: Box<Self>` receivers**
-`into_sightings(self: Box<Self>) -> Sightings` consumes the extractor to move its results
-out without cloning. A plain `self` receiver needs to know the concrete type's size,
-which a `dyn Extractor` doesn't have, so such a method couldn't be called on a trait
-object. Taking `self` *through the box* works: the box has a known size, and the method
-receives ownership of the heap value.
+**`self: Box<Self>`**
+`into_findings(self: Box<Self>)` consumes the extractor to move its results out without a clone.
+A plain `self` needs the concrete type's size, which a `dyn Extractor` lacks; through the box,
+the size is known.
 
 **Enums with data**
-`Transport::Memory(Vec<u8>)` carries the downloaded bytes, `Transport::Disk(PathBuf)` the
-file to read. Each variant holds exactly what that way of reading needs, so a "memory"
-transport without bytes cannot be built and `parse_archive` has no invalid case to
-check. `match transport { Transport::Memory(data) => ... }` moves the bytes out of the
-enum and into the parser in the same step. `OnionExtractor` uses the same idea privately:
-the public `OnionEngine` is a plain choice (`Memchr` / `Regex`), turned once into an
-`OnionSearch` enum that holds the built `memmem::Finder` or compiled `Regex`.
+`Transport::Memory(Vec<u8>)` carries the bytes, `Transport::Disk(PathBuf)` the path: each variant
+holds what its way of reading needs, so an invalid Transport can't be built, and `match` moves
+the data out as it picks the branch. Privately, `OnionExtractor` turns the plain `OnionEngine`
+choice into an `OnionSearch` holding the built searcher.
 
-**Lifetimes in `PageRecord<'a>`**
-`PageRecord<'a>` holds `&'a str` and `&'a [u8]` instead of owned `String`s and `Vec`s.
-`'a` names how long the borrowed bytes live, and the compiler rejects any use of a
-`PageRecord` after its source is gone. One type now serves both parsers: on the
-streaming path it borrows the current `WarcRecord`'s buffers, on the mmap path it borrows
-a region of the mapped file. In both cases it lives for one loop iteration, and nothing is
-copied to build it. On the mmap path `String::from_utf8_lossy` returns a `Cow<str>` that
-borrows the header bytes whenever they are valid UTF-8, so even the URL is usually not
-copied (the old code called `.to_string()` on every record).
+**Lifetimes: `PageRecord<'a>`**
+`PageRecord<'a>` holds `&'a str` and `&'a [u8]` borrowed from the parser (the current record's
+buffers, or the mapping), and the compiler rejects any use after they are gone. Building one
+copies nothing; on the mmap path even the URL stays borrowed, through `from_utf8_lossy`'s `Cow`.
 
-**Exhaustive `match` on a one-variant enum**
-`PageRecord` has a single variant today, yet the extractors `match` on it rather than
-reaching into it. When a `Wat` variant is added, every such `match` stops compiling until
-it handles WAT records: the compiler lists exactly the places a new Format affects.
+**Exhaustive `match`, no `_` arm**
+`PageRecord` had one variant, yet the extractors `match` on it. When Step 15 added `Wet`, the
+build failed at each such `match`: a list of every place that has to decide what a WET record
+means. A `_` arm would have compiled silently.
 
-**The newtype pattern: `Shard(String)`**
-A tuple struct wrapping one `String`. At runtime it is a `String`; to the compiler it is
-a different type, so an Archive file name can't be passed where a Shard is expected, and
-`Shard::from_archive_name` is the one place the `.warc.gz` suffix is stripped. `serde`
-serializes a newtype as its inner value, so in JSON a Shard is a plain string.
+**Newtype: `Shard(String)`**
+A tuple struct around a `String`: the same at runtime, a different type to the compiler, so an
+Archive file name can't pass for a Shard. `serde` writes it as the inner string.
 
-**Re-exports with `pub use`**
-`lib.rs` declares the new modules `pub mod artifact;` etc. and also re-exports their main
-types: `pub use artifact::{Shard, Sighting, ...};`. Callers write
-`use onion_crawler::Sighting;` instead of `onion_crawler::artifact::Sighting`, and the
-module layout can change later without breaking them.
+**`pub use` re-exports**
+`lib.rs` re-exports the main types (`pub use artifact::{Shard, Sighting, ...};`), so callers
+write `cc_extract::Sighting` and the modules can move without breaking them.
 
 **Dev-dependencies and examples**
-Each file in `examples/` is a small program of its own, linked against the library like
-an outside crate (`use onion_crawler::onion_search::ONION_PATTERN;`). Cargo builds
-examples only on request (`cargo run --example baseline`, and `cargo test` builds them
-to check they compile). Examples, tests and benchmarks may use `[dev-dependencies]`;
-the library and binary may not. Moving `warc` there means `cargo build` no longer
-compiles it, while the benchmark that needs it still works.
+Each file in `examples/` is a program linked to the library like an outside crate, built on
+request (`cargo run --example baseline`; `cargo test` checks it compiles). Examples and tests may
+use `[dev-dependencies]`, the library may not, so moving `warc` there keeps it out of
+`cargo build`.
 
-**Errors instead of defaults: `unwrap_or_default` vs `?`**
-`serde_json::from_str(&content).unwrap_or_default()` reads as "use an empty map if
-parsing fails", which sounds harmless until the empty map is saved over the file. The
-loaders now return `Result<Sightings, Box<dyn Error>>`, and `?` passes a failure up to
-`main`, which decides to stop. `.map_err(|err| format!("cannot load {}: {}", path, err))?`
-adds the file name on the way: `format!` builds a `String`, and `?` converts it into a
-`Box<dyn Error>` through the standard library's `From<String>` impl. A default is
-the right fallback only when losing the data it replaces is acceptable.
+**Errors, not defaults**
+Since Step 8, `serde_json::from_str(..).unwrap_or_default()` had turned an unreadable results
+file into an empty map, which the next save wrote over the file. The loaders now return a
+`Result`, and `.map_err(|err| format!("cannot load {}: {}", path, err))?` passes the error up
+with the file's name (`?` boxes the `String` through `From<String>`). A default fits only where
+losing what it replaces is fine.
 
-**ASCII word boundaries in `regex`: `(?-u:\b)`**
-`(?-u:...)` turns Unicode mode off for the enclosed part of the pattern, so `\b` checks
-only `[0-9A-Za-z_]` on each side. It is also cheaper: a Unicode `\b` can force the
-`regex` crate off its fast DFA when the input contains non-ASCII bytes.
+**`(?-u:\b)`: ASCII word boundaries**
+`(?-u:...)` turns Unicode off inside it, so `\b` checks `[0-9A-Za-z_]` only. It is also faster:
+a Unicode `\b` can push `regex` off its DFA on non-ASCII input.
 
 ---
 
@@ -1217,258 +554,134 @@ only `[0-9A-Za-z_]` on each side. It is also cheaper: a Unicode `\b` can force t
 
 ### What we built
 
-A run can now extract any subset of Artifact kinds, and a later run can add a kind
-without redoing the work already done. The crate is renamed `onion-crawler` →
-`cc-extract` (version 2.0.0: the CLI changed in incompatible ways).
+A run extracts any subset of kinds, and a later run adds a kind without redoing the rest. The
+crate became `cc-extract` 2.0.0 (it was `onion-crawler`), as the CLI changed.
 
-- **`processed.log` per (Shard, kind)**: each line is `<shard> <kind>`, such as
-  `CC-MAIN-20260305070756-20260305100756-00000 onion`. Before, a line held the Archive file
-  name, so a Shard processed once was skipped forever, even for a kind added later. Lines
-  without a known kind (every line written before this step) are ignored: they don't say
-  which kinds were extracted, so those Shards are processed again.
-- **Scheduling**: for each Archive in the paths file, `main` computes the requested kinds
-  not yet done for its Shard. None missing: skipped. Otherwise the Archive is scheduled
-  with only those kinds' extractors (`new_extractor`). `--limit` counts scheduled Archives.
-- **Save, then mark**: after a Shard finishes, each kind's Sightings are merged, its JSON
-  file saved, and only then is `<shard> <kind>` appended (`save_then_mark`). The old code
-  marked the Archive first and saved after, so a crash in between lost that Archive's
-  results for good.
-- **Only requested kinds are loaded and saved**: `-e onion` never reads or writes
-  `favicons.json`. File names come from `ArtifactKind::output_filename()`; the per-kind
-  `load_results_from` / `load_favicons_from` / `merge_results` / `merge_favicons` pairs are
-  replaced by `load_sightings_from`, `save_sightings_to` and `merge_sightings_from`, which
-  take the kind as a parameter.
-- **`merge`** loops over `ArtifactKind::all()` and merges every kind whose file exists in
-  at least one input directory. It fails if no directory has any results file.
-- **CLI**: `-s/--strategy` and `-m/--stream` are gone, replaced by three independent options:
+- **`processed.log` lines are `<shard> <kind>`**, where an Archive name used to mark a Shard
+  done for every kind, forever. Old lines name no kind and are ignored, so their Shards are
+  redone.
+- **Scheduling**: a Shard runs with only the requested kinds not yet done (none: skipped);
+  `--limit` counts scheduled Shards.
+- **Save, then mark** (`save_then_mark`): each kind's file is saved, then its line appended. The
+  old code marked first, so a crash in between lost the results.
+- **Only the requested kinds are loaded and saved**, by one set of functions taking the kind
+  (`load_sightings_from`, `save_sightings_to`, `merge_sightings_from`); `merge` covers every
+  kind with a file.
+- **CLI**: `-s/--strategy` and `-m/--stream` became three independent options: `-e/--extract`
+  (kinds, default `onion,favicon`), `-t/--transport` (`disk`, `memory`, `mmap`) and
+  `--onion-engine` (`memchr`, `regex`).
 
-  | New option | Values | Default |
-  |------------|--------|---------|
-  | `-e/--extract` | comma-separated Artifact kinds | `onion,favicon` |
-  | `-t/--transport` | `disk`, `memory`, `mmap` | `disk` |
-  | `--onion-engine` | `memchr`, `regex` | `memchr` |
-
-  The old flags map as follows: `-s memchr` = defaults, `-s bytes` = `--onion-engine regex`,
-  `-s mmap` = `-t mmap`, `-m` = `-t memory`. The RAM guard now applies to `-t memory`.
-
-```sh
-cargo run -- warc.paths -e onion            # onions only
-cargo run -- warc.paths -e onion,favicon    # same Shards: only favicon runs
-```
-
-The end-to-end test `tests/crawl_cli.rs` does exactly this on a fixture Archive, checks that
-the second run extracts `favicon` only, and that the output directory ends up with the same
-Sightings and `processed.log` lines as a single `-e onion,favicon` run.
+`tests/crawl_cli.rs` runs `-e onion`, then `-e onion,favicon` on the same Shards: the second run
+extracts `favicon` only, and the output equals that of one `-e onion,favicon` run.
 
 ### Rust concepts introduced
 
-**`clap::ValueEnum` on a library type**
-`#[derive(ValueEnum)]` on `ArtifactKind` and `OnionEngine` turns each variant into a CLI
-value, kebab-cased (`Onion` → `onion`; a future `InlineFavicon` → `inline-favicon`), with the
-variant's doc comment as its help text. The derive also generates `value_variants()`, the
-list of all variants, which `ArtifactKind::all()` returns, so a new kind is listed
-everywhere without editing a hand-maintained array. `Display` is built from
-`to_possible_value()` and `FromStr` from `ValueEnum::from_str`, so the CLI, progress
-output and `processed.log` share one spelling per kind; a log written with `Display` is
-always readable with `parse()`.
+**`ValueEnum` on a library type**
+On `ArtifactKind`, each variant becomes a kebab-cased value (`InlineFavicon` →
+`inline-favicon`) with its doc comment as help, and `value_variants()` lists them all, so a new
+kind shows up everywhere with no list to update. `Display` and `FromStr` are built on it, so the
+CLI, the progress output and `processed.log` share one spelling. `Transport` can't derive it, as
+its variants carry data unknown when arguments are parsed; `main` has a fieldless
+`TransportChoice` instead.
 
-`Transport` can't derive `ValueEnum`: its variants carry a path or the downloaded bytes,
-which don't exist when the command line is parsed. `main` has a fieldless
-`TransportChoice` enum for the option, and each task turns it into a `Transport` once the
-Archive is downloaded.
+**Fully qualified syntax**
+`ArtifactKind` has a `from_str` from both `FromStr` and `ValueEnum`, so `Self::from_str` is
+ambiguous (error E0034); `<Self as ValueEnum>::from_str(name, false)` picks one.
 
-**Fully qualified syntax: `<Self as ValueEnum>::from_str`**
-`ArtifactKind` implements both `FromStr` and `ValueEnum`, and both traits have a
-`from_str` method. Inside `impl FromStr`, a plain `Self::from_str(..)` would be ambiguous
-(the compiler reports error E0034 and stops). `<Self as ValueEnum>::from_str(name, false)`
-says which trait's method is meant.
-
-**Comma-delimited lists in `clap`**
-A `Vec<T>` field makes an option take several values. `value_delimiter = ','` also splits
-one argument on commas, so `-e onion,favicon` and `-e onion -e favicon` give the same
-`Vec`. `default_value = "onion,favicon"` is split the same way and shown as typed in
-`--help`; the typed alternative, `default_values_t = [..]`, would display as
-`onion favicon`, which is not how the user writes it. Repeats (`-e onion,onion`) are
-removed with `sort()` then `dedup()`: `dedup` only drops *adjacent* equal elements, so
-sorting first is what makes it remove all of them. Sorting needs `Ord`, now derived on
-`ArtifactKind` (declaration order).
+**Comma-separated values in `clap`**
+A `Vec<T>` field with `value_delimiter = ','` reads `-e onion,favicon` as `-e onion -e favicon`,
+and `default_value = "onion,favicon"` is split the same way and shown as typed. `sort()` then
+`dedup()` drops repeats, as `dedup` only drops *adjacent* equal items (sorting needs `Ord`,
+derived in declaration order).
 
 **`HashSet` of tuples**
-`load_processed_from` returns `HashSet<(Shard, ArtifactKind)>`. Tuples implement `Hash` and
-`Eq` whenever all their fields do, so the pair is a set element with no extra code, and
-"is `onion` done for this Shard?" is `processed.contains(&(shard.clone(), kind))`. The
-`clone` is needed because `contains` takes a reference to a whole tuple, and a tuple
-of references `(&Shard, ArtifactKind)` is a different type; one small allocation per check
-is negligible next to downloading an Archive.
+A tuple is `Hash` and `Eq` when its fields are, so `HashSet<(Shard, ArtifactKind)>` takes no
+code. `contains(&(shard.clone(), kind))` clones because a tuple of references is another type.
 
-**`filter_map` with `?` inside the closure**
-Each `processed.log` line goes through a closure returning `Option`:
-`let (shard, kind) = line.split_once(' ')?;` returns `None` for a line without a space,
-`kind.parse::<ArtifactKind>().ok()?` for an unknown kind. `filter_map` keeps only the
-`Some` values, so ignoring malformed lines takes no `if`/`continue` at all.
+**`filter_map` with `?` in the closure**
+For each log line, a closure returning `Option` runs `line.split_once(' ')?` and
+`kind.parse().ok()?`; `filter_map` keeps the `Some`s, so malformed lines go without an `if`.
 
 **`BTreeMap` for a stable order**
-The loaded results are a `BTreeMap<ArtifactKind, Sightings>`. A `HashMap` would work too,
-but would iterate in a different order every run, shuffling the kinds in the summary
-lines. A `BTreeMap` iterates in key order (`Ord`), so output is the same every time.
+It iterates in key order, so the summary lists the kinds the same way on every run, where a
+`HashMap` would shuffle them.
 
-**Ordering for crash safety**
-Two writes that belong together (save the results, record the pair as done) can't happen
-atomically, so their order decides what a crash between them leaves behind:
+**Ordering writes for crash safety**
+Two writes that can't be made atomic together: their order decides what a crash between them
+leaves. Save then mark, and the Shard is redone, `merge_sightings` skipping the Sightings already
+saved. Mark then save, and the results are lost and never looked for again. Data first, the
+record that it exists last. `save_then_mark` is the only public way to mark, so no caller can get
+the order wrong; its test puts a *directory* where `onions.json` goes, which fails even as root.
 
-- save, then mark: results saved, pair not marked. The next run redoes the Shard for that
-  kind; `merge_sightings` skips the Sightings already in the file, so the redo costs time
-  and changes nothing.
-- mark, then save: pair marked, results lost, and no later run looks for them again.
-
-The rule is: write the data first, the record that the data exists last. `save_then_mark`
-does both with `?` between them, so a failed save returns before the mark is written. It
-is also the only public way to mark a pair: `mark_processed_in` is private, so no caller
-can get the order wrong. `tests/output_state.rs` checks the failure case by putting a
-*directory* where `onions.json` should be written. Writing then fails even for root, which
-file permissions alone would not guarantee.
-
-**End-to-end tests of a binary: `CARGO_BIN_EXE_<name>`**
-Before running integration tests, Cargo builds the package's binaries and passes each
-path at compile time as `env!("CARGO_BIN_EXE_cc-extract")`. `tests/crawl_cli.rs` runs it
-with `std::process::Command`, setting `current_dir` to a scratch directory whose
-`download/` already holds the fixture Archive, so the binary skips the download and needs
-no network. The test compares the *loaded* output, not the bytes: a `HashMap` is
-serialized in a different order each run, so two identical results files rarely match
-byte for byte.
-
-**`#[allow(dead_code)] mod common;`**
-`tests/crawl_cli.rs` uses only `WarcBuilder` and `http_response` from the shared helpers.
-Each test crate compiles its own copy of `common`, so the helpers it doesn't use would
-each raise a dead-code warning; the attribute on the `mod` line silences them for that
-crate only.
+**End-to-end tests: `CARGO_BIN_EXE_<name>`**
+Cargo builds the binaries before the integration tests and passes their paths as
+`env!("CARGO_BIN_EXE_cc-extract")`. The test runs it in a scratch directory whose `download/`
+already holds the fixture, so no network is needed, and compares loaded results, not bytes
+(`HashMap` order varies).
 
 ---
 
-## Step 14: Planner — Formats, Datasets, Multi-Archive Shards
+## Step 14: The Planner: Formats, Datasets, Multi-Archive Shards
 
 ### What we built
 
-Each Shard is now planned before it is downloaded: the program picks the cheapest Formats
-that serve every requested kind, downloads one Archive per Format in that
-Plan, and hands each Archive to the kinds that read its Format. Only WARC can be read so
-far, so every kind's Format requirement is still `{WARC}` and every Plan is WARC: the
-behaviour on a WARC paths file is unchanged. The WET and WAT readers, in the next steps,
-only have to add their entries to the table.
+Each Shard is planned before download: the cheapest Formats serving every requested kind, one
+Archive per Format, each handed to the kinds that read it. Only WARC could be read yet, so every
+Plan was WARC; Steps 15 and 16 add WET and WAT.
 
-- **`src/format.rs`**: `Format { Warc, Wat, Wet }` with its file suffix (`.warc.gz`,
-  `.warc.wat.gz`, `.warc.wet.gz`), directory (`warc`, `wat`, `wet`) and estimated size
-  (1 GB, 170 MB, 70 MB); `FormatSet`, a set of Formats; `Dataset { CcMain, CcNews }`,
-  detected from the path prefix, with the Formats it publishes (CC-MAIN all three, CC-NEWS
-  WARC only, written from memory and marked unverified in the code).
-- **`ArchivePath`**: one line of a paths file. The three Archives of a Shard differ only in
-  the last directory and the suffix, so any of them locates the others:
-
-  ```text
-  crawl-data/CC-MAIN-2025-01/segments/1735000000000.00/wat/CC-MAIN-…-00000.warc.wat.gz
-  crawl-data/CC-MAIN-2025-01/segments/1735000000000.00/warc/CC-MAIN-…-00000.warc.gz
-  ```
-
-  The input can now be a WARC, WAT or WET paths file. `Shard::from_archive_name` strips any
-  of the three suffixes.
-- **`src/plan.rs`**: `cheapest_fit(requirement, inside)` is the cheapest of a kind's
-  accepted combinations made only of Formats in `inside`; `cheapest_plan(available,
-  requirements)` tries every non-empty subset of the Dataset's Formats, keeps those where
-  every kind has a fit, and returns the cheapest. `Plan` holds what each kind reads; its
-  `formats()` are the Archives to download.
-- **`--formats warc,wat,wet`** forces the Plan. It is rejected at startup if it can't serve
-  a requested kind, and when a Shard is planned if its Dataset doesn't publish one of the
-  Formats:
-
-  ```text
-  $ cc-extract warc.paths --formats wet -e favicon
-  Error: cannot extract favicon from wet: it needs warc
-  ```
-
-  A forced Format no kind reads is not downloaded.
-- **Pipeline per Shard**: each task downloads every Archive of its Shard's Plan, then
-  parses each one with new extractors for the kinds reading its Format, and unions their
-  Sightings. A (Shard, kind) pair is saved and marked only if every Archive that kind
-  reads parsed (`Plan::split_done`, with `Iterator::partition`); a failed download no
-  longer stops the kinds that don't need that Archive. `-d` deletes every Archive of the
-  Shard that parsed. `download_warc_async` and `download_warc_to_memory` are now
-  `download_archive` and `download_archive_to_memory`, and take an `ArchivePath`, which
-  replaces `filename_from_uri`.
-- **RAM guard**: with `-t memory`, a job holds every Archive of its Plan at once, so the
-  available RAM is divided by the largest estimated Plan among the scheduled Shards instead
-  of a flat 1 GB. With WARC Plans this is the same 1 GB as before.
-
-The planner is tested with the target requirement tables (`onion` = WARC or WAT + WET,
-`favicon` = WARC or WAT, `inline-favicon` = WARC): `onion` + `favicon` plan WAT + WET with
-`onion` reading both and `favicon` WAT only, `favicon` alone plans WAT, anything with
-`inline-favicon` plans WARC, CC-NEWS always plans WARC.
+- **`src/format.rs`**: `Format { Warc, Wat, Wet }` (suffix, directory, estimated size: 1 GB,
+  170 MB, 70 MB), `FormatSet`, and `Dataset { CcMain, CcNews }`, read from the path prefix, with
+  the Formats each publishes.
+- **`ArchivePath`**: a Shard's three Archives differ only in the last directory and the suffix,
+  so any one locates the others, and the input can be a WARC, WAT or WET paths file.
+- **`src/plan.rs`**: `cheapest_fit` (a kind's cheapest accepted combination within some
+  Formats) and `cheapest_plan` (the cheapest subset of the Dataset's Formats that every kind
+  fits in).
+- **`--formats`** forces the Plan. It is rejected at startup if it can't serve a kind
+  (`Error: cannot extract favicon from wet: it needs warc`), and for a Shard whose Dataset lacks
+  one of its Formats.
+- **Per Shard**: every Archive of the Plan is downloaded, each parsed with the extractors of the
+  kinds reading it, and their Sightings unioned. A kind is saved and marked only if every Archive
+  it reads parsed (`Plan::split_done`), so a failed download no longer stops kinds that don't
+  need it. With `-t memory`, the available RAM is divided by the largest Plan.
 
 ### Rust concepts introduced
 
-**Modelling a static table with `match`**
-`ArtifactKind::format_requirement` returns each kind's accepted combinations:
-
-```rust
-match self {
-    ArtifactKind::Onion => &[&[Format::Warc]],
-    ArtifactKind::Favicon => &[&[Format::Warc]],
-}
-```
-
-A `HashMap<ArtifactKind, …>` built at startup would work too, but a kind added without an
-entry would only fail when looked up, at runtime. A `match` must cover every variant, so a
-new kind without a requirement doesn't compile. `Format::suffix`, `directory` and
-`estimated_size` are tables of the same shape. The return type is `&'static [&'static
-[Format]]`: the slices are built from constants only, so the compiler stores them once in
-the binary and the reference lives for the whole program (*constant promotion*), with no
-`static` item to declare.
+**A static table as a `match`**
+`ArtifactKind::format_requirement` returns each kind's accepted combinations from a `match`. A
+`HashMap` would fail at runtime on a kind without an entry; a `match` must cover every variant,
+so such a kind doesn't compile. Its type, `&'static [&'static [Format]]`, needs no `static`
+item: slices built from constants are stored once in the binary (*constant promotion*).
 
 **Bitmasks as small sets**
-`FormatSet(u8)` gives each Format one bit (`1 << format as u8`: `as u8` turns a fieldless
-variant into its position in the declaration). A set is the OR of its members' bits, so
-WAT + WET is `0b110`, and set operations are single integer operations: union is `a | b`,
-"`a` is inside `b`" is `a & !b == 0` (no bit of `a` outside `b`). The struct wraps the `u8`
-(newtype) so a set can't be mixed up with any other number.
+`FormatSet(u8)` gives each Format a bit (`1 << format as u8`, `as u8` giving a fieldless
+variant's position). Union is `a | b`; "`a` inside `b`" is `a & !b == 0`. The newtype keeps a set
+from mixing with other numbers.
 
-**Enumerating subsets with a bitmask**
-Every subset of a set only clears bits, so its value is at most the set's own. Counting
-from 1 (the smallest non-empty set) up to the set's value visits every non-empty subset;
-numbers with a bit outside the set are filtered out:
+**Enumerating subsets**
+A subset only clears bits, so counting from 1 to the set's value and keeping the numbers inside
+it visits every non-empty subset (seven at most):
+`(1..=self.0).map(FormatSet).filter(move |subset| subset.is_subset_of(self))`.
+`.map(FormatSet)` passes the tuple struct's constructor as a function.
 
-```rust
-(1..=self.0).map(FormatSet).filter(move |subset| subset.is_subset_of(self))
-```
+**`min_by_key`**
+Returns the item with the smallest key, or `None` from an empty iterator, so "nothing fits"
+needs no separate check. The key comes from a closure, so `FormatSet` needs no `Ord`; a tie
+keeps the first.
 
-With three Formats that is at most seven candidates, so trying them all is simpler than
-any clever search. `.map(FormatSet)` passes the tuple struct's constructor as a function:
-`FormatSet` is also a `fn(u8) -> FormatSet`.
+**`FromIterator`; collecting into `Result` and `Option`**
+Implementing `FromIterator<Format> for FormatSet` makes it a `collect()` target. Collecting
+`Result`s into `Result<Vec<_>, _>` stops at the first `Err` and returns it (`Plan::within`);
+`Option` works the same way.
 
-**`Iterator::min_by_key`**
-`min_by_key(|plan| plan.estimated_size())` returns the item with the smallest key, or
-`None` if the iterator is empty. Both planner functions end with it, so "nothing fits"
-needs no separate check. The key comes from a closure, so `FormatSet` needs no `Ord` (sets
-have no natural order). On a tie it keeps the first item.
+**A typed error**
+`enum PlanError` has a variant per reason, carrying the facts, and `Display` writes the message;
+tests compare variants, so rewording breaks none. `impl Error for PlanError {}` is empty
+(`Error` only needs `Debug` and `Display`) and lets `?` box it.
 
-**`FromIterator`: making a type a `collect()` target**
-`collect()` builds its result through the `FromIterator` trait. Implementing
-`FromIterator<Format> for FormatSet` lets the pipeline write
-`parsed.iter().map(ArchivePath::format).collect::<FormatSet>()`, the same way it would
-collect into a `Vec`. `ArchivePath::format` is passed as a function path, without a closure.
-
-**Collecting into `Result` and `Option`**
-`Plan::within` maps each kind to a `Result` and collects into `Result<Vec<_>, _>`: the
-first `Err` stops the iteration and is returned, otherwise all the values come back in a
-`Vec`. The scheduling loop does the same with `Option<Vec<ArchivePath>>`: `None` as soon as
-one Format's path can't be derived.
-
-**A typed error: `enum PlanError` and an empty `impl Error`**
-`PlanError` has one variant per reason (`Unavailable`, `Unserved`) carrying the facts, and
-`Display` writes the message. Tests compare variants, so rewording a message breaks none of
-them. `impl Error for PlanError {}` is empty: `Error` only requires `Debug` and `Display`,
-and implementing it lets `?` turn a `PlanError` into a `Box<dyn Error>`.
-
-**Let chains: `if let … && let …`**
-Edition 2024 allows several `let` patterns joined by `&&` in one `if`:
+**Let chains**
+Edition 2024 joins `let` patterns with `&&` in one `if`, each binding visible to the next
+condition; Clippy's `collapsible_if` suggests them for nested `if`s.
 
 ```rust
 if let Some(forced) = forced
@@ -1476,123 +689,70 @@ if let Some(forced) = forced
 {
 ```
 
-The body runs only if both match, and `forced` is in scope for the second pattern. Before,
-this needed two nested `if let`s.
+---
 
 ## Step 15: Reading WET Archives
 
 ### What we built
 
-WET Archives can now be read, and the onion extractor searches their text. A WET Archive
-is a WARC file too: one `warcinfo` record, then one `conversion` record per HTML page,
-holding the page's visible text (`text/plain`). Its `WARC-Target-URI` and `WARC-Date` are
-the page URL and crawl time, as in the WARC `response` it was made from.
-
-No Plan reads WET yet: WET alone finds about a third of the onions (they mostly sit in
-HTTP headers and attribute values, which WET drops), so `onion` still requires WARC and
-`--formats wet -e onion` is still rejected. WET becomes plannable together with WAT.
-
-- **Record selection per Format**: `Format::record_type()` names the `WARC-Type` holding
-  the pages (`response` for WARC, `conversion` for WET, `metadata` for WAT). Both record
-  parsers, `WarcRecordIter::new(reader, record_type)` and `WarcSliceIter::new(data,
-  record_type)`, take it and skip every other record's body, as they skipped every
-  non-`response` record before.
-- **`parse_archive(transport, format, &shard, &mut extractors)`**: the Format is passed in
-  (a `Memory` Transport has no file name to read it from); `main` passes
-  `archive.format()`. A WAT Archive is rejected with an error before anything is read.
-- **`PageRecord::Wet(WetConversion { page_url, date, text })`**: the second variant. The
-  onion extractor searches `text`; the favicon extractor finds nothing in it, since WET
-  keeps no `<link>` or `<meta>` tag.
-- **Tests**: `tests/wet_archive.rs` builds a WET fixture (`WarcBuilder::conversion`) and
-  parses it through `parse_archive`: onions written in the text are found with the page's
-  URL and date, an onion inside the `warcinfo` record is not, favicon markup shown as text
-  is not a favicon, and every Transport and onion engine agrees. `parse_with_every_combination`
-  now takes the Format from the file name's suffix. A planner test pins that WET alone
-  can't serve `onion`.
+A WET Archive is a WARC file of `conversion` records, one per HTML page, holding its visible
+text. `Format::record_type()` names the record type holding the pages (`response`, `metadata`,
+`conversion`); both parsers take it and skip every other record. `parse_archive` takes the
+Format as a parameter, as a `Memory` Transport has no file name to tell it. The new
+`PageRecord::Wet(WetConversion { page_url, date, text })` is searched for onions; favicons have
+nothing to find there. WET alone finds about a third of the onions, most sitting in HTTP headers
+and attributes, so no Plan used it until Step 16 paired it with WAT. `tests/wet_archive.rs`
+builds a WET fixture.
 
 ### Rust concepts introduced
 
 **`&'static str` fields**
-`WarcRecordIter` stores the wanted record type as `record_type: &'static str`. A string
-literal such as `"conversion"` is compiled into the binary and lives for the whole
-program, so its type is `&'static str`. Storing a `'static` reference needs no lifetime
-parameter on the struct: `WarcRecordIter<R>` stays as it was, whereas a field of type
-`&'a str` would have made it `WarcRecordIter<'a, R>` and tied every iterator to the
-lifetime of whatever owns the string.
+`WarcRecordIter` keeps its record type as a `&'static str`: a string literal lives for the whole
+program, so the struct needs no lifetime parameter, where `&'a str` would have tied every
+iterator to the string's owner.
 
-**Exhaustive `match`: the payoff**
-Step 12 had extractors `match` on the one-variant `PageRecord` without a `_` arm. Adding
-`PageRecord::Wet` now made the build fail at every such `match`: `page_url()`, `date()`,
-the onion extractor and the favicon extractor. Each error is a place that has to decide
-what a WET record means, and none could be forgotten. A `_ => …` arm would have compiled
-silently and treated WET like whatever it fell through to.
+**`unreachable!` behind an entry check**
+`parse_archive` then rejected `Format::Wat` up front, so the WAT arm building a `PageRecord`
+could never run. `unreachable!` panics if that ever proves false, instead of inventing a value;
+naming the arm, not `_`, keeps the `match` exhaustive.
 
-**`unreachable!` behind a check at the entry**
-`parse_archive` returns an error for `Format::Wat` before reading anything, so the
-`Format::Wat` arm of the `match` that builds a `PageRecord` (`to_page_record`) can never
-run. `unreachable!` says so: it panics with its message if the assumption is ever broken,
-instead of inventing a value. Naming the arm rather than writing `_ =>` keeps the `match`
-exhaustive over `Format`: a fourth Format would stop it compiling. The compiler does
-*not* point at it when the WAT reader arrives (the arm already compiles); the check in
-`parse_archive` and the `unreachable!` message are what lead there.
+**`BTreeMap::from([...])` and const generics in `std`**
+`BTreeMap::from([(k1, v1), (k2, v2)])` builds a map in one expression: the standard library
+implements `From<[(K, V); N]>` once for every length `N`, through a *const generic* parameter.
 
-**`BTreeMap::from([...])`**
-A map can be built from an array of `(key, value)` tuples in one expression, as the WET
-test does for its expected Sightings: `BTreeMap::from([(k1, v1), (k2, v2)])`. The
-standard library implements `From<[(K, V); N]>` for every array length `N`, one generic
-`impl` over a *const generic* parameter, rather than one `impl` per length.
+---
 
 ## Step 16: Reading WAT Archives; WAT + WET Plans
 
 ### What we built
 
-WAT Archives can now be read, and with them the cheaper Plans come into force: on
-CC-MAIN, the default `-e onion,favicon` downloads WAT + WET (~240 MB per Shard) instead of
-WARC (~1 GB), `onion` reading both and `favicon` WAT only; `-e favicon` downloads WAT only.
-WARC is still read for CC-NEWS, or when forced with `--formats warc`.
+With WAT readable, the cheaper Plans apply: on CC-MAIN, the default `-e onion,favicon` downloads
+WAT + WET (~240 MB per Shard) instead of WARC (~1 GB), `onion` reading both and `favicon` WAT
+only. A WAT Archive holds one JSON `metadata` record per WARC record, three per page, written by
+ia-web-commons: the WARC and HTTP headers and, for HTML, the `<link>` and `<meta>` tags of the
+`<head>` and every link.
 
-A WAT Archive is a WARC file of `metadata` records, one per record of the matching WARC
-Archive, so three per page (made from its `request`, `response` and `metadata` records).
-Each is a JSON document written by ia-web-commons: the WARC record's headers, its HTTP
-headers and, for an HTML page, the `<link>` and `<meta>` tags of its `<head>` and every link
-with its text. The record's own `WARC-Date` is when the WAT was generated; the crawl date is
-inside the JSON.
-
-- **`PageRecord::Wat(WatMetadata { page_url, date, json, head })`**: the third variant.
-  `WatMetadata::parse` first looks for `"WARC-Type":"response"` with a SIMD `memmem`
-  search, which drops the two records out of three not made from a `response` without
-  parsing them; then parses the JSON once, into structs that declare only the path down to
-  `Head`. `date` is `Envelope.WARC-Header-Metadata.WARC-Date`. A record whose JSON can't be
-  read is skipped: it has no crawl date to give a Sighting.
-- **Onions** are searched in the raw JSON bytes, like the WARC HTTP response: an address is
-  made of `[a-z2-7.]`, which ia-web-commons doesn't escape, and is surrounded by `"`, `/`,
-  `:` or spaces, so the addresses WAT kept are found as in WARC. Three differences: onions
-  only in the page's plain text are gone (WET has them); one right after an escape such as
-  `\n` or `\u2003` is missed, the escape's last character reading as part of the address;
-  and one in the page URL itself is found, as the JSON repeats the WARC headers.
-- **Favicons** come from `Head`: `<link>` entries whose `rel` is a favicon value, `<meta>`
-  entries named `msapplication-TileImage`, resolved against `<base href>` when the page has
-  one, else against the page URL (the WARC scanner ignores `<base>`, so the two differ on
-  such pages). `data:` URLs are skipped: ia-web-commons cuts them after the first comma,
-  so the image is gone. `favicon_search::favicons_in_head` shares the `rel` and `name`
-  checks with the HTML scanner (`is_favicon_rel`, `is_tile_image_name`, case-insensitive:
-  WAT keeps attribute values as written).
-- **Requirements**: `onion` accepts WARC or WAT + WET, `favicon` WARC or WAT. The planner
-  needed no change.
-- **Tests**: `tests/wat_archive.rs` writes the same two pages as a WARC, a WAT and a WET
-  Archive (`WarcBuilder::wat_metadata`, and `wat_response_json` / `wat_request_json` in
-  `tests/common` building the JSON with `serde_json::json!`). On those pages WAT + WET find
-  exactly what WARC finds, with the crawl dates; WAT alone misses only the onion in plain text; every
-  Transport and engine agrees. Smaller tests cover `<base href>`, escaped JSON strings and
-  a record cut short. `tests/crawl_cli.rs` runs the binary on the default kinds (it reads
-  `wat,wet` and saves what a WARC run saves) and on `-e favicon` (it reads `wat`); the test
-  about adding a kind later now forces `--formats warc`.
+- **`PageRecord::Wat(WatMetadata)`**: a SIMD search for `"WARC-Type":"response"` drops, without
+  parsing them, the two records in three not made from a `response`; the rest are parsed once,
+  into structs declaring only the path down to `Head`. The crawl date is inside the JSON, so a
+  record whose JSON can't be read is skipped.
+- **Onions** are searched in the raw JSON, which keeps addresses as WARC does with three
+  exceptions: onions only in the plain text are gone (WET has them), one right after an escape
+  such as `\n` is missed, and one in the page URL is found.
+- **Favicons** come from `Head`, resolved against `<base href>`; `data:` URLs are skipped, as
+  ia-web-commons cuts them short. The `rel` and `name` checks are shared with the HTML scanner.
+- **Requirements**: `onion` accepts WARC or WAT + WET, `favicon` WARC or WAT. The planner needed
+  no change.
+- **Tests**: `tests/wat_archive.rs` writes the same pages as WARC, WAT and WET; WAT + WET find
+  what WARC finds.
 
 ### Rust concepts introduced
 
-**Partial deserialization, skipping unknown fields**
-A WAT record about an HTML page is a few kilobytes of JSON, most of it the page's links.
-The `Deserialize` structs in `page_record.rs` declare only what is read:
+**Partial deserialization**
+The `Deserialize` structs declare only the fields read. serde skips every other key, checking
+its JSON but building nothing, so the large `Links` array costs a scan, not a `Vec`
+(`#[serde(deny_unknown_fields)]` would reject such keys instead). `#[serde(rename = "...")]` maps
+keys that aren't Rust identifiers, and a level that may be missing is an `Option`.
 
 ```rust
 #[derive(Deserialize)]
@@ -1602,59 +762,29 @@ struct WatJson<'a> {
 }
 ```
 
-Every key a struct doesn't declare (`Container`, `Links`, `Headers`, `Title`, ...) is
-skipped: `serde_json` still checks that its value is valid JSON, but builds no value from
-it, so the large `Links` array costs a scan, not a `Vec` of links. Skipping is serde's default;
-`#[serde(deny_unknown_fields)]` would turn it into an error. `#[serde(rename = "...")]` maps
-JSON keys such as `WARC-Header-Metadata`, which are not Rust identifiers. A level that may
-be absent is an `Option` (a missing key gives `None`), so a non-HTML response, whose record
-has no `HTML-Metadata`, still parses, with `head: None`.
+**Borrowing from the input: `Cow<'a, str>`**
+`serde_json::from_slice` can return strings pointing into its input. A string with an escape
+(`\/`, `\u00e9`) can't be borrowed, its decoded text not being in the input, so a `&'a str` field
+would fail the parse. A `Cow<'a, str>` holds either a `Borrowed` or an `Owned` string, and both
+read as `&str`.
 
-**Borrowing from the input, and `Cow<'a, str>`**
-`serde_json::from_slice(json)` can give back strings that point into `json` instead of
-copying them: the structs carry a lifetime `'a` tied to the record's bytes, and the
-compiler stops them from outliving the record. A JSON string with an escape (`\/`,
-`\u00e9`) can't be borrowed, though: its decoded text is not in the input as such and must
-be built in a new `String`. A `&'a str` field would then fail the whole parse.
-`Cow<'a, str>` (*clone on write*) holds either: `Cow::Borrowed(&'a str)` for the usual
-unescaped string, `Cow::Owned(String)` for an escaped one. Both deref to `&str`, so the
-code reading them doesn't care which it got.
-
-**`#[serde(borrow)]`, and the `Option<Cow>` pitfall**
-A `Cow` field only borrows when marked `#[serde(borrow)]`; without it, it always
-deserializes as `Owned`. On a field whose type has a lifetime (`Envelope<'a>`), the same
-attribute passes the borrow down. The borrowing only works on a `Cow<'a, str>` field
-itself: inside an `Option`, `Option<Cow<'a, str>>` always allocates, because serde's
-special case for `Cow` looks at the field's type, not inside it. Optional strings (`rel`,
-`url`, `Base`) are therefore plain `Cow`s with `#[serde(default)]`: a missing key reads as
-`""` (`Cow::default()`, an empty `String`, which allocates nothing), and an empty string is
-never a favicon `rel`.
+**`#[serde(borrow)]` and the `Option<Cow>` pitfall**
+A `Cow` field borrows only when marked `#[serde(borrow)]`, and only as the field's own type:
+`Option<Cow<'a, str>>` always allocates. Optional strings are plain `Cow`s with
+`#[serde(default)]`: a missing key reads as `""`, which allocates nothing.
 
 **`Cow` for a value computed only sometimes**
-`favicons_in_head` resolves URLs against the page's `<base href>` when there is one:
+`favicons_in_head` borrows the page URL as its base, and builds a `String` only for a page with
+a `<base href>`.
 
-```rust
-let base: Cow<'_, str> = match head.base.trim() {
-    "" => Cow::Borrowed(page_url),
-    base_href => Cow::Owned(resolve_url(page_url, base_href)),
-};
-```
-
-Most pages have no `<base>`, and pay nothing; only those with one build a `String`.
-
-**A method returning a reference shorter than `'a`**
-`PageRecord::page_url(&self) -> &'a str` hands out the borrowed URL for the record's whole
-lifetime `'a`. `date` can't: a WAT date is a `Cow` that may own its `String`, and an owned
-string lives only as long as the `WatMetadata` holding it. So `date(&self) -> &str` borrows
-from `self` (lifetime elision ties the result to `&self`). Callers only copy it into a
-`Sighting`, so the shorter borrow is enough.
+**Returning a shorter borrow**
+`page_url(&self) -> &'a str` lends the URL for the record's whole life. `date` can't: a WAT date
+may be an owned `String` inside the `WatMetadata`, so `date(&self) -> &str` borrows from `self`
+(elision ties the result to `&self`).
 
 **`LazyLock`: a `static` built on first use**
-The `memmem::Finder` for `"WARC-Type":"response"` should be built once, not once per
-record, but a `static` must be built at compile time and `Finder::new` can't be (it chooses
-a search algorithm at runtime). `std::sync::LazyLock` runs its closure the first time the
-value is used and keeps the result; it is thread-safe, so the parse tasks on Tokio's
-blocking threads share one `Finder`:
+`memmem::Finder::new` picks its algorithm at runtime, so a `static` can't be built at compile
+time. `std::sync::LazyLock` runs its closure on first use and keeps the result, thread-safely:
 
 ```rust
 static RESPONSE_TYPE: LazyLock<memmem::Finder<'static>> =
@@ -1662,63 +792,31 @@ static RESPONSE_TYPE: LazyLock<memmem::Finder<'static>> =
 ```
 
 **`const fn`**
-`ArtifactKind::format_requirement` is now `const fn`: a `match` returning constant slices
-needs nothing from the running program, so it can also be called where a value must be
-known at compile time. The planner tests use it to define their requirement constants from
-the real table (`const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();`)
-instead of copying it.
+`format_requirement` returns constant slices, so it can be a `const fn`, and the planner tests
+take their constants from the real table
+(`const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();`).
 
-**Let chains, again**
-Both HTML tag scanners now test a tag with three nested `if`s (`scan_link_tags` did not
-before: a `let` between them kept them apart), which Clippy flags as collapsible. Edition
-2024 let chains write them as one condition:
-
-```rust
-if let Some(rel_value) = extract_attribute(tag_bytes, b"rel")
-    && is_favicon_rel(rel_value)
-    && let Some(href) = extract_attribute(tag_bytes, b"href")
-{
-    process_favicon_value(href, page_url, result);
-}
-```
+---
 
 ## Step 17: WARC Favicons Honour `<base href>`
 
 ### What we built
 
-The HTML scanner now resolves relative favicon URLs as a browser does: against the page's
-first `<base>` tag with an `href`, itself resolved against the page URL, else against the
-page URL (the HTML standard's "document base URL"). The WAT reader already did so with
-`Head.Base`, so WARC and WAT now give the same favicon URLs for a page declaring a `<base>`:
-`https://example.net/docs/page.html` with `<base href="/static/">` and
-`<link rel="icon" href="icons/fav.png">` gives `https://example.net/static/icons/fav.png`
-from both, where WARC gave `https://example.net/docs/icons/fav.png` before.
-
-- **Finding `<base>`**: `first_base_href` scans like the `<link>` and `<meta>` scanners
-  (`memmem` finders for `<base ` and `<BASE `, `find_tag_end`, `extract_attribute`),
-  skipping a `<base>` that only sets a `target`. With both cases on one page, the earlier
-  tag wins. ia-web-commons probably keeps the *last* `<base>` when a page has several;
-  that is not copied.
-- **Only when needed**: the scan runs the first time a favicon URL is resolved
-  (`DocumentBase::url`), so a page declaring no favicon pays nothing for it.
-- **One rule for both Formats**: `document_base_url(page_url, base_href)` turns a
-  `<base href>` (`""` when none) into the base URL; `favicons_in_head` and the HTML scanner
-  both call it.
-- **Tests**: unit tests in `favicon_search.rs` for a relative `<base>`, an absolute one on
-  another host (also in upper case, with a root-relative favicon), and the first `<base>`
-  with an `href` winning, in either case order. The WARC vs WAT + WET fixture of
-  `tests/wat_archive.rs` gains page C, with a relative `<base>` and a relative favicon, so
-  both Formats are pinned to the same URL; it replaces the WAT-only `Head.Base` test of
-  Step 16. No page of the characterization fixtures declares a `<base>`, and their tests
-  pass unchanged.
+The HTML scanner resolves relative favicon URLs as a browser does: against the first `<base>`
+with an `href` (itself resolved against the page URL), else against the page URL. WARC and WAT
+now agree: on `https://example.net/docs/page.html` with `<base href="/static/">`,
+`icons/fav.png` becomes `https://example.net/static/icons/fav.png` in both. The scan for
+`<base>` runs only once a favicon URL needs resolving, so pages without favicons pay nothing;
+`document_base_url` is the one rule both Formats call. `tests/wat_archive.rs` pins a page with a
+relative `<base>`.
 
 ### Rust concepts introduced
 
-**`OnceCell`: a value computed on first use, through `&self`**
-The scanners take a `&DocumentBase` instead of the page URL, and the base URL is computed
-the first time one of them asks for it. Computing means storing the result, yet the
-scanners hold only a shared reference. `std::cell::OnceCell` allows exactly that: it can be
-written once through `&self`, then only read:
+**`OnceCell`: computed on first use, through `&self`**
+The scanners hold a `&DocumentBase`, and the base URL is computed the first time one asks.
+Storing it through a shared reference is *interior mutability*, which the `std::cell` types
+allow under rules: a `OnceCell` is set once, then only read, so every `&str` it hands out stays
+valid.
 
 ```rust
 struct DocumentBase<'a> {
@@ -1732,44 +830,28 @@ fn url(&self) -> &str {
 }
 ```
 
-Changing data behind a shared reference is *interior mutability*. Rust forbids it for
-ordinary fields; the types in `std::cell` allow it in controlled ways. `OnceCell` is safe
-because the value can be set only once: every `&str` handed out afterwards points into a
-value that never changes again.
-
-**`OnceCell`, `LazyCell` and `LazyLock`**
-`std::cell::LazyCell` is a `OnceCell` holding the closure to run, so
-`LazyCell::new(|| /* scan body for <base>, resolve it */)` would need no struct. But a closure's
-type has no name, and every scanner taking that `LazyCell` would need a generic parameter
-for it. The struct holds what the closure would capture (`body`, `page_url`) and keeps the
-signatures plain. `LazyLock` (Step 16) is the thread-safe version, for a `static` shared by
-threads; one page is scanned on one thread, so a `Cell` type is enough.
+**`OnceCell`, `LazyCell`, `LazyLock`**
+A `LazyCell` holds its closure, but a closure's type has no name, so every scanner taking one
+would need a generic parameter; the struct holds what the closure would capture instead.
+`LazyLock` is the thread-safe one, for `static`s; one page is scanned on one thread.
 
 **`Option` as an iterator**
-`Option<T>` implements `IntoIterator`, yielding its value if it has one. Picking the earlier
-of two tags that may each be missing then needs no `match` over four cases:
+`Option` is `IntoIterator`, yielding its value if it has one, so the earlier of two tags that
+may be missing is `[lower, upper].into_iter().flatten().min_by_key(|&(start, _)| start)`, with
+no four-case `match`.
 
-```rust
-[lower, upper]
-    .into_iter()
-    .flatten() // drop the `None`s
-    .min_by_key(|&(tag_start, _)| tag_start)
-    .map(|(_, href)| href)
-```
+**`?` on `Option`**
+`first_base_href_found_by` returns `None` at `finder.find(...)?` when no tag is left, and at
+`find_tag_end(...)?` when one is cut short.
 
-**`?` on `Option`, again**
-As in the `filter_map` closure of Step 13, `?` on an `Option` returns `None` early, here
-from a whole function: `first_base_href_found_by` returns `None` at `finder.find(...)?`
-when no tag is left and at `find_tag_end(...)?` when the tag is cut short, where the
-`<link>` and `<meta>` scanners, which return nothing, need `let ... else { break }`.
+---
 
 ## Step 18: The `inline-favicon` Artifact Kind
 
 ### What we built
 
-Favicons that pages embed as base64 `data:` URIs were decoded since the first favicon scanner,
-then thrown away. They are now an Artifact kind of their own, `inline-favicon`, saved in
-`inline_favicons.json`:
+Base64 `data:` favicons, decoded since the first scanner and then thrown away, are a kind of
+their own, saved in `inline_favicons.json`:
 
 ```json
 {
@@ -1782,62 +864,37 @@ then thrown away. They are now an Artifact kind of their own, `inline-favicon`, 
 }
 ```
 
-- **Key**: the SHA-256 of the decoded bytes, in hex (`inline_favicon::sha256_hex`, `sha2`
-  crate). The same image on many pages, or written with other line breaks, is one entry.
-- **`mmh3`**: Shodan's favicon hash, the number its `http.favicon.hash:` filter takes:
-  MurmurHash3 x86_32, seed 0, of the image's base64 as Python's `codecs.encode(data,
-  "base64")` writes it (a newline every 76 characters and at the end), read as a signed
-  `i32`. Hand-written, with the base64 encoder.
-- **`media_type`**: from the `data:` header, without parameters, in lower case
-  (`data:Image/SVG+XML;charset=utf-8;base64,` → `image/svg+xml`). The scanner now returns
-  an `InlineImage { media_type, bytes }`, and only decodes URIs marked `;base64`: a
-  percent-encoded `data:image/svg+xml,...` is dropped, as before, even when its text happens
-  to read as base64.
-- **Plan**: `inline-favicon` accepts WARC only (WAT cuts `data:` URLs, WET has no markup),
-  so asking for it plans WARC even on CC-MAIN, and the other kinds read that WARC.
-  It is not in the default `--extract` list.
-- **One type for every kind's results**: the other kinds map each Artifact to a list of
-  Sightings; this one maps each image to a description *and* its Sightings. The pipeline
-  now holds a `Findings` per kind (`Sightings` or `InlineFavicons`), which the extractors
-  return (`Extractor::into_findings`) and `main`, `load_sightings_from`,
-  `save_sightings_to`, `merge_sightings_from` and `save_then_mark` pass along. Deduplication
-  stays in one place: `merge_sightings` is generic over the map's values. `merge` unions an
-  image's Sightings across output directories; the first media type seen wins.
-- **Tests**: unit tests for the encoder (RFC 4648 vectors), the line wrapping (Python's
-  output), MurmurHash3 (reference vectors, and `mmh3.hash("foo")` from the Python README),
-  Shodan's hash and SHA-256 (FIPS 180-2 `"abc"`); scanner tests for the media type and the
-  non-base64 URI; a merge test. End to end (`tests/crawl_cli.rs`), `-e onion,inline-favicon`
-  on a WARC-only workspace plans WARC, finds the onion, and saves one PNG seen on two pages
-  with two Sightings, its SHA-256 and `mmh3` pinned from Python's `hashlib` and `mmh3`.
+- **Key**: the SHA-256 of the image (`sha2` crate), so one image is one entry, on however many
+  pages, with whatever line breaks.
+- **`mmh3`**: Shodan's favicon hash (its `http.favicon.hash:` filter): MurmurHash3 x86_32,
+  seed 0, of the base64 as Python's `codecs.encode` writes it (a newline every 76 characters and
+  at the end), as a signed `i32`. Hand-written, as is the base64 encoder.
+- **`media_type`**: from the `data:` header, lowercase, without parameters; only `;base64` URIs
+  are decoded.
+- **Plan**: WARC only (WAT cuts `data:` URLs, WET has no markup); not in the default `-e`.
+- **`Findings`**: one type for every kind's results, `Sightings` or `InlineFavicons`, passed
+  through the pipeline; deduplication stays in `merge_sightings`, now generic.
+- **Tests**: published vectors for base64, MurmurHash3 and SHA-256; end to end, one PNG on two
+  pages is saved once, with two Sightings and its hashes pinned from Python.
 
 ### Rust concepts introduced
 
-**Hashing crates: `sha2` and the `Digest` trait**
-RustCrypto publishes one crate per hash family (`sha2`, `sha3`, `blake2`, `md-5`, ...), all
-implementing the `Digest` trait of the `digest` crate, so they are used the same way:
+**`sha2` and the `Digest` trait**
+RustCrypto publishes a crate per hash family, all implementing `digest::Digest`:
+`Sha256::digest(bytes)`. A cryptographic hash is worth a dependency, as a subtly wrong one shows
+only when keys fail to match someone else's; MurmurHash3, a few dozen lines with published
+vectors, is written by hand as teaching material.
 
-```rust
-use sha2::{Digest, Sha256};
+**Why `DefaultHasher` is no identifier**
+`HashMap`'s hash is left unspecified on purpose and may change in a later Rust release, breaking
+every saved key; with 64 bits, a collision also becomes likely past ~5 billion inputs (the
+birthday bound). Keys that are saved or shared need a standard hash: SHA-256 is the same in Rust,
+Python and `sha256sum`.
 
-let digest = Sha256::digest(bytes); // 32 bytes
-```
-
-A cryptographic hash is worth a dependency: it is easy to get subtly wrong, and a wrong
-SHA-256 is only noticed when the keys fail to match someone else's. MurmurHash3 is a few
-dozen lines with published test vectors, so it is written by hand here, as teaching
-material; the `murmur3` crate would do as well.
-
-**Why `DefaultHasher` is not an identifier**
-`std::hash::DefaultHasher` is the hash `HashMap` uses. Its documentation leaves the
-algorithm unspecified on purpose (SipHash-1-3 today), so a later Rust release may change it,
-and every key saved by an earlier build would then stop matching. Its 64 bits also make a
-collision as likely as not past about five billion distinct inputs (the birthday bound).
-Anything saved, compared across programs or kept for years needs a hash fixed by a standard:
-SHA-256 gives the same hex in Rust, Python's `hashlib` and `sha256sum`.
-
-**An enum holding either map, saved `#[serde(untagged)]`**
-`main` keeps every requested kind's results side by side in one
-`BTreeMap<ArtifactKind, Findings>`, so they need one type though their files differ:
+**`#[serde(untagged)]`**
+`untagged` writes a variant as its content alone, so `onions.json` keeps its shape. Reading back
+can't be untagged (`{}` fits both variants), so the kind chooses, through `Findings::empty(kind)`,
+the one `match` saying which kind has which shape.
 
 ```rust
 #[derive(Serialize)]
@@ -1848,69 +905,34 @@ pub enum Findings {
 }
 ```
 
-`untagged` writes a variant as its content alone, so `onions.json` keeps its shape. Reading
-back can't be untagged, though: `{}` fits both variants. `Findings::from_json(kind, json)`
-lets the kind choose, through `Findings::empty(kind)`, the one `match` saying which kind has
-which shape. `Findings::merge` matches on the pair `(self, from)`, checking both shapes at
-once; mixing them would be a bug, so it panics.
-
-**A generic function over a trait, and the orphan rule**
-`merge_sightings` used to take `Sightings` only. It now takes any map whose values hold
-Sightings:
-
-```rust
-pub trait ArtifactEntry {
-    fn sightings_mut(&mut self) -> &mut Vec<Sighting>;
-    fn add_sighting(&mut self, sighting: Sighting) { /* dedup on (page_url, shard) */ }
-}
-
-pub fn merge_sightings<E: ArtifactEntry>(into: &mut HashMap<String, E>, from: HashMap<String, E>)
-```
-
-The compiler builds one copy of the function per value type (*monomorphization*), and
-inside it `E` can only be used through the trait. `add_sighting` is a *provided method*:
-implementors write `sightings_mut` only and inherit the dedup. `ArtifactEntry` is
-implemented for `Vec<Sighting>`, a `std` type: allowed because the trait is ours (the
-*orphan rule* requires the trait or the type to be local to the crate).
+**Generics over a trait; provided methods; the orphan rule**
+`merge_sightings<E: ArtifactEntry>(into: &mut HashMap<String, E>, from: HashMap<String, E>)`
+takes any map whose values hold Sightings, and the compiler builds one copy per `E`
+(*monomorphization*). `add_sighting` is a *provided method*: implementors write `sightings_mut`
+and inherit the deduplication. The trait is implemented for `Vec<Sighting>`, a `std` type,
+which the orphan rule allows because the trait is ours.
 
 **`std::mem::take`**
-Merging needs an image's description without its Sightings, to insert it, and the Sightings
-on their own, to add one by one. `mem::take(entry.sightings_mut())` moves the list out and
-leaves an empty `Vec` in its place (`Default::default()`), with no clone.
+Moves a value out from behind a `&mut`, leaving its `Default` (an empty `Vec`) in its place:
+no clone.
 
-**Wrapping arithmetic, rotations and `chunks_exact`**
-MurmurHash3 multiplies and adds modulo 2³². Rust's `*` and `+` panic on overflow in debug
-builds, so the intent is spelled out: `wrapping_mul`, `wrapping_add`, and `rotate_left` for
-C's `(x << r) | (x >> (32 - r))`. The input is read 4 bytes at a time with `chunks_exact(4)`,
-which yields whole blocks only and keeps the 0 to 3 leftover bytes as its `remainder()`;
-iterating `&mut blocks` leaves `blocks` usable for that call after the loop.
-`u32::from_le_bytes` reads a block as the reference does on x86.
+**Wrapping arithmetic, `rotate_left`, `chunks_exact`, `cast_signed`**
+MurmurHash3 computes modulo 2³², and `*` and `+` panic on overflow in debug builds, so it says
+`wrapping_mul` and `wrapping_add`; `rotate_left` is C's `(x << r) | (x >> (32 - r))`.
+`chunks_exact(4)` yields whole 4-byte blocks and keeps the rest as its `remainder()`, and
+`u32::from_le_bytes` reads a block as x86 does. `u32::cast_signed` (Rust 1.87) reads the same 32
+bits as an `i32`, where `as i32` could be any conversion.
 
-**`cast_signed`**
-Python's `mmh3.hash` returns a signed number: the same 32 bits read as an `i32`.
-`u32::cast_signed` (Rust 1.87) says exactly that, where `as i32` could be any conversion.
+**`let ... else`**
+`let PageRecord::Warc(response) = record else { return; };` binds the pattern, or leaves.
 
-**`let ... else`, again**
-`InlineFaviconExtractor::extract` reads only WARC HTML pages, and returns early otherwise:
-
-```rust
-let PageRecord::Warc(response) = record else {
-    return;
-};
-let Some(html) = response.html_body() else {
-    return;
-};
-```
+---
 
 ## Step 19: The Modular Refactor in Review; Docs and a SLURM Example
 
 ### What we built
 
-Steps 10 to 18 turned a WARC-only extractor of two hard-wired kinds into a program built
-from three independent choices: the Transport (how bytes arrive: `-t disk|memory|mmap`), the
-Format (how records are read: WARC, WAT, WET) and the Artifact kind (what is extracted:
-`-e onion,favicon,inline-favicon`). Which Formats a Shard downloads is no longer a choice
-the user makes, but the planner's: the cheapest Formats serving every kind still to do.
+Steps 10 to 18 in one table:
 
 | | Before (`onion-crawler` 1.3.1) | After (`cc-extract` 2.0.0) |
 |---|---|---|
@@ -1924,372 +946,128 @@ the user makes, but the planner's: the cheapest Formats serving every kind still
 | Favicons | Guessed root `/favicon.ico` on every page, `<base href>` ignored | Declared favicons only, resolved against `<base href>` |
 | Inline favicons | Decoded, then dropped | Saved with SHA-256, Shodan `mmh3` and media type |
 
-Adding an Artifact kind now takes a variant in `ArtifactKind`, an `impl Extractor`, and one
-arm in each `match` on the kind (`format_requirement`, `output_filename`,
-`Findings::empty`, `new_extractor`). The compiler lists every one of those arms, as none
-of them has a `_` fallback, and `tests/cli_help.rs` asks for the new name in the README's
-`-h` block; the parsing loop, the planner and the state handling don't change.
-
-This step brings the documents in line:
-
-- **`documentation/FEATURES.md`** is rewritten for 2.0.0: the paths file and Datasets, Format
-  requirements and Plans, the three record readers, each kind's rules per Format, the
-  `inline_favicons.json` shape, and the known limitations as they stand now (the fixed
-  ones gone, new ones in: what WAT + WET miss compared with WARC, `--limit` on a re-run,
-  the RAM guard with several processes per node, CC-NEWS's unverified Formats).
-- **`README.md`** describes the kinds and the Plans, and shows `cc-extract -h` and
-  `cc-extract merge -h` verbatim. `tests/cli_help.rs` runs the binary and fails when the
-  README no longer matches, so a new option or kind can't be documented in `main.rs` only.
-- **Help text**: `--jobs` showed its default as a number, the core count of the machine
-  printing the help (`[default: 16]`); on a cluster that is the login node's, not the compute
-  node's. It now says `(default: number of CPU cores)`. `--output-dir` stated its default twice,
-  `-t memory` still said "~1 GB per job", `--offset` and `--output-dir` spoke of one SLURM
-  task where the example runs several processes per task, and `--limit --help` now explains
-  that Shards already done aren't counted.
-- **`examples/slurm/crawl.sh` and `merge.sh`** replace the two uncommitted scripts written
-  for one cluster: `<...>` placeholders for account, partition and paths, cores read from
-  `SLURM_CPUS_ON_NODE` instead of a fixed `--cpus-per-task`, any paths file, `--extract` and
-  `--transport memory`. Several processes per node, each with its own `--offset`, `--limit`
-  and `--output-dir`, then `merge` over every `<output root>/<task>/<process>/`.
-- **`documentation/RESEARCH-warc-wat-wet.md`** keeps its measurements under the names they
-  were taken with, and gains a note mapping them to today's.
+Adding a kind takes a variant in `ArtifactKind`, an `impl Extractor`, and an arm in each `match`
+on the kind, which the compiler lists as none has a `_` arm. The documents caught up:
+`FEATURES.md` rewritten for 2.0.0; the README shows `-h` verbatim, checked by
+`tests/cli_help.rs`; `--jobs` no longer shows the core count of the machine printing the help as
+its default; and `examples/slurm/crawl.sh` runs several processes per node, each with its own
+`--offset`, `--limit` and `--output-dir`, which `merge.sh` then merges.
 
 ### Rust concepts introduced
 
-**`include_str!`: a file compiled into the program**
-`include_str!("../README.md")` is a macro that reads the file when the crate is compiled
-and puts its text in the binary as a `&'static str`; the path is relative to the source
-file using it. The test needs no file I/O at run time and can't fail on a missing file: a
-missing README fails the build. Cargo knows the test depends on the file (the compiler
-reports included files as dependencies), so editing the README rebuilds the test.
-`include_bytes!` does the same for a `&'static [u8; N]`.
+**`include_str!`**
+Reads a file at compile time into a `&'static str` (the path relative to the source file): a
+missing README fails the build, and editing it rebuilds the test. `include_bytes!` gives bytes.
 
 **Short and long help from one doc comment**
-clap splits a field's `///` comment at its first blank line: the first paragraph is the
-`-h` text, the whole comment the `--help` text. `-h` stays one line per option, and
-`--help` explains (the `--limit` paragraph above lives there only). A `//` comment between
-`///` and the field, as on `jobs`, is invisible to clap: notes for the reader of the code
-only.
+clap's `-h` shows a field's `///` comment up to its first blank line, `--help` all of it. A `//`
+comment is invisible to clap.
 
 **`default_value_t` and `hide_default_value`**
-`default_value_t = default_jobs()` is an expression clap evaluates when it builds the
-parser, every time the program starts, and `--help` prints whatever it returned.
-`hide_default_value = true` keeps the default but hides it from the help, which then says
-in words what the default is.
+`default_value_t = default_jobs()` is evaluated at every start and printed by `--help`;
+`hide_default_value = true` hides it, so the help can state the default in words.
 
 **Testing the documentation through the binary**
-`Command::new(env!("CARGO_BIN_EXE_cc-extract")).args(["-h"]).output()` runs the binary and
-collects its exit status, stdout and stderr. The test asserts that the README *contains*
-that output (`str::contains`), so the README can wrap it in prose and code fences. clap
-only wraps help to the terminal width with its `wrap_help` feature, which this crate
-doesn't enable, so the output is the same on every machine.
+The test runs the binary with `Command` and asserts the README *contains* its output. clap wraps
+help to the terminal only with its `wrap_help` feature, not enabled here, so the output is the
+same on every machine.
 
 **Cargo's `examples/` discovery**
-Cargo builds `examples/*.rs` and `examples/*/main.rs` as example targets
-(`cargo run --example baseline`). `examples/slurm/` holds no `main.rs`, so Cargo ignores
-it: shell scripts can sit next to Rust examples without becoming a target.
+Cargo builds `examples/*.rs` and `examples/*/main.rs`; `examples/slurm/` has no `main.rs`, so its
+scripts are no target.
 
-## Step 20: Crash-Safe Writes
+---
 
-### What we built
+## Steps 20–23: Fixes
 
-A process can be killed at any moment: a SLURM time limit, `scancel`, the OOM killer,
-Ctrl-C. Two writes used to put a file at its final name before its content was complete,
-so a kill there left a cut-off file that the next run tripped over. Now every file in
-`download/` and in the output directory is either complete or absent.
+### Step 20: Crash-Safe Writes
 
-- **Results files** (`save_sightings_to`): `fs::write` truncated `onions.json` and then
-  wrote the new JSON. A kill in between left a truncated file, which the next run refuses
-  to load (on purpose, rather than overwrite it), so the user had to repair it by hand. The
-  JSON is now written in full to `onions.json.tmp` in the same directory, then
-  `fs::rename`d over `onions.json`. A leftover `.tmp` file is never loaded, and the next
-  save replaces it.
-- **Downloads** (`save_archive`): the body used to stream straight into
-  `download/<file name>`, and any file there counted as downloaded, so an interrupted
-  download was parsed, truncated, on every later run. Chunks now go to
-  `download/<file name>.<process id>.part`, renamed to `download/<file name>` only once the
-  stream ended and, when the server sent one, the byte count matches `Content-Length` (a
-  mismatch is a download error). `save_archive` takes any `Stream` of byte chunks, so the
-  rule is tested without a network.
-- **One existence check**: `fetch` (in `main`) and `download_archive` both checked whether
-  the Archive was in `download/`. Now only `download_archive` does, and returns the path;
-  `download_path` is the one place that says where an Archive goes.
-- **Temporary files removed on error paths**: a `TempFile` guard removes the `.part` file
-  of a failed download, the `.tmp` file of a failed save, and the decompressed copy the
-  `mmap` Transport maps, which used to stay behind when decompression failed.
-- **No `fsync`**: the target is a killed process, not a power cut or a node crash. After a
-  kill, the kernel still writes out what the process wrote; `fsync` would only help when
-  the machine itself goes down, and on a network filesystem it waits for the server to
-  store the whole file, hundreds of MB for `favicons.json`, on every save.
-- **Tests**: a save whose temporary file can't be written fails and leaves the previous
-  `onions.json` byte for byte, still loadable (`tests/output_state.rs`). In
-  `tests/download.rs`, a body arriving in chunks appears at the Archive's name only after
-  the last one, and a body short of its `Content-Length`, or failing part-way, leaves
-  `download/` empty.
+A kill (a SLURM time limit, `scancel`, the OOM killer, Ctrl-C) could leave a file cut short
+under its final name: a truncated `onions.json`, which the next run refuses to load, or a partial
+Archive in `download/`, parsed as if whole on every later run. Each file is now written under a
+temporary name, then renamed once complete: results to `<file>.tmp`, downloads to
+`<file name>.<process id>.part`, renamed only if the byte count matches `Content-Length` when
+the server sent one. A `TempFile` guard removes the temporary file on error paths. No `fsync`: a
+killed process's writes still reach the disk, and syncing hundreds of MB over a network
+filesystem at every save would help only against a machine crash.
 
-### Rust concepts introduced
+- **`fs::rename`** replaces a file in one atomic step, but only within one filesystem (`EXDEV`
+  otherwise), so temporary files sit next to their target, not in `/tmp`.
+- **`std::process::id`** makes the `.part` name unique among processes sharing `download/`.
+- **A guard with `Drop`** runs its cleanup however the function is left, `?` included, and when
+  an async task is cancelled, but not when the process is killed. `keep()` disarms it after the
+  rename. Locals are dropped in reverse order of declaration.
+- **`Stream` and `try_unfold`**: `futures::Stream` is the async `Iterator`. `save_archive` takes
+  any stream of byte chunks, so tests need no network; `stream::try_unfold` turns `reqwest`'s
+  `chunk().await` calls into such a stream.
+- **`std::pin::pin!`** is the standard library's `pin_mut!` (Step 6).
+- **`flush` before `rename`**: `tokio::fs::File` writes on a background thread, and
+  `flush().await` waits for the last write.
 
-**`fs::rename`: replacing a file in one step**
-On Unix, `rename` makes the target name point to the new file in one atomic step: any
-reader, or a run started after a kill, sees either the old file or the new one, never a
-mix, and never no file at all. This holds only within one filesystem, where a rename just
-edits a directory entry; across filesystems it fails (`EXDEV`), and a copy-then-delete
-fallback would lose the atomicity. That is why the temporary file is written next to its
-target, not in `/tmp`, which is often another filesystem (a `tmpfs` in RAM, or a node's
-local disk while the output is on the cluster's shared one).
+### Step 21: `cargo fmt` and `cargo clippy` Clean; Paths File Read Errors
 
-**`std::process::id`: names unique per process**
-`std::process::id()` returns the operating system's id for the running process (`u32`).
-Several processes can share one `download/` and reach the same Shard; with the id in the
-partial file's name, each writes its own file instead of interleaving bytes in one. Ids
-are unique among the processes running on one machine: a reused id belongs to a process
-that is gone, whose leftover `.part` file is simply overwritten. Processes on several
-nodes sharing one `download/` over a network filesystem could still pick the same id. The results
-`.tmp` file needs no id, as each process has its own output directory.
+`cargo fmt -- --check` and `cargo clippy --all-targets -- -D warnings` pass on the whole crate,
+the reformatting in a commit of its own so `git blame --ignore-rev` can skip it. Clippy's
+`lines_filter_map_ok` found a bug: `reader.lines().filter_map(Result::ok)` dropped read errors,
+so a `warc.paths.gz` cut short ran with the paths before the cut and exited 0. The first read
+error now stops the run with exit 1.
 
-**Cleaning up on `?` error paths: a guard type with `Drop`**
-`?` returns from the function as soon as a step fails, skipping any cleanup written
-further down; that is how `parse_mmap` left its decompressed file behind. A guard
-moves the cleanup into `Drop`, which Rust runs on every local value whichever way the
-function is left:
+- **`filter_map(Result::ok)` on `lines()`** makes a read error look like the end of the file,
+  and loops forever on a reader failing on every call; `map_while(Result::ok)`, Clippy's
+  suggestion, ends the loop but still hides the error. Collecting into
+  `Result<Vec<String>, _>` stops at the first error and returns it.
 
-```rust
-struct TempFile { path: Option<PathBuf> }
+### Step 22: The mmap Copy Without a Name
 
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-```
+The `mmap` Transport's decompressed copy, `download/<name>.warc`, had the same name in every
+process: a second process reaching the same Shard truncated the file the first had mapped,
+killing it with `SIGBUS`, and a killed process left 3 to 5 GB behind. `parse_mmap` now creates
+`<file name>.<process id>.mmap` with `create_new`, removes the name at once, then decompresses
+into the open `File` and maps it: no other process can reach the copy, and the kernel frees it
+when the parse ends or the process dies. Windows can't remove an open file, so there the copy
+keeps its name until `TempFile` removes it. `tests/mmap_transport.rs` lists the directory during
+the parse.
 
-`keep(mut self)` sets `path` to `None` once the file has been renamed to its final name,
-so the drop at the end of `keep` has nothing left to remove. The same `Drop` runs when an
-async task is cancelled at an `.await` (dropping a future drops its locals), but not when
-the process is killed: then the file stays under a name no run reads. Locals are dropped in
-reverse order of declaration, so declaring the guard first in `parse_mmap` removes the file
-only after the memory map and the open file are closed.
+- **Unlinked open files**: a name is a directory entry pointing to the file, and the kernel frees
+  the file once no name and no open handle or mapping is left. A kill closes every handle, so it
+  leaves nothing, with no `Drop` needed. Meanwhile `df` counts the space; `ls` and `du` don't see
+  it. NFS clients emulate this with a hidden `.nfsXXXX` file.
+- **`OpenOptions::create_new`** creates the file or fails with `AlreadyExists`, in one system call
+  (`O_CREAT | O_EXCL`), where `File::create` would truncate another process's file. It needs
+  `read(true)` too, as a mapping requires a handle opened for reading.
+- **`Mmap::map(&file)`** maps whatever the handle refers to, named or not; the `File`'s writes and
+  the mapping share the page cache, so no flush is needed.
+- **`#[cfg]` on a statement; a guard declared before it is assigned**: the Windows guard,
+  `let _copy_name: TempFile;`, is assigned only once `create_new` succeeds. It is dropped last,
+  and never if never assigned, so a failed `create_new` can't remove another process's file.
+  `_copy_name` lives to the end of the function, where `let _ = ...` would drop it at once.
+- **`Rc<RefCell<..>>`** in the test: several owners of one value, borrows checked at runtime.
+  Neither is thread-safe (`Arc<Mutex<..>>` is), and the test needs no threads.
 
-**`Stream` and `try_unfold`: an async iterator, and building one**
-`futures::Stream` is the async counterpart of `Iterator`: `next().await` yields the next
-item, or `None` at the end. `save_archive` is generic over
-`S: Stream<Item = Result<B, E>>` with `B: AsRef<[u8]>`, so it reads `reqwest`'s `Bytes`
-as well as a test's `Vec<u8>`. `reqwest` hands the body out through repeated
-`response.chunk().await` calls instead; `stream::try_unfold(response, |mut response| ...)`
-turns those calls into a `Stream`, passing the response from one call to the next.
-`TryStreamExt::try_next()` reads such a stream of `Result`s with `?`.
+### Step 23: An Exit Status for Shards Left Undone
 
-**`std::pin::pin!`: the standard library's `pin_mut!`**
-`try_next` needs a stream that can't move (Step 6's pinning). `std::pin::pin!(chunks)`
-does what `futures::pin_mut!` does, from the standard library: it pins the stream on the
-stack and gives back a `Pin<&mut S>`, which is `Unpin` itself.
-
-**`flush` before `rename` with `tokio::fs::File`**
-`tokio::fs::File` does its writes on a background thread: `write_all` may return before
-the last one has reached the file. `flush().await` waits for it. Renaming without it could
-give a reader the Archive's name before its last bytes are in.
-
-## Step 21: `cargo fmt` and `cargo clippy` Clean; Paths File Read Errors
-
-### What we built
-
-`cargo fmt -- --check` and `cargo clippy --all-targets -- -D warnings` now pass on the
-whole crate, so whatever they report on a new change belongs to that change.
-
-- **Formatting**: `cargo fmt` reformatted five files in `src/`, the `use cc_extract::{...}`
-  block of `main.rs` among them (edition 2024's style sorts names differently). It goes in
-  a commit of its own, with nothing else, so `git blame --ignore-rev` can skip it.
-- **Paths file read errors** (clippy's `lines_filter_map_ok`): the paths file was read with
-  `reader.lines().filter_map(Result::ok)`, which dropped read errors. A `warc.paths.gz`
-  cut short by an interrupted download gave only the paths before the cut, and the run
-  went on with them and exited with 0.
-  The first read error now stops the run with exit 1 and a message naming the file, like
-  a paths file that can't be opened or isn't gzip. Tested end to end in
-  `tests/crawl_cli.rs`: a `.gz` paths file cut in half stops the run before anything is
-  written.
-- **`collapsible_if`**: the `--limit` check is one let chain, like the `--formats` check;
-  here a pattern and a plain `bool` condition are joined by `&&`, where `--formats` joins
-  two patterns.
-
-### Rust concepts introduced
-
-**Why `filter_map(Result::ok)` on `lines()` hides errors**
-`BufRead::lines()` yields one `io::Result<String>` per line. `filter_map(Result::ok)` turns
-each `Err` into `None` and drops it, so a read error looks like the end of the file: the
-lines read before it come back as if they were all of it. It can also loop forever, as
-`lines()` doesn't stop after an error: a reader that fails the same way on every call
-yields `Err` endlessly, and `filter_map` keeps asking for the next one. Clippy suggests
-`map_while(Result::ok)`, which stops at the first `Err`; that ends the loop but still
-hides the error, making the silent truncation official.
-
-**`collect::<Result<Vec<_>, _>>()` stopping at the first error**
-As with `Plan::within` (Step 14), collecting the `Result`s into `Result<Vec<String>, _>`
-stops at the first `Err` and returns it, or returns every line in a `Vec`. `unwrap_or_else`
-then reports the error and exits, as the opening of the file does a few lines above.
-
-## Step 22: The mmap Copy Without a Name
-
-### What we built
-
-The `mmap` Transport decompresses an Archive to a copy it can map. That copy was
-`download/<file name without .gz>.warc`, the same name in every process, removed by a
-`TempFile` guard when `parse_mmap` returned. Two problems remained:
-
-- **Processes sharing a `download/` clashed on it.** Overlapping slices on a re-run can
-  bring two processes to the same Shard at once. The second one's `File::create`
-  truncated the file the first had mapped, and the first was killed by `SIGBUS` as soon
-  as it read a mapped page past the new end.
-- **A killed process left its copy behind**, 3 to 5 GB for a WARC Archive, until the
-  Shard was parsed with mmap again, which may never happen.
-
-A name unique per process, as the `.part` downloads have, solves the first and worsens
-the second: every kill would leave a multi-GB file that no later run overwrites. So the
-copy now gets a unique name, `<file name>.<process id>.mmap`, only for the instant it is
-created: `parse_mmap` opens it with `create_new`, removes the name at once, decompresses
-into the open `File` and maps that same `File`. The copy never shows in `download/`, no
-other process can open it, and the kernel frees its space when the parse ends or the
-process dies. `parse_mmap` no longer needs the `TempFile` guard on Unix; downloads and
-results files still use it.
-
-Windows can't remove an open file, so there (`#[cfg(not(unix))]`) the copy keeps its
-name, and the guard removes it when the function returns, as before; a killed process
-leaves it behind.
-
-- **Tests** (`tests/mmap_transport.rs`): an extractor that lists the Archive's directory
-  when handed the first page shows only the Archive there while the parse runs, which
-  failed before the change (the `.warc` copy was listed); a parse failing on an Archive
-  cut short leaves only the Archive too.
-
-### Rust concepts introduced
-
-**Unlinked open files: when the kernel frees a file**
-On Unix, a file and its name are separate things. A directory entry points to the file
-(its inode), and `fs::remove_file` (`unlink`) only removes that entry. The kernel frees
-the file's blocks once two counts reach zero: the names pointing to it, and the open
-handles and memory mappings on it. Removing the name of a file that is still open
-therefore changes nothing for the process holding it: reads, writes and mappings go on.
-What changes is that nobody else can reach the file, and that its space is reclaimed as
-soon as the last handle goes away, whichever way it goes away: `drop` closing the `File`,
-an error returned through `?`, or the kernel closing every handle of a killed process. No
-`Drop` guard is needed, and a kill, which runs no destructors, leaves nothing. While the
-parse runs, the space is still used: `df` counts it, but `ls` and `du`, which walk names,
-don't see it.
-
-Network filesystems emulate this. An NFS client asked to remove a file it still has open
-renames it to a hidden `.nfsXXXX` (`ls -a` shows it, but no run looks for that name) and
-removes that once the file is closed, after a kill too; only a crash of the client machine
-leaves one. Lustre and GPFS keep such files on
-their servers.
-
-**`OpenOptions::create_new`: create, never open**
-`OpenOptions::new().read(true).write(true).create_new(true).open(path)` creates the file
-and fails with `ErrorKind::AlreadyExists` if the name exists, where `File::create` would
-open the existing file and truncate it. The check and the creation are one system call
-(`O_CREAT | O_EXCL`), so no other process can slip in between. With a name unique per
-process the error should never happen; it is what makes sure that, if two machines
-sharing `download/` ever pick the same process id at the same instant, the second gets an
-error rather than the first one's file. `read(true)` is needed too: the same `File` is
-then mapped for reading, which the system allows only through a handle opened for reading
-(`EACCES` otherwise).
-
-**Mapping a file that has no name**
-`memmap2::Mmap::map(&file)` takes an open `File`, not a path: it maps whatever that handle
-refers to, named or not. The bytes written through the `File` and the mapped pages are
-the same page cache, so the mapping sees everything `io::copy` wrote without a flush (a
-`File` has no buffer of its own in user space). `copy.metadata()` asks the open handle
-for the size (`fstat`), where `fs::metadata(path)` would need the name. The mapping
-stays `unsafe`: the compiler can't know that no one changes the file while it is mapped.
-With no name, no other process can open it to do so; that is what made the `SIGBUS`
-above impossible.
-
-**`#[cfg]` on statements, and a guard declared before it is assigned**
-`#[cfg(unix)]` and `#[cfg(not(unix))]` can mark a single statement, not only an item:
-`#[cfg(unix)] fs::remove_file(&copy_path)?;` exists only in Unix builds, and the Windows
-guard only in the others. That guard is declared first, `let _copy_name: TempFile;`, and
-assigned only once `create_new` succeeded. Locals are dropped in reverse order of
-*declaration*, so it is dropped last, after the mapping and the `File`; and a variable
-never assigned is never dropped, so when `create_new` fails (the name belongs to another
-process) the guard doesn't remove that other process's file. `_copy_name`, unlike `_`, is
-a real binding: the guard lives until the end of the function, where `let _ = ..` would
-drop it, and remove the file, on the spot.
-
-**Sharing a value with a boxed trait object: `Rc<RefCell<..>>`**
-The test's extractor goes into `parse_archive` as a `Box<dyn Extractor>`, and the trait
-hands nothing back but `Findings`. To read the directory listing it took, the test keeps a
-second handle on it: `Rc` (reference counted) gives a value several owners, and `RefCell`
-lets one of them change it through a shared handle, with the borrow rules checked at run
-time (`borrow_mut` panics if the value is already borrowed) instead of at compile time.
-Neither is thread-safe (that would be `Arc<Mutex<..>>`); `parse_archive` runs on the
-test's own thread, so they need not be.
-
-## Step 23: An Exit Status for Shards Left Undone
-
-### What we built
-
-A run that went to the end exited with 0 even when some Shards failed: their kinds were
-left undone, counted in the summary and retried by the next run, but nothing outside the
-logs showed it. On a cluster, `sacct` listed every task as COMPLETED. A script or scheduler
-can now tell from the exit status alone what to do next:
+A run exited 0 even when Shards failed and were left for the next run, so `sacct` showed every
+task COMPLETED. Now:
 
 | Code | Meaning | Run again? |
 |---|---|---|
 | 0 | Every Shard taken on done for every requested kind | No need |
-| 1 | Stopped early (missing or unreadable paths or results file, `--offset` past the end, ...) | Once the cause is fixed |
-| 2 | Invalid option or value | Once the command is fixed |
+| 1 | Stopped early (paths or results file missing or unreadable, `--offset` past the end, ...) | Once the cause is fixed |
+| 2 | Invalid option or value (`clap`) | Once the command is fixed |
 | 3 | Ran to the end with some Shards left with kinds undone | Yes, the same command |
 
-- **3, not 2.** `clap` already exits with 2 on invalid arguments (`--jobs abc`, an unknown
-  flag), as `grep`, `diff` and shell builtins do for misuse. A wrapper retrying on 2 would
-  retry a typo forever, so Shards to retry got the next free code.
-- **Failed saves count.** A kind whose results file can't be saved, or whose
-  `processed.log` line can't be appended, was only a warning; it is now added to the
-  Shard's undone kinds, like a kind whose Archive failed to download or parse, so the
-  Shard counts as failed in the summary and in the exit status. The final save of every
-  file stays a safety net and doesn't count: each kind it saves was either saved after its
-  Shard already, or failed to save then and already counts as undone.
-- **`--help`** lists the exit statuses after the options (`after_long_help`); `-h`, which the
-  README shows verbatim, is unchanged.
-- **`examples/slurm/crawl.sh`** reports, per process, "finished with Shards to retry"
-  (exit 3) or "stopped early" (any other non-zero exit, a kill by a signal included), and
-  counts both in its final line. It still exits with 0, so `--dependency=afterok` starts
-  `merge.sh` on the results so far.
-- **Tests** (`tests/crawl_cli.rs`): a WET Archive that isn't gzip leaves `onion` undone
-  while `favicon` finishes from WAT, and the run exits with 3, counting one failed Shard; a
-  directory in the way of `favicons.json.tmp` makes the save fail, with the same outcome
-  and no `processed.log` line. The early stop on `--formats` that can't serve a kind is
-  pinned to exit 1.
+3, not 2: `clap` exits with 2 on misuse, and a wrapper retrying on 2 would retry a typo forever.
+A failed save or `processed.log` append now leaves the kind undone too. `--help` lists the codes
+(`after_long_help`), and `examples/slurm/crawl.sh` reports, per process, Shards to retry and
+early stops.
 
-### Rust concepts introduced
-
-**`ExitCode` and the `Termination` trait**
-`main` can return any type implementing `std::process::Termination`, whose `report` method
-turns it into the process's exit status. `()` reports success (0); `Result<(), E>` reports
-1 on `Err`, after printing the error with `Debug`; `ExitCode` reports its own value.
-`ExitCode::SUCCESS` and `ExitCode::FAILURE` are the portable 0 and 1, and
-`ExitCode::from(3u8)` builds any other: a `u8`, because only the low 8 bits of an exit
-status reach the parent process on Unix. `#[tokio::main]` passes `main`'s return type
-through, so `async fn main() -> ExitCode` works as the synchronous one does. `run_crawl`
-returns the `ExitCode` and `main` returns it in turn.
-
-**Why `process::exit` skips `Drop`**
-`process::exit` ends the process on the spot: it never returns (its type is `!`), so the
-stack frames above it are never unwound and no value in them is dropped. Buffered writers
-lose what they hold, temporary files guarded by a `Drop` (the `TempFile` of Step 20) stay
-behind, and the Tokio runtime is not shut down. Returning from `main` instead drops every
-local first, in reverse order of declaration, then exits with the code `main` returned.
-The early stops still call `process::exit(1)`: the crawl's come before anything is
-downloaded or written, and `merge`'s after a failed save has already removed its temporary
-file, so no destructor has work left to do there. Turning each of them into a returned
-`ExitCode` would thread a value through closures like `unwrap_or_else` for no gain.
-
-**`after_help` and `after_long_help`**
-`clap` prints `after_help` at the end of both `-h` and `--help`, and `after_long_help`
-at the end of `--help` only, replacing `after_help` there. Set on `Config` with
-`#[command(after_long_help = "...")]`, the exit statuses stay out of the short help. A
-string starting with `"\` and a newline skips that first line break, so the text starts at
-the left margin of the next line.
+- **`ExitCode` and `Termination`**: `main` may return any `Termination` type: `()` reports 0,
+  `Result::Err` 1, an `ExitCode` its own value (`ExitCode::from(3u8)`: only the low 8 bits reach
+  the parent). `#[tokio::main]` passes it through.
+- **`process::exit` skips `Drop`**: it never returns (its type is `!`), so nothing above it is
+  dropped: buffered writes are lost, `TempFile`s stay, the runtime isn't shut down. The early
+  stops keep it, as they come before anything is written.
+- **`after_help` / `after_long_help`**: text printed after both helps, or after `--help` only.
 
 ---
 
@@ -2297,140 +1075,88 @@ the left margin of the next line.
 
 ### What we built
 
-Onion matching went by shape alone: 16 or 56 characters of `[a-z2-7]`, then `.onion`. An
-address written in uppercase, or ending in `.Onion`, was missed, and any 56 base32
-characters passed for a v3 address, whatever they encoded. Now:
+Onion matching went by shape: 16 or 56 characters of `[a-z2-7]`, then `.onion`. An address in
+uppercase or ending in `.Onion` was missed, and any 56 base32 characters passed for v3. Now:
 
-- **Any case.** The characters and the suffix match in any case, and every address is
-  returned lowercase, since it becomes the Artifact key: `ABC…XYZ.ONION` and
-  `abc…xyz.onion` are one Artifact. `ONION_PATTERN` lists both cases of every letter
-  (`[a-zA-Z2-7]`, `\.[oO][nN][iI][oO][nN]`) instead of using `(?i)`, which together with a
-  Unicode `\b` once made it over 1000x slower (see Performance Fixes).
-- **v3 addresses verified.** 56 base32 characters are 35 bytes:
-  `public key (32) || checksum (2) || version (1)`. `onion_search::checked_address` decodes
-  them (base32 written by hand) and keeps the address only if the version is 3 and the
-  checksum is the first 2 bytes of `SHA3-256(".onion checksum" || public key || version)`,
-  computed with the `sha3` crate (RustCrypto, like `sha2`). Anything else is dropped
-  silently, like text that doesn't match. Over 99 Shards of CC-MAIN-2026-34, all 203 v3
-  addresses found passed: the check guards against look-alikes, it fixes no output seen
-  so far.
-- **v2 unchanged.** 16-character addresses carry no checksum and are kept without a
-  check. Tor dropped them in 2021: history, not live services.
-- **One check for everyone.** Both engines and `examples/baseline.rs` keep only what
-  `checked_address` returns, lowercased by it, so the three still count the same onions.
-- **No rules version.** `processed.log` doesn't record which rules extracted a pair, so
-  the new rules apply to the Shards extracted from now on; a fresh `--output-dir` gives
-  results all under one set of rules.
-- **Tests.** `src/onion_search.rs` adds an all-uppercase address, mixed case in the
-  characters, `.Onion` and `.oNIoN` suffixes, a v3 address with one character changed
-  (checksum fails), one encoding version 4 (with the checksum computed for version 4, so
-  only the version is wrong), and addresses of every case in one body coming out in page
-  order; the engine-agreement inputs gain all of these. The v3 address the unit tests used
-  encoded version `0xD7`, so it is replaced by one built from a made-up public key: base32
-  packs 5 bits per character, so the first 51 characters (255 of the key's 256 bits) can
-  spell anything (here the alphabet), and the last five, holding the key's last bit, the
-  checksum and the version, were computed with Python's `hashlib`, an implementation
-  independent of the one under test. The fixture of `tests/parse_characterization.rs`
-  writes one address in uppercase, `.ONION` included: it used to be missed, and is now
-  found and recorded lowercase.
+- **Any case**, suffix included; every address is returned lowercase, as it is the Artifact
+  key. `ONION_PATTERN` lists both cases (`[a-zA-Z2-7]`, `\.[oO][nN][iI][oO][nN]`) rather than
+  using `(?i)` (see Performance).
+- **v3 verified**: the 56 characters decode to `public key (32) || checksum (2) || version (1)`,
+  and `checked_address` keeps the address only if the version is 3 and the checksum is the first
+  2 bytes of `SHA3-256(".onion checksum" || public key || version)` (`sha3` crate; base32 by
+  hand). Anything else is dropped silently. All 203 v3 addresses found in 99 Shards of
+  CC-MAIN-2026-34 passed: the check guards against look-alikes, it changes no output seen so
+  far.
+- **v2 kept unchecked**: 16-character addresses carry no checksum; Tor dropped them in 2021.
+- **One check**: both engines and `examples/baseline.rs` keep only what `checked_address`
+  returns, so they still count the same onions.
+- **No rules version**: `processed.log` doesn't record which rules extracted a pair, so the new
+  rules apply from now on; a fresh `--output-dir` keeps results under one set of rules.
+- **Tests**: uppercase, mixed case, `.Onion`, a wrong checksum, a version 4 address, page order.
+  The old test address encoded version `0xD7`; its replacement is built from a made-up key: the
+  first 51 base32 characters are free, the last five computed with Python's `hashlib`.
 
-**How the memchr engine finds `.onion` in any case.** `memmem` compares bytes exactly, so
-one `.onion` needle can't find `.ONION` or `.oNiOn`, and there are 32 spellings. The
-candidates, timed as a bare scan over 1 GB of a decompressed WARC Archive (no
-validation):
+**The memchr engine in any case.** `memmem` compares bytes exactly, and `.onion` has 32
+spellings. Bare scans over 1 GB of a decompressed WARC Archive:
 
 | Scan | Time for 1 GB |
 |---|---|
 | `memmem` for `.onion` (the old engine, lowercase only) | 27 ms |
-| `memmem` for `.o`, and again for `.O`, positions merged in order | 47 ms |
-| Teddy (`aho-corasick`'s packed SIMD searcher) over `.o` and `.O`, one pass | 54 ms |
-| Teddy over the 32 spellings of `.onion` | 94 ms |
-| the new `ONION_PATTERN` with `regex::bytes` | 94 ms |
-| `memchr` for `.`, then compare the next 5 bytes ignoring case | 230 ms |
+| `memmem` for `.o`, and again for `.O`, merged in order | 47 ms |
+| Teddy (`aho-corasick`'s SIMD searcher) over `.o` and `.O` | 54 ms |
+| Teddy over the 32 spellings, or the new `ONION_PATTERN` | 94 ms |
+| `memchr` for `.`, then the next 5 bytes ignoring case | 230 ms |
 
-The `.` is the only byte the same in every spelling, but that Archive has one every 34
-bytes, and stopping at each costs more than scanning. `.o` and `.O` are rare: the engine
-scans for each with its own `memmem::Finder` (the pair is a `SuffixFinder`, built once per
-extractor) and compares the four letters after them with `eq_ignore_ascii_case`. It stays
-the faster engine, with nothing but the `memchr` crate.
+The engine scans for `.o` and `.O` (`SuffixFinder`) and compares the rest ignoring case. Each
+full `memmem` scan costs ~22 ms per GB, so doing better would take hand-written SIMD.
 
-Each full `memmem` scan costs about 22 ms per GB however rare its needle, so two scans
-can't get much under 47 ms; one pass for both needles would take hand-written SIMD.
+**Timings** (`-e onion --formats warc`, parse time, release builds):
 
-**Timings.** `-e onion --formats warc`, parse time as the run prints it (to 0.1 s), with
-the release binaries of before and after:
+| Archive | memchr, before → after | regex, before → after |
+|---|---|---|
+| CC-NEWS 1 GB, disk, 3 rounds | 6.0–6.1 → 6.1–6.2 s | 6.1 → 6.4 s |
+| CC-NEWS 1 GB, memory | 6.0 → 6.1 s | 6.0 → 6.3 s |
+| CC-MAIN 0.9 GB, disk | 4.7 → 4.7 s | 4.7 → 4.9 s |
 
-| Archive | Transport | Engine | Before | After |
-|---|---|---|---|---|
-| CC-NEWS, 1 GB, 3 rounds | disk | memchr | 6.0, 6.1, 6.1 s | 6.1, 6.2, 6.2 s |
-| | disk | regex | 6.1, 6.1, 6.1 s | 6.4, 6.4, 6.4 s |
-| | memory | memchr | 6.0 s | 6.1 s |
-| | memory | regex | 6.0 s | 6.3 s |
-| CC-MAIN, 0.9 GB | disk | memchr | 4.7 s | 4.7 s |
-| | disk | regex | 4.7 s | 4.9 s |
-
-The memchr engine costs about 0.1 s more on the CC-NEWS Archive (2 %), the regex engine
-0.3 s (5 %): the bare-scan differences above, times the ~4.5 GB the Archive decompresses
-to. The regex's cost can't be written away: every form of the pattern tried (classes
-listing both cases, `(?i:onion)` on the suffix alone, an ASCII-only `(?i)` over the whole
-pattern) scans at the same 93 ms per GB, as `regex` searches the 32 spellings of `.onion`
-at once whatever the pattern says, and only the old lowercase-only pattern let it use
-`memmem` on one literal. With `-t memory`, the download (11 to 29 s here) dwarfs either.
-
-**Same onions, before and after.** On the CC-MAIN Archive (25 onions), the old and new
-binaries, with either engine, wrote identical `onions.json` files, and `baseline` counted
-the same 25, before and after; on the CC-NEWS one, all found the same single onion.
-`every_transport_and_engine_agrees_on_real_archive` passes on the CC-MAIN Archive.
+memchr costs ~2 % more, regex ~5 %. The regex's cost can't be written away: every form tried
+(classes, `(?i:onion)`, an ASCII-only `(?i)`) scans at 93 ms per GB, as `regex` searches the 32
+spellings at once. With `-t memory`, the download (11 to 29 s) dwarfs either. On the CC-MAIN
+Archive, old and new binaries wrote identical `onions.json` files with either engine, and
+`baseline` counted the same 25 onions; on the CC-NEWS one, all found the same single onion.
 
 ### Rust concepts introduced
 
-**Const generics: `fn decode_base32<const N: usize>(...) -> Option<[u8; N]>`**
-A generic parameter can be a value instead of a type. `N` is fixed at each call
-(`decode_base32::<35>`), so the function returns a plain array on the stack, sized at
-compile time, with no `Vec` and no heap allocation, and the length check
-`text.len() * 5 != N * 8` reads as the definition of base32: 5 bits per character, 8 per
-byte.
+**Const generics**
+`fn decode_base32<const N: usize>(text: &[u8]) -> Option<[u8; N]>` takes a value as a generic
+parameter: `decode_base32::<35>` returns an array on the stack, sized at compile time, and the
+check `text.len() * 5 != N * 8` reads as base32's definition (5 bits per character, 8 per byte).
 
-**Decoding base32 with a bit queue**
-Each character is 5 bits; they are shifted into a small integer (`bits = (bits << 5) |
-value`) and counted (`pending`). As soon as 8 are waiting, the oldest 8 go out as one byte
-(`(bits >> (pending - 8)) as u8`), and a mask keeps only those left over. At most 7 bits
-remain after a byte and 5 arrive, so a `u16` holds them. `as u8` keeps the low 8 bits of a
-wider integer, which is why the shift comes first.
+**Base32 with a bit queue**
+Each character's 5 bits are shifted into a `u16` (`bits = (bits << 5) | value`) and counted. Once
+8 are waiting, the oldest go out as a byte (`(bits >> (pending - 8)) as u8`, `as u8` keeping the
+low 8 bits) and a mask drops them; at most 7 + 5 bits are ever held.
 
 **`Digest::chain_update`**
-The RustCrypto hash traits (`sha2`, `sha3`, ...) let a hash be fed in pieces:
-`Sha3_256::new().chain_update(a).chain_update(b).finalize()` hashes `a` then `b`, as if
-they were one buffer, without first copying them into one. `chain_update` takes the hasher
-by value and returns it, so the calls chain, builder-style.
+`Sha3_256::new().chain_update(a).chain_update(b).finalize()` hashes `a` then `b` as one buffer,
+without copying them together; each call takes the hasher and returns it, builder-style.
 
-**Merging two sorted iterators: `Peekable` and `iter::from_fn`**
-`memmem::Finder::find_iter` yields positions in increasing order, one iterator per needle.
-`.peekable()` adds `peek()`, which shows the next item without taking it; comparing the
-two peeks and taking the smaller with `next()` merges them as merge sort merges its
-halves. `std::iter::from_fn(closure)` turns that closure into an iterator: each call of
-`next` runs it, and its `None` ends the iteration. The closure is `move`, so it owns both
-peekable iterators. `chain` would be simpler but returns every `.o` before every `.O`,
-out of page order, which the regex engine keeps.
+**Merging sorted iterators: `Peekable` and `iter::from_fn`**
+`find_iter` yields positions in order, one iterator per needle. `peek()` shows the next item
+without taking it, so comparing the two peeks and taking the smaller merges them, as merge sort
+does. `iter::from_fn(move || ...)` turns the closure into an iterator that ends at its first
+`None`. `chain` would put every `.o` before every `.O`, out of page order.
 
-**`impl Trait` and lifetimes in edition 2024**
-`fn candidates(&self, body: &[u8]) -> impl Iterator<Item = usize>` returns an iterator
-that borrows both `self` and `body`. Since edition 2024, a return-position `impl Trait`
-captures every lifetime in scope by default; earlier editions needed `+ '_` or a named
-lifetime to say the result borrows its inputs.
+**`impl Trait` captures lifetimes in edition 2024**
+`fn candidates(&self, body: &[u8]) -> impl Iterator<Item = usize>` borrows both arguments.
+Edition 2024 captures every lifetime in scope; earlier editions needed `+ '_`.
 
 **`#[expect(lint, reason = "...")]`**
-Clippy's `large_enum_variant` warns when one variant of an enum is much larger than the
-others, since every value is as large as the largest variant: `OnionSearch::Memchr` holds
-two `Finder`s (288 bytes), `OnionSearch::Regex` a 32-byte handle. There is one per
-extractor, already on the heap inside a `Box<dyn Extractor>`, so boxing the variant would
-only add a pointer to follow per record. `#[expect]` (Rust 1.81) silences the lint with the
-reason written next to it, and, unlike `#[allow]`, itself warns if the lint stops firing,
-so the exception can't outlive its cause.
+Clippy's `large_enum_variant` flags `OnionSearch`: 288 bytes for `Memchr`, 32 for `Regex`. There
+is one per extractor, already boxed, so boxing the variant would only add a pointer to follow per
+record. `#[expect]` (Rust 1.81) silences the lint with its reason and, unlike `#[allow]`, warns
+once the lint stops firing.
 
 **`checked_` names and `bool::then`**
-The standard library's `checked_add`, `checked_sub`, ... return `Option`: `None` instead
-of a wrong value. `checked_address` follows that convention. Its last line,
-`valid.then(|| ...)`, turns a `bool` into an `Option`: `Some` of the closure's result when
-`true`, `None` without running it when `false`. On the regex side, `filter_map` then keeps
-the `Some`s and drops the `None`s in one step.
+Like `checked_add`, `checked_address` returns `None` rather than a wrong value.
+`valid.then(|| ...)` is `Some` of the closure's result when `true`, and `None`, without running
+it, when `false`; `filter_map` then keeps the `Some`s.
