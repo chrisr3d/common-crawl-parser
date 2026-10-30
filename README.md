@@ -203,7 +203,7 @@ without its Format suffix, such as `.warc.gz`):
 
 ```json
 {
-  "exampleexampleexampleexampleexampleexampleexampleexample.onion": [
+  "exampleexampleexampleexampleexampleexampleexampleexkokad.onion": [
     {
       "page_url": "https://example.com/page",
       "date": "2025-01-01T00:00:01Z",

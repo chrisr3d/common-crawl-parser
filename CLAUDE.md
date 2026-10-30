@@ -40,7 +40,7 @@ Parsing separates three independent choices: Transport (how bytes arrive), Forma
 - **`src/extractor.rs`** -- `trait Extractor` (one boxed extractor per kind per Archive; a kind reading several Archives has its Sightings unioned), `OnionExtractor` (engine `Memchr | Regex`; searches the WARC HTTP response, the raw WAT JSON, the WET text), `FaviconExtractor` (WARC HTML body, WAT `Head`; nothing in WET), `InlineFaviconExtractor` (WARC HTML body only). The parsing loop never names a kind.
 - **`src/page_record.rs`** -- `PageRecord<'a>` (one variant per Format: `Warc(WarcResponse)`, `Wat(WatMetadata)`, `Wet(WetConversion)`) borrowing the parser's bytes; HTML detection via `WarcResponse::html_body()`. `WatMetadata::parse`: `memmem` prefilter for `"WARC-Type":"response"`, then one `serde_json` parse into partial structs borrowing from the record (`Cow<'a, str>`), down to `Head { base, links, metas }`; crawl date from `Envelope.WARC-Header-Metadata.WARC-Date`.
 - **`src/warc_parser.rs`** -- Custom byte-level WARC record parser. `WarcRecordIter<R: BufRead>` for streaming, `WarcSliceIter<'a>` for mmap. Both keep one `WARC-Type` (`Format::record_type`: `response` for WARC, `metadata` for WAT, `conversion` for WET) and skip other records' bodies for performance.
-- **`src/onion_search.rs`** -- `ONION_PATTERN` (ASCII word boundaries) and the two engines: `search_regex_bytes()` (regex::bytes) and `search_memchr()` (SIMD memmem). Both return `Vec<String>`.
+- **`src/onion_search.rs`** -- `ONION_PATTERN` (any case, ASCII word boundaries), `checked_address` (the one validity check, applied by both engines and `examples/baseline.rs`: v2 kept as is, v3 checksum and version verified with `sha3` over hand-written base32; returns the address lowercase) and the two engines: `search_regex_bytes()` (regex::bytes) and `search_memchr()` (`SuffixFinder`: SIMD memmem for `.o` and `.O`, merged in order). Both return `Vec<String>`.
 - **`src/favicon_search.rs`** -- Byte-level `<link>`/`<meta>` favicon scanner for WARC (URLs, and base64 `data:` URIs decoded with their media type: `InlineImage`), resolving against the first `<base href>` (scanned only once a favicon URL is found); `favicons_in_head` applies the same rules to a WAT `Head` (resolves against `Head.Base`, skips the truncated `data:` URLs). Declared favicons only, no guessed root `/favicon.ico` (unverified, and one per page).
 
 **Data flow**: Read paths file (WARC, WAT or WET) -> schedule each Shard with its requested kinds not yet done -> plan its Formats, derive the Plan's Archive paths -> concurrent per-Shard tasks: download each Archive (async), then `spawn_blocking` parse each with the extractors of the kinds reading its Format (CPU-bound) -> merge results sequentially -> per kind whose Archives all parsed: save JSON, then mark `<shard> <kind>` done.
@@ -54,7 +54,7 @@ Parsing separates three independent choices: Transport (how bytes arrive), Forma
 ## Performance notes
 
 - `[profile.dev.package."*"] opt-level = 2` optimizes dependencies in debug builds
-- Regex must be case-sensitive -- `(?i)` with `\b` causes 1000x+ slowdown
+- Onion regex lists both cases per letter (`[a-zA-Z2-7]`, `[oO]`) -- `(?i)` with `\b` caused a 1000x+ slowdown
 - `flate2` uses `zlib-ng` backend for SIMD gzip decompression
 - Resource guards cap concurrency at `min(requested_jobs, 2x CPU cores, available_RAM / largest estimated Plan)` (the RAM cap only with `-t memory`; estimates: WARC 1 GB, WAT 170 MB, WET 70 MB)
 

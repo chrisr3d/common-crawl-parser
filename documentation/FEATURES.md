@@ -186,17 +186,35 @@ name until the parse ends, and a killed process leaves it behind.
 
 Code: `src/onion_search.rs`, `OnionExtractor` in `src/extractor.rs`.
 
-**What matches.** A run of exactly 16 (v2) or 56 (v3) characters from the base32
-alphabet `[a-z2-7]`, followed by `.onion`, with a word boundary on both sides.
-This is the regex `\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b`.
+**What matches.** A run of exactly 16 or 56 characters from the base32 alphabet
+(`a-z`, `2-7`), followed by `.onion`, with a word boundary on both sides, in any
+case: the characters and the suffix (`.ONION`, `.Onion`). This is the regex
+`\b([a-zA-Z2-7]{16}|[a-zA-Z2-7]{56})\.[oO][nN][iI][oO][nN]\b`, each letter
+listing both cases: the `(?i)` flag, with `\b`, once made it over 1000x slower.
+Then:
+
+- 56 characters are a v3 address, which carries its own check: its base32
+  decodes to a 32-byte public key, a 2-byte checksum and a version byte. It is
+  kept only if the version is 3 and the checksum is the first 2 bytes of
+  `SHA3-256(".onion checksum" || public key || version)`; any other is dropped
+  silently, like text that doesn't match. Over 99 Shards of CC-MAIN-2026-34,
+  all 203 v3 addresses found passed.
+- 16 characters are a v2 address, kept without a check: there is no checksum
+  to verify. Tor dropped v2 in 2021, so these are history, not live services.
+
+Every address is recorded lowercase, whatever its case on the page:
+`ABC…XYZ.ONION` and `abc…xyz.onion` are one Artifact.
 
 `--onion-engine` picks the search; both find the same addresses, and unit tests
 check that they agree:
 
 | Engine | Technique |
 |---|---|
-| `memchr` (default) | Jump to each `.onion` literal with SIMD `memmem`, count base32 characters backwards, check the boundaries |
+| `memchr` (default) | Jump to each `.o` and `.O` with SIMD `memmem`, compare the rest of `.onion` ignoring case, count base32 characters backwards, check the boundaries |
 | `regex` | The regex above, with `regex::bytes` on the raw bytes |
+
+Both engines, and `examples/baseline.rs`, then apply the same check and
+lowercasing (`onion_search::checked_address`), so they count the same onions.
 
 **Where it looks.** Every page record, whatever its content type:
 
@@ -205,8 +223,8 @@ check that they agree:
   `RESEARCH-warc-wat-wet.md`, 53 % of matches came from `Onion-Location` and
   `Content-Security-Policy` headers.
 - WAT: the raw JSON bytes, which repeat the HTTP headers and hold the page's
-  links, link texts and `<meta>` contents. An address is made of `[a-z2-7.]`,
-  which JSON never escapes, so it is found as in WARC.
+  links, link texts and `<meta>` contents. An address is made of ASCII letters,
+  digits and `.`, which JSON never escapes, so it is found as in WARC.
 - WET: the page's text.
 
 Together, WAT and WET hold the places an onion was found in the research
@@ -217,7 +235,7 @@ sample; [Known limitations](#known-limitations) lists the places they don't.
 
 ```json
 {
-  "exampleexampleexampleexampleexampleexampleexampleexample.onion": [
+  "exampleexampleexampleexampleexampleexampleexampleexkokad.onion": [
     {
       "page_url": "https://example.com/2020/10/04/post",
       "date": "2025-01-01T00:00:01Z",
@@ -373,6 +391,12 @@ a kind whose file failed to save, and is retried on the next run. Lines
 `processed.log` can't read (such as bare Archive names, written before kinds
 were tracked) are ignored, so those Shards are processed again.
 
+A `<shard> <kind>` line doesn't say which matching rules extracted the pair, so
+a change to the rules (such as onions found in any case and v3 checksums
+verified) applies to the Shards extracted from then on: the pairs already done
+keep what the older rules found, and nothing redoes them. Results under one set
+of rules take a fresh `--output-dir`.
+
 The summary at the end reports processed, skipped and failed Shards (a Shard
 left with any kind undone, by a failed download, parse or save), new and total
 Artifacts per kind, and average download and parse time per Shard. The exit
@@ -467,16 +491,9 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **CC-NEWS's Formats are unverified.** That CC-NEWS publishes WARC only was
   written from memory, commoncrawl.org being unreachable at the time. If it
   publishes WAT or WET too, its Plans are more expensive than they need to be.
-- **Onion matching is by shape only.**
-  - Case-sensitive. An address written in uppercase (`ABCD...XYZ.ONION`) is
-    missed. Making the pattern case-insensitive with `(?i)` slowed the regex by
-    over 1000x (see `PROGRESS.md`, Performance Fixes).
-  - A v3 address carries a checksum and a version byte; neither is verified, so
-    any 56-character base32 run in front of `.onion` is accepted.
-  - v2 addresses (16 characters) are still matched although Tor dropped them in
-    2021. They are useful as history, not as live services.
-  - No context is kept: the output records which page mentioned the address,
-    not where on the page or in what role (link, header, plain text).
+- **Onion Sightings keep no context.** The output records which page mentioned
+  the address, not where on the page or in what role (link, header, plain
+  text).
 - **Favicon tag matching in WARC is narrower than HTML.**
   - Only `<link ` and `<LINK ` are found (likewise `<meta `, `<base `), so mixed
     case (`<Link`) and a newline or tab right after the tag name are missed.

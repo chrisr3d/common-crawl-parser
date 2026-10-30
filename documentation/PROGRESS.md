@@ -2290,3 +2290,147 @@ at the end of `--help` only, replacing `after_help` there. Set on `Config` with
 `#[command(after_long_help = "...")]`, the exit statuses stay out of the short help. A
 string starting with `"\` and a newline skips that first line break, so the text starts at
 the left margin of the next line.
+
+---
+
+## Step 24: Onion Addresses in Any Case, v3 Checksums Verified
+
+### What we built
+
+Onion matching went by shape alone: 16 or 56 characters of `[a-z2-7]`, then `.onion`. An
+address written in uppercase, or ending in `.Onion`, was missed, and any 56 base32
+characters passed for a v3 address, whatever they encoded. Now:
+
+- **Any case.** The characters and the suffix match in any case, and every address is
+  returned lowercase, since it becomes the Artifact key: `ABC…XYZ.ONION` and
+  `abc…xyz.onion` are one Artifact. `ONION_PATTERN` lists both cases of every letter
+  (`[a-zA-Z2-7]`, `\.[oO][nN][iI][oO][nN]`) instead of using `(?i)`, which together with a
+  Unicode `\b` once made it over 1000x slower (see Performance Fixes).
+- **v3 addresses verified.** 56 base32 characters are 35 bytes:
+  `public key (32) || checksum (2) || version (1)`. `onion_search::checked_address` decodes
+  them (base32 written by hand) and keeps the address only if the version is 3 and the
+  checksum is the first 2 bytes of `SHA3-256(".onion checksum" || public key || version)`,
+  computed with the `sha3` crate (RustCrypto, like `sha2`). Anything else is dropped
+  silently, like text that doesn't match. Over 99 Shards of CC-MAIN-2026-34, all 203 v3
+  addresses found passed: the check guards against look-alikes, it fixes no output seen
+  so far.
+- **v2 unchanged.** 16-character addresses carry no checksum and are kept without a
+  check. Tor dropped them in 2021: history, not live services.
+- **One check for everyone.** Both engines and `examples/baseline.rs` keep only what
+  `checked_address` returns, lowercased by it, so the three still count the same onions.
+- **No rules version.** `processed.log` doesn't record which rules extracted a pair, so
+  the new rules apply to the Shards extracted from now on; a fresh `--output-dir` gives
+  results all under one set of rules.
+- **Tests.** `src/onion_search.rs` adds an all-uppercase address, mixed case in the
+  characters, `.Onion` and `.oNIoN` suffixes, a v3 address with one character changed
+  (checksum fails), one encoding version 4 (with the checksum computed for version 4, so
+  only the version is wrong), and addresses of every case in one body coming out in page
+  order; the engine-agreement inputs gain all of these. The v3 address the unit tests used
+  encoded version `0xD7`, so it is replaced by one built from a made-up public key: base32
+  packs 5 bits per character, so the first 51 characters (255 of the key's 256 bits) can
+  spell anything (here the alphabet), and the last five, holding the key's last bit, the
+  checksum and the version, were computed with Python's `hashlib`, an implementation
+  independent of the one under test. The fixture of `tests/parse_characterization.rs`
+  writes one address in uppercase, `.ONION` included: it used to be missed, and is now
+  found and recorded lowercase.
+
+**How the memchr engine finds `.onion` in any case.** `memmem` compares bytes exactly, so
+one `.onion` needle can't find `.ONION` or `.oNiOn`, and there are 32 spellings. The
+candidates, timed as a bare scan over 1 GB of a decompressed WARC Archive (no
+validation):
+
+| Scan | Time for 1 GB |
+|---|---|
+| `memmem` for `.onion` (the old engine, lowercase only) | 27 ms |
+| `memmem` for `.o`, and again for `.O`, positions merged in order | 47 ms |
+| Teddy (`aho-corasick`'s packed SIMD searcher) over `.o` and `.O`, one pass | 54 ms |
+| Teddy over the 32 spellings of `.onion` | 94 ms |
+| the new `ONION_PATTERN` with `regex::bytes` | 94 ms |
+| `memchr` for `.`, then compare the next 5 bytes ignoring case | 230 ms |
+
+The `.` is the only byte the same in every spelling, but that Archive has one every 34
+bytes, and stopping at each costs more than scanning. `.o` and `.O` are rare: the engine
+scans for each with its own `memmem::Finder` (the pair is a `SuffixFinder`, built once per
+extractor) and compares the four letters after them with `eq_ignore_ascii_case`. It stays
+the faster engine, with nothing but the `memchr` crate.
+
+Each full `memmem` scan costs about 22 ms per GB however rare its needle, so two scans
+can't get much under 47 ms; one pass for both needles would take hand-written SIMD.
+
+**Timings.** `-e onion --formats warc`, parse time as the run prints it (to 0.1 s), with
+the release binaries of before and after:
+
+| Archive | Transport | Engine | Before | After |
+|---|---|---|---|---|
+| CC-NEWS, 1 GB, 3 rounds | disk | memchr | 6.0, 6.1, 6.1 s | 6.1, 6.2, 6.2 s |
+| | disk | regex | 6.1, 6.1, 6.1 s | 6.4, 6.4, 6.4 s |
+| | memory | memchr | 6.0 s | 6.1 s |
+| | memory | regex | 6.0 s | 6.3 s |
+| CC-MAIN, 0.9 GB | disk | memchr | 4.7 s | 4.7 s |
+| | disk | regex | 4.7 s | 4.9 s |
+
+The memchr engine costs about 0.1 s more on the CC-NEWS Archive (2 %), the regex engine
+0.3 s (5 %): the bare-scan differences above, times the ~4.5 GB the Archive decompresses
+to. The regex's cost can't be written away: every form of the pattern tried (classes
+listing both cases, `(?i:onion)` on the suffix alone, an ASCII-only `(?i)` over the whole
+pattern) scans at the same 93 ms per GB, as `regex` searches the 32 spellings of `.onion`
+at once whatever the pattern says, and only the old lowercase-only pattern let it use
+`memmem` on one literal. With `-t memory`, the download (11 to 29 s here) dwarfs either.
+
+**Same onions, before and after.** On the CC-MAIN Archive (25 onions), the old and new
+binaries, with either engine, wrote identical `onions.json` files, and `baseline` counted
+the same 25, before and after; on the CC-NEWS one, all found the same single onion.
+`every_transport_and_engine_agrees_on_real_archive` passes on the CC-MAIN Archive.
+
+### Rust concepts introduced
+
+**Const generics: `fn decode_base32<const N: usize>(...) -> Option<[u8; N]>`**
+A generic parameter can be a value instead of a type. `N` is fixed at each call
+(`decode_base32::<35>`), so the function returns a plain array on the stack, sized at
+compile time, with no `Vec` and no heap allocation, and the length check
+`text.len() * 5 != N * 8` reads as the definition of base32: 5 bits per character, 8 per
+byte.
+
+**Decoding base32 with a bit queue**
+Each character is 5 bits; they are shifted into a small integer (`bits = (bits << 5) |
+value`) and counted (`pending`). As soon as 8 are waiting, the oldest 8 go out as one byte
+(`(bits >> (pending - 8)) as u8`), and a mask keeps only those left over. At most 7 bits
+remain after a byte and 5 arrive, so a `u16` holds them. `as u8` keeps the low 8 bits of a
+wider integer, which is why the shift comes first.
+
+**`Digest::chain_update`**
+The RustCrypto hash traits (`sha2`, `sha3`, ...) let a hash be fed in pieces:
+`Sha3_256::new().chain_update(a).chain_update(b).finalize()` hashes `a` then `b`, as if
+they were one buffer, without first copying them into one. `chain_update` takes the hasher
+by value and returns it, so the calls chain, builder-style.
+
+**Merging two sorted iterators: `Peekable` and `iter::from_fn`**
+`memmem::Finder::find_iter` yields positions in increasing order, one iterator per needle.
+`.peekable()` adds `peek()`, which shows the next item without taking it; comparing the
+two peeks and taking the smaller with `next()` merges them as merge sort merges its
+halves. `std::iter::from_fn(closure)` turns that closure into an iterator: each call of
+`next` runs it, and its `None` ends the iteration. The closure is `move`, so it owns both
+peekable iterators. `chain` would be simpler but returns every `.o` before every `.O`,
+out of page order, which the regex engine keeps.
+
+**`impl Trait` and lifetimes in edition 2024**
+`fn candidates(&self, body: &[u8]) -> impl Iterator<Item = usize>` returns an iterator
+that borrows both `self` and `body`. Since edition 2024, a return-position `impl Trait`
+captures every lifetime in scope by default; earlier editions needed `+ '_` or a named
+lifetime to say the result borrows its inputs.
+
+**`#[expect(lint, reason = "...")]`**
+Clippy's `large_enum_variant` warns when one variant of an enum is much larger than the
+others, since every value is as large as the largest variant: `OnionSearch::Memchr` holds
+two `Finder`s (288 bytes), `OnionSearch::Regex` a 32-byte handle. There is one per
+extractor, already on the heap inside a `Box<dyn Extractor>`, so boxing the variant would
+only add a pointer to follow per record. `#[expect]` (Rust 1.81) silences the lint with the
+reason written next to it, and, unlike `#[allow]`, itself warns if the lint stops firing,
+so the exception can't outlive its cause.
+
+**`checked_` names and `bool::then`**
+The standard library's `checked_add`, `checked_sub`, ... return `Option`: `None` instead
+of a wrong value. `checked_address` follows that convention. Its last line,
+`valid.then(|| ...)`, turns a `bool` into an `Option`: `Some` of the closure's result when
+`true`, `None` without running it when `false`. On the regex side, `filter_map` then keeps
+the `Some`s and drops the `None`s in one step.
