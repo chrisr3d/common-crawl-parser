@@ -10,13 +10,14 @@ defined in `GLOSSARY.md`.
 
 One run takes a Common Crawl paths file, works out which Shards still need which
 of the requested Artifact kinds, downloads the cheapest Archives that serve them,
-and maintains one result file per kind:
+and writes what it finds to a kvrocks store (see section 9):
 
-- `onions.json`: every `.onion` address found, with the pages it appeared on.
-- `favicons.json`: every favicon URL an HTML page declares, with the pages that
+- `onion`: every `.onion` address found, with the pages it appeared on.
+- `favicon`: every favicon URL an HTML page declares, with the pages that
   declare it.
-- `inline_favicons.json`: every favicon image a page embeds as a base64 `data:`
-  URI, keyed by its SHA-256, with its Shodan hash and the pages that embed it.
+- `inline-favicon`: every favicon image a page embeds as a base64 `data:` URI,
+  identified by its SHA-256, with its media type, its Shodan hash and the pages
+  that embed it.
 
 `-e` / `--extract` picks the kinds (default `onion,favicon`). All requested kinds
 are extracted in the same pass over each Archive.
@@ -26,12 +27,9 @@ paths file ──▶ schedule Shards (offset, skip the kinds done, limit)
            ──▶ plan each Shard's Formats (cheapest serving every kind)
            ──▶ download its Archives (to disk or to memory) ┐ up to --jobs Shards
            ──▶ parse them on the blocking thread pool       ┘ in flight at once
-           ──▶ merge into the result maps, one Shard at a time
-           ──▶ per kind done: rewrite its JSON file, then append to processed.log
+           ──▶ per kind done, one Shard at a time: write its Sightings to the
+               store, then mark the (Shard, kind) pair done there
 ```
-
-A second mode, `merge`, combines result directories produced by separate runs
-(see [HPC batch mode](#10-hpc-batch-mode)).
 
 ## 1. Input: the paths file
 
@@ -57,8 +55,8 @@ The Dataset is read from the path's prefix: `crawl-data/CC-MAIN-<crawl>/` or
 Shards are selected in this order:
 
 1. `--offset N` drops the first N paths.
-2. A Shard whose every requested kind is already listed for it in
-   `processed.log` is skipped. Otherwise it is scheduled for the missing kinds
+2. A Shard whose every requested kind is already marked done for it in the
+   store is skipped. Otherwise it is scheduled for the missing kinds
    only.
 3. `--limit N` stops once N Shards are scheduled. Skipped Shards don't count
    toward the limit.
@@ -247,19 +245,14 @@ Together, WAT and WET hold most places an onion is found: over 99 Shards they
 found 208 of the 215 distinct onions WARC found.
 [Known limitations](#known-limitations) lists where the rest were.
 
-**What it records.** For each address, one Sighting per distinct
-`(page_url, shard)` pair:
+**What it records.** For each address, in lowercase, one Sighting per distinct
+`(page_url, shard)` pair: the Page it was seen on, in the address's set
+`onion:<address>` (keys in section 9). The Page holds:
 
-```json
-{
-  "exampleexampleexampleexampleexampleexampleexampleexkokad.onion": [
-    {
-      "page_url": "https://example.com/2020/10/04/post",
-      "date": "2025-01-01T00:00:01Z",
-      "shard": "CC-MAIN-20250101000000-20250101010101-00000"
-    }
-  ]
-}
+```text
+page_url  https://example.com/2020/10/04/post
+date      2025-01-01T00:00:01Z
+shard     CC-MAIN-20250101000000-20250101010101-00000
 ```
 
 `date` is when the page was crawled, in every Format. The same page crawled in
@@ -354,14 +347,14 @@ recorded as `url` writes them, which is what a browser requests.
 **No root guess.** Unlike AIL, no `{scheme}://{host}/favicon.ico` is added for
 pages that declare nothing: only declared favicons are recorded. A guessed URL
 was never checked to exist, and with one per HTML page such guesses made up
-nearly a third of the URLs in `favicons.json`.
+nearly a third of the favicon URLs recorded.
 
 **`data:` values** (the scheme in any case) are not favicon URLs. In WARC,
 base64 ones are handed to the `inline-favicon` kind (next section); in WAT they
 are skipped, since ia-web-commons cuts every `data:` URL after its first comma.
 
-**What it records.** `favicons.json` maps each absolute favicon URL to its
-Sightings, deduplicated on `(page_url, shard)`, as for onions.
+**What it records.** Each absolute favicon URL with its Sightings, in
+`favicon:<url>`, deduplicated on `(page_url, shard)`, as for onions.
 
 ## 7. Inline favicons
 
@@ -373,37 +366,36 @@ kinds read that WARC too.
 
 The `<link>` and `<meta>` values of section 6 that are `data:` URIs marked
 `;base64` are decoded. A percent-encoded URI (`data:image/svg+xml,<svg…>`) is
-dropped, even when its text happens to read as base64. Each image is saved
-under the SHA-256 of its bytes, in hex, so the same image on many pages, or
-written with other line breaks, is one entry:
+dropped, even when its text happens to read as base64. Each image is recorded
+under the SHA-256 of its bytes, in lowercase hex, so the same image on many
+pages, or written with other line breaks, is one Artifact: its Sightings in
+`inline-favicon:<sha256>`, and its description in the hash `image:<sha256>`:
 
-```json
-{
-  "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d": {
-    "mmh3": 1932519735,
-    "media_type": "image/png",
-    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ...",
-    "sightings": [{ "page_url": "...", "date": "...", "shard": "..." }]
-  }
-}
+```text
+media_type  image/png
+mmh3        1932519735
 ```
 
 - `mmh3`: Shodan's favicon hash, the number its `http.favicon.hash:` filter
   takes: MurmurHash3 x86_32 (seed 0) of the base64 as Python's
   `codecs.encode(data, "base64")` writes it (a newline every 76 characters and
   at the end), read as a signed 32-bit number.
-- `media_type`: from the `data:` header, without parameters, in lower case
+- `media_type`: as the first Page written declares it, from the `data:` header,
+  without parameters, in lower case
   (`data:Image/SVG+XML;charset=utf-8;base64,` gives `image/svg+xml`); empty if
   the URI declares none.
-- `data`: the image, in base64 without line breaks.
+
+The image itself is not kept: once hashed, its bytes are dropped.
 
 ## 8. Concurrency and resource guards
 
 Shards are processed through `buffer_unordered(jobs)`: up to `jobs` Shards are
 in flight, and results are consumed as soon as any one finishes. Downloads are
 async; parsing runs under `spawn_blocking` so it doesn't stall downloads.
-Results are merged one Shard at a time on the main task, so no locks are
-needed.
+Results are written to the store one Shard at a time on the main task, so no
+locks are needed. The downloads in flight wait while a Shard is written: one
+Shard's writes take the same time however much the store holds, well under
+the 60 s a download may go without data.
 
 The number of jobs (default: one per logical CPU core) is capped in two steps:
 
@@ -416,88 +408,106 @@ The number of jobs (default: one per logical CPU core) is capped in two steps:
 
 Each cap prints a warning when it lowers the requested value.
 
-## 9. State, resume and output files
+## 9. The results store
 
-Everything is written under `--output-dir` (default `output/`):
+Results and done marks go to a [kvrocks](https://kvrocks.apache.org/) store:
+the Redis protocol, its data kept on disk (RocksDB) rather than in RAM. No
+results file is written: nothing goes under the working directory but
+`download/` and the mmap Transport's temporary file.
 
-| File | Content | Written |
+**Reaching it.** `--kvrocks` names a Unix socket (default `/tmp/kvrocks.sock`)
+or gives a `redis://host:port` URL. A socket reaches a store on the same
+machine without the network stack. TCP is there for a store that has no socket
+to offer: kvrocks has no macOS build that runs well, and in Docker Desktop a
+container's socket, though visible on the Mac, can't be connected to from
+there; its published port can. If the store needs a password, it comes from
+`CC_EXTRACT_KVROCKS_PASSWORD` and is sent with `AUTH` (in kvrocks, the password
+chooses the namespace); a URL holding one is refused, since options show in
+`ps` and in shell history. The store is reached and checked after the
+arguments and the paths file are read, before anything is downloaded: a store
+that can't be reached stops the run with exit status 1, naming it.
+
+**Keys.** Kinds are named as on the command line:
+
+| Key | Type | Content |
 |---|---|---|
-| `processed.log` | One `<shard> <kind>` line per done pair | Appended after the kind's file is saved |
-| `onions.json` | Onion address → Sightings | Fully rewritten after each Shard that finished `onion`, and once more at the end |
-| `favicons.json` | Favicon URL → Sightings | Same, for `favicon` |
-| `inline_favicons.json` | Image SHA-256 → hashes, image and Sightings | Same, for `inline-favicon` |
+| `page:<id>` | hash | `page_url`, `date`, `shard` of one Page |
+| `<kind>:<artifact>` | set | ids of the Pages the Artifact was seen on |
+| `page:<id>:<kind>` | set | the Page's Artifacts of that kind |
+| `artifacts:<kind>` | set | every Artifact of the kind |
+| `image:<sha256>` | hash | `media_type` (declared by the first Page written), `mmh3` (signed decimal) |
+| `processed` | set | `<shard> <kind>`, one per done pair |
 
-Only the requested kinds' files are loaded at start-up and saved: `-e onion`
-never touches `favicons.json`. New results are merged into the loaded ones, so
-successive runs accumulate. A results file that can't be loaded (corrupt, or
-written in the old `url` / `archive` shape) stops the run before anything is
-written, rather than being overwritten.
+`<artifact>` is the onion address, the favicon URL, or the inline favicon's
+SHA-256. A Page's `<id>` is the first 16 bytes of the SHA-256 of
+`"<shard> <page_url>"`, in lowercase hex: computed from the Page alone, so a
+Shard written again gives the same keys, and each set lists 32 characters per
+Page rather than its URL. One Sighting is one Page in an Artifact's set: the
+same page crawled in two Shards is two Pages, two Sightings. The forward sets
+link the kinds seen on one Page: from an onion to the inline favicons of the
+Pages naming it, then to their `mmh3`.
 
-A results file is never written in place: the new JSON goes to
-`<file>.tmp` in the same directory, then `rename` puts it in place in one
-step (atomic within one filesystem). A run killed during a save leaves the
-previous file whole, and maybe a `<file>.tmp` that nothing loads and the next
-save replaces. This guards against a killed process, not a power cut or a node
-crash: nothing is forced to disk with `fsync`. `processed.log` needs no such
-care: it is appended one short line at a time, and a line cut off by a kill
-names no known kind, so it is ignored and its pair redone.
+**Only adding.** Every write is a `SADD` or an `HSETNX` (set a hash field only
+if absent): nothing written is ever removed or changed, so the first `date` or
+`media_type` written is the one kept, and writing the same Shard again changes
+nothing.
 
-A kind's file is saved before its `<shard> <kind>` line is appended, so a crash
-in between leaves the pair undone and the next run extracts it again;
-deduplication makes that redo change nothing. A later run with more kinds
-extracts only the new ones for the Shards already done. A Shard whose download
-or parse failed is not marked for the kinds reading the failed Archive, nor for
-a kind whose file failed to save, and is retried on the next run. Lines
-`processed.log` can't read (such as bare Archive names, written before kinds
-were tracked) are ignored, so those Shards are processed again.
+**Writing one Shard.** For each kind whose Archives all parsed, the Shard's
+Sightings are written in pipelined batches (many commands sent before the
+replies are read), then, once every write is acknowledged, `<shard> <kind>` is
+added to `processed`. A Shard costs its own writes only, whatever the store
+already holds (a Shard's favicons are about 51,000 Sightings, 200,000
+commands). The run's results are never held in RAM: only one Shard's at a
+time.
 
-A `<shard> <kind>` line doesn't say which matching rules extracted the pair, so
-a change to the rules (such as onions found in any case and v3 checksums
-verified, or favicon tags read as HTML reads them) applies to the Shards
-extracted from then on: the pairs already done keep what the older rules found,
-and nothing redoes them. Results under one set of rules take a fresh
-`--output-dir`. Favicon URLs are keys written by the `url` crate since its
-rules came in (host in lowercase, `..` removed, entities decoded): a file
-merged across that change can hold one favicon under two keys, its old
-spelling and its new one.
+**Mark after writes.** The order is the guarantee: a run killed, or a
+connection lost, between the writes and the mark leaves the pair undone, never
+marked with Sightings missing. The next run extracts the pair again and writes
+the same members and fields, which changes nothing. A transaction
+(`MULTI`/`EXEC`) is not used: kvrocks runs `EXEC` under a lock that stops
+every other client, for 200,000 commands. A write that fails leaves its pair
+undone too, like a failed download or parse: the run goes on with the other
+kinds and Shards, and exits with 3.
+
+**Resuming.** At start-up, the members of `processed` say which pairs are done;
+a member without a kind this version knows is ignored, its pairs done again. A
+later run with more kinds extracts only the new ones for the Shards already
+done. A Shard whose download or parse failed is not marked for the kinds
+reading the failed Archive, and is retried on the next run.
+
+A done mark doesn't say which matching rules extracted the pair, so a change to
+the rules (such as onions found in any case and v3 checksums verified, or
+favicon tags read as HTML reads them) applies to the Shards extracted from then
+on: the pairs already done keep what the older rules found, and nothing redoes
+them. Results under one set of rules take a fresh store, or a namespace of
+their own.
 
 The summary at the end reports processed, skipped and failed Shards (a Shard
-left with any kind undone, by a failed download, parse or save), new and total
-Artifacts per kind, and average download and parse time per Shard. The exit
-status tells whether any Shard failed (see section 11).
+left with any kind undone, by a failed download, parse or store write), the
+Artifacts new to the store per kind (those `SADD` added to `artifacts:<kind>`),
+the total per kind (that set's size), and average download and parse time per
+Shard. Each Shard's log also gives the time its writes took. The exit status
+tells whether any Shard failed (see section 11).
 
 ## 10. HPC batch mode
 
-For runs over a whole Crawl (about 100,000 Shards) on a cluster:
+For runs over a whole Crawl (about 100,000 Shards) on a cluster,
+`--offset` and `--limit` give each process its own slice of the paths file.
 
-- `--offset` and `--limit` give each process its own slice of the paths file.
-- `--output-dir` gives each process its own state and result files, so
-  processes never write to the same file.
-- `cc-extract merge <DIR>... [-o OUT]` merges every kind whose results file is
-  in at least one directory, deduplicates as above, and writes the merged files
-  to `OUT` (default `output/`). A file that can't be loaded is reported and
-  skipped. For an inline favicon, the first media type seen wins.
-  `processed.log` files are not merged.
-
-Two example scripts run this on SLURM. They hold `<...>` placeholders for the
-account, partition and paths, to be replaced first:
-
-- `examples/slurm/crawl.sh`: an array of 10 tasks, each one a whole node
-  (`--exclusive`), each running 20 processes over 500 paths (`--transport
-  memory`, the node's cores shared out as `--jobs`), so 100,000 paths in total.
-  Output goes to `<output root>/<task>/<process>/`.
-  Its report tells processes that finished with Shards to retry (exit 3) from
-  those that stopped early (any other non-zero exit). It exits with 0 either
-  way, so `afterok` starts the merge on the results so far.
-- `examples/slurm/merge.sh`: merges every `<output root>/<task>/<process>/`
-  directory into `<output root>`. Meant to run after the crawl job, with
-  `--dependency=afterok`.
+Runs across several nodes are not supported with the store yet: every process
+must reach the same store, and nothing decides yet whether the nodes write to
+one store over the network or each to its own, copied together afterwards.
+`examples/slurm/crawl.sh` (an array of 10 tasks, each one a whole node, each
+running 20 processes over 500 paths with `--transport memory`) is kept as a
+starting point, marked as not working with the store. Several processes on one
+machine can share one store: each writes its own Shards, and the writes only
+add.
 
 ## 11. CLI reference
 
 | Flag | Default | Effect |
 |---|---|---|
-| `<INPUT>` | | Paths file (WARC, WAT or WET), plain or `.gz`. Required unless using `merge`. |
+| `<INPUT>` | | Paths file (WARC, WAT or WET), plain or `.gz`. Required. |
 | `-l`, `--limit N` | all | Process at most N Shards this run, not counting Shards already done for every requested kind |
 | `-o`, `--offset N` | 0 | Skip the first N paths |
 | `-j`, `--jobs N` | CPU cores | Shards in flight at once (capped, see section 8) |
@@ -506,8 +516,10 @@ account, partition and paths, to be replaced first:
 | `--formats F,...` | the Plan | Force the Formats downloaded: `warc`, `wat`, `wet` |
 | `-t`, `--transport T` | `disk` | `disk`, `memory` or `mmap` |
 | `--onion-engine E` | `memchr` | `memchr` or `regex` |
-| `--output-dir DIR` | `output` | Where state and results are read and written |
-| `merge DIR... [-o OUT]` | | Merge result directories into `OUT` (default `output`) |
+| `--kvrocks SOCKET\|URL` | `/tmp/kvrocks.sock` | The store: a Unix socket path, or `redis://host:port` |
+
+The store's password, if it needs one, is read from the
+`CC_EXTRACT_KVROCKS_PASSWORD` environment variable, never from an option.
 
 The exit status (listed by `--help` too) tells a script whether to run the same
 command again:
@@ -515,16 +527,15 @@ command again:
 | Code | Meaning | Run again? |
 |---|---|---|
 | 0 | Every Shard taken on done for every requested kind | No need |
-| 1 | Stopped early, such as on a missing or unreadable paths or results file, an `--offset` past the end, or a Plan no Shard can meet | Once the cause is fixed |
+| 1 | Stopped early, such as on a missing or unreadable paths file, an unreachable store, an `--offset` past the end, or a Plan no Shard can meet | Once the cause is fixed |
 | 2 | Invalid option or value (`clap`'s code for usage errors) | Once the command is fixed |
-| 3 | Ran to the end with some Shards left with kinds undone: a failed download, parse or save | Yes, the same command |
+| 3 | Ran to the end with some Shards left with kinds undone: a failed download, parse or store write | Yes, the same command |
 
 Early stops come before anything is downloaded or written. Shards that fail
 don't stop the run: the others go on, and the run exits with 3 at the end.
 Paths file lines the run can't use (not a Common Crawl path, or one whose other
 Formats' paths can't be derived) are reported and skipped: they are no Shard
 to retry, and leave the exit status at 0.
-`merge` exits with 0, or 1 when it has nothing to merge or can't save.
 
 ## Known limitations
 
@@ -559,17 +570,18 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
     tag before.
 
   Details in `RESEARCH-warc-wat-wet.md`, section 4.7.
-- **Results files are rewritten whole after every Shard.** A large
-  `favicons.json` makes each save slower as the run goes on, on the one task
-  that merges results.
+- **The store must be reachable from the machine running the crawl.** Over a
+  Unix socket it is on that machine. Over TCP the traffic, password included,
+  is not encrypted: keep the store on the same machine or a trusted network.
+  Runs across several nodes are not supported yet (section 10).
 - **`--limit` counts Shards to do, not paths.** Re-running a slice with the same
   `--offset` and `--limit` after some of its Shards are done goes on past the
-  slice's end, into the next process's paths. `merge` deduplicates, so this
-  costs time, not correctness.
+  slice's end, into the next process's paths. The store's writes only add, so
+  this costs time, not correctness.
 - **The RAM guard sees the whole machine.** Each process divides the free RAM by
   its largest Plan on its own, so several processes on one node can together
   schedule more in-memory Shards than fit.
-- **Onion Sightings keep no context.** The output records which page mentioned
+- **Onion Sightings keep no context.** The store records which page mentioned
   the address, not where on the page or in what role (link, header, plain
   text).
 - **The WARC favicon scanner reads only the tags it needs.**

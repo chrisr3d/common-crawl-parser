@@ -1298,3 +1298,86 @@ them.
   passes, so a download that hangs fails its test rather than `cargo test`.
 - **`TcpListener::bind("127.0.0.1:0")`**: port 0 asks the system for a free port, read back
   with `local_addr`, so tests running in parallel never collide.
+
+---
+
+## Step 27: Results and Done Marks in a kvrocks Store
+
+### What we built
+
+After every Shard, each done kind's whole results map was serialised into its JSON file. At
+1.38 GB of favicons (100 Shards of CC-MAIN-2026-34) one save took 2.2–2.4 s, on the loop that
+also polls every download; a full Crawl would be about 1.4 TB of JSON, which no save, `merge`
+or reader can hold in RAM. Results and done marks now go to a kvrocks store (the Redis
+protocol, kept on disk by RocksDB), written per Shard:
+
+- **Keys** (`src/store.rs`): `page:<id>` (a hash: `page_url`, `date`, `shard`), `<kind>:<artifact>`
+  (the Pages an Artifact was seen on), `page:<id>:<kind>` (a Page's Artifacts), `artifacts:<kind>`,
+  `image:<sha256>` (`media_type`, `mmh3`) and `processed` (`<shard> <kind>`). A Page's id is the
+  first 16 bytes of the SHA-256 of `"<shard> <page_url>"`: the same Page always gets the same id.
+- **Only adding**: every write is `SADD` or `HSETNX` (set a field only if absent), so writing a
+  Shard again changes nothing, and the first `date` or `media_type` written is kept.
+- **Mark after writes**: a pair joins `processed` only once every write of its Sightings was
+  acknowledged. A kill in between leaves the pair undone, and redoing it writes the same
+  members. Not `MULTI`/`EXEC`: kvrocks runs `EXEC` under a lock stopping every other client.
+- **A Shard costs its own writes**: no results are loaded at start-up, none kept in RAM; only
+  `processed` is read, to schedule. Measured on a MacBook Pro (Apple M3 Max, 64 GB), release
+  build, kvrocks in Docker Desktop reached over TCP through its published port: three Shards
+  of CC-MAIN-2026-34, `-e favicon` from WAT (45,836 to 47,306 favicon URLs, about 51,000
+  Sightings each), took 1.4 s, 1.6 s and 1.6 s to write, the store holding 0, 46 k and 93 k
+  favicons before each. The JSON save took 2.2–2.4 s at 100 Shards and grew with every one.
+- **Connection**: `--kvrocks` takes a Unix socket path (default `/tmp/kvrocks.sock`) or a
+  `redis://host:port` URL. TCP is there because kvrocks runs in Docker on macOS, and Docker
+  Desktop's containers live in a Linux VM: their sockets show in a shared directory but can't be
+  connected to from the Mac. The password comes from `CC_EXTRACT_KVROCKS_PASSWORD` only; a URL
+  with one is refused (options show in `ps`). An unreachable store stops the run before any
+  download (exit 1); a failed write leaves the pair undone (exit 3).
+- **Removed**: the JSON files, `processed.log`, `--output-dir`, the end-of-run save, `merge` and
+  `examples/slurm/merge.sh`. `crawl.sh` is marked as not working until runs across several nodes
+  are designed. Inline favicon bytes are dropped once hashed.
+- **Tests**: `tests/store.rs` runs the crawl's store code against `MemoryStore`: several Shards
+  read back as their merge, a Shard written twice leaves every key unchanged, a write failing
+  half-way leaves the pair unmarked and the earlier pairs whole, unknown kinds in `processed`
+  are ignored. `tests/crawl_cli.rs` runs the binary against a real kvrocks when
+  `CC_EXTRACT_TEST_KVROCKS` names a throwaway one, and skips otherwise.
+
+### Rust concepts introduced
+
+**A trait as a seam for a test double**
+`save_then_mark(store: &mut impl Store, ..)` decides what is written and in which order; the
+`Store` trait only says how to send writes and read keys back. The crawl passes a
+`KvrocksStore`, the tests a `MemoryStore`, so the tests exercise the code the crawl runs, not a
+copy of it, and need no server. The double adds what a test needs (`fail_after(n)`,
+`PartialEq` over every key) without the real store knowing.
+
+**Async methods in a trait, and `Send`**
+A trait may declare `async fn`, but a caller generic over it can't require the returned future
+to be `Send`, which `tokio::spawn` needs. Declaring `fn write(..) -> impl Future<Output = ..> +
+Send` puts it in the contract; implementations still write `async fn`, and the compiler checks
+each one's future. `Future` is in the 2024 prelude.
+
+**An async Redis client**
+The `redis` crate's `MultiplexedConnection` shares one connection among callers and runs on the
+tokio runtime the downloads already use: a store write is one more `.await` in the result loop.
+
+**Pipelining**
+`redis::pipe()` queues commands, sends them in one write and reads the replies back in order.
+Sent one by one, each of a Shard's 200,000 writes would wait a round trip; batches of 10,000
+wait 20. The replies say which `SADD` added a new member: that count is "new Artifacts".
+
+**Unix sockets, and when they don't reach**
+A Unix socket is a file-system name for a connection between processes on one kernel: no TCP
+stack, no port, permissions from the file. It stops at the kernel: a Docker Desktop container
+on macOS runs under the VM's kernel, so its socket file is visible from the Mac but its
+listener is not.
+
+**`FromStr` as a `clap` value parser**
+`StoreAddress` implements `FromStr`; `clap` derives its parser from that, defaults included, so
+a refused URL is an invalid value (exit 2) before anything runs, and the rest of the program
+only sees a parsed address.
+
+**Async closures and a `static Mutex` in tests**
+`fn read<T>(&self, read: impl AsyncFnOnce(&mut KvrocksStore) -> T) -> T` takes an `async |store|
+..` closure (Rust 1.85) borrowing the connection it is handed. The crawl tests share one store,
+so each takes `STORE_TURN.lock()` first; a test failing while it holds the guard poisons the
+mutex, and `PoisonError::into_inner` takes it anyway, the next test emptying the store first.

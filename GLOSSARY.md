@@ -35,11 +35,15 @@ A category of information that can be requested: `onion` (`.onion` address), `fa
 _Avoid_: data point, feature, target, observable
 
 **Artifact**:
-One value of an Artifact kind found in a crawled page, such as one `.onion` address or one favicon URL.
+One value of an Artifact kind found in a crawled page, such as one `.onion` address, one favicon URL, or one inline favicon image (identified by the SHA-256 of its bytes).
 _Avoid_: match, result
 
+**Page**:
+One URL crawled in one Shard, with the date it was crawled; the same URL in another Shard is another Page.
+_Avoid_: item, document, record
+
 **Sighting**:
-One occurrence of an Artifact: the page it was seen on, when that page was crawled, and the Shard it came from.
+One occurrence of an Artifact: the Page it was seen on, which gives when that Page was crawled and the Shard it came from.
 _Avoid_: source, occurrence
 
 **Format requirement**:

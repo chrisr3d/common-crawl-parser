@@ -24,8 +24,8 @@ The project was built incrementally and now features the following:
 2. **HTTP download** — Fetch each Shard's Archives from Common Crawl servers
 3. **Archive parsing** — Decompress gzip-compressed Archives and read their WARC, WAT or WET records with a custom parser
 4. **Onion extraction** — Find `.onion` addresses in HTTP responses (WARC), metadata JSON (WAT) or page text (WET)
-5. **Favicon extraction** — Find the favicons HTML pages declare, resolved against the page's `<base href>`; inline images are saved with their SHA-256 and Shodan's `mmh3` favicon hash
-6. **Deduplication & output** — Deduplicate Sightings and produce one JSON file per Artifact kind
+5. **Favicon extraction** — Find the favicons HTML pages declare, resolved against the page's `<base href>`; inline images are recorded by their SHA-256, with Shodan's `mmh3` favicon hash
+6. **Deduplication & results store** — Deduplicate Sightings and write them, Shard by Shard, to a kvrocks store, over a Unix socket or TCP
 7. **Concurrent processing** — Download and parse several Shards in parallel with async/tokio
 8. **Ripgrep-style parsing** — Transport (`-t`) and onion search engine (`--onion-engine`) selectable at runtime
 9. **Sighting metadata** — Record the page URL, crawl date and Shard of each Artifact found
@@ -33,13 +33,13 @@ The project was built incrementally and now features the following:
 11. **Resource guards** — Layered concurrency caps (CPU cores, available RAM) prevent oversubscription and OOM
 12. **Incremental extraction** — Pick Artifact kinds with `-e`; a later run adds kinds without redoing the ones already done
 13. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them): on CC-MAIN, `onion` and `favicon` read WAT + WET (~240 MB) instead of WARC (~1 GB), `favicon` alone WAT only
-14. **HPC batch mode** — Split a Crawl across processes with `--offset`, `--limit` and `--output-dir`, then `merge` their results; SLURM example in [`examples/slurm/`](examples/slurm/)
+14. **HPC batch mode** — Split a Crawl across processes with `--offset` and `--limit`, all writing to one store; runs across several nodes are not supported with the store yet (the SLURM example in [`examples/slurm/`](examples/slurm/) is kept as a starting point)
 
 Additional features:
 
 - **CLI with `clap`** — Short flags (`-l`, `-o`, `-j`, `-d`, `-e`, `-t`), auto `--help`, paths file as positional argument
 - **Timing** — Per-Shard download/parse duration and averages in summary
-- **Crash-safe writes** — Results files and downloads are written under a temporary name and renamed once complete: a killed run leaves no file cut short under a name a run reads, and the next run resumes as is
+- **Crash-safe writes** — Downloads are written under a temporary name and renamed once complete, and a (Shard, kind) pair is marked done only once its Sightings are in the store: a killed run leaves nothing half-written that a run reads, and the next run resumes as is
 
 ## Rust Concepts Covered
 
@@ -68,7 +68,16 @@ See [`PROGRESS.md`](documentation/PROGRESS.md) for detailed explanations of each
 
 ## Build & Run
 
-Requires Rust 1.91+ (edition 2024).
+Requires Rust 1.91+ (edition 2024), and a running [kvrocks](https://kvrocks.apache.org/) for
+the results (see [Results Store](#results-store)): by default on the Unix socket
+`/tmp/kvrocks.sock` (`unixsocket /tmp/kvrocks.sock` in its `kvrocks.conf`). In Docker, on
+macOS for instance, a container's socket can't be reached from the host: publish its port
+and give the URL instead:
+
+```sh
+docker run -d --name kvrocks -p 127.0.0.1:6666:6666 apache/kvrocks
+cargo run -- warc.paths --kvrocks redis://127.0.0.1:6666
+```
 
 ```sh
 cargo build                                    # compile (debug)
@@ -90,8 +99,10 @@ cargo run -- warc.paths --onion-engine regex   # regex::bytes instead of memchr 
 cargo run -- warc.paths.gz -l 3 -j 2 -d        # combined (short flags)
 cargo run -- warc.paths.gz -l 3 -j 2 -t memory -e onion  # combined with in-memory parsing
 cargo run -- warc.paths --limit 3 --jobs 2 --delete --transport disk  # combined (long flags)
-cargo run -- warc.paths -o 1000 -l 1000 --output-dir output/1  # one slice of a Crawl
-cargo run -- merge output/1 output/2 -o output # merge results of several --output-dir runs
+cargo run -- warc.paths -o 1000 -l 1000        # one slice of a Crawl
+cargo run -- warc.paths --kvrocks run/kvrocks.sock       # the store on another socket
+cargo run -- warc.paths --kvrocks redis://127.0.0.1:6666  # the store over TCP
+CC_EXTRACT_KVROCKS_PASSWORD=secret cargo run -- warc.paths  # a store (namespace) with a password
 cargo run -- --help                            # show usage and all options
 cargo run --release --example baseline -- download/X.warc.gz  # original parser, as a benchmark
 ```
@@ -174,60 +185,52 @@ jobs are limited to 2× CPU cores, and with `--transport memory`, further limite
 RAM (queried on macOS and Linux) divided by the largest estimated Plan among the scheduled
 Shards, to prevent OOM.
 
-## Output Format
+## Results Store
 
-Each Artifact kind has its own file: `output/onions.json`, `output/favicons.json` and
-`output/inline_favicons.json`; a run only loads and saves the kinds it extracts. In the first
-two, each Artifact (a `.onion` address, a favicon URL) maps to a list of Sightings: the
-clearnet page where it was found, the crawl date, and the Shard (the Archive file name
-without its Format suffix, such as `.warc.gz`):
+Results go to a kvrocks store (the Redis protocol, kept on disk), written after each Shard;
+no results file is written. Each Sighting is one Page in an Artifact's set: the clearnet page
+where it was found, the crawl date, and the Shard (the Archive file name without its Format
+suffix, such as `.warc.gz`). Kinds are named as on the command line:
 
-```json
-{
-  "exampleexampleexampleexampleexampleexampleexampleexkokad.onion": [
-    {
-      "page_url": "https://example.com/page",
-      "date": "2025-01-01T00:00:01Z",
-      "shard": "CC-MAIN-20250101000000-20250101010101-00000"
-    }
-  ]
-}
-```
+| Key | Type | Content |
+|---|---|---|
+| `page:<id>` | hash | `page_url`, `date`, `shard` of one Page |
+| `<kind>:<artifact>` | set | ids of the Pages the Artifact was seen on |
+| `page:<id>:<kind>` | set | the Page's Artifacts of that kind |
+| `artifacts:<kind>` | set | every Artifact of the kind |
+| `image:<sha256>` | hash | an inline favicon's `media_type` and Shodan favicon hash (`mmh3`, the number `http.favicon.hash:` takes) |
+| `processed` | set | `<shard> <kind>`, one per done (Shard, kind) pair |
 
-`inline_favicons.json` maps the SHA-256 of each image to its Shodan favicon hash (`mmh3`,
-the number `http.favicon.hash:` takes), its media type, the image itself in base64, and its
-Sightings:
+An `<artifact>` is a `.onion` address, a favicon URL, or the SHA-256 of an inline favicon (the
+image itself is not kept). A Page's `<id>` is the first 16 bytes of the SHA-256 of
+`"<shard> <page_url>"`, in hex. For instance:
 
-```json
-{
-  "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d": {
-    "mmh3": 1932519735,
-    "media_type": "image/png",
-    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ...",
-    "sightings": [{ "page_url": "...", "date": "...", "shard": "..." }]
-  }
-}
+```sh
+redis-cli -s /tmp/kvrocks.sock SMEMBERS artifacts:onion       # every onion found
+redis-cli -s /tmp/kvrocks.sock SMEMBERS onion:<address>       # the Pages it was seen on
+redis-cli -s /tmp/kvrocks.sock HGETALL page:<id>              # one Page
 ```
 
 Sighting metadata is extracted from WARC headers (`WARC-Target-URI`, `WARC-Date`) during
 parsing; in WAT, whose own `WARC-Date` is when the WAT was generated, the crawl date is
 read from the JSON (`Envelope.WARC-Header-Metadata.WARC-Date`). Results are deduplicated
-on `(page_url, shard)` pairs. Files written before this shape (with `url` / `archive`
-fields) are not converted: a run that finds one in its output directory stops with an
-error instead of overwriting it.
+on `(page_url, shard)` pairs, and every write only adds (`SADD`, `HSETNX`): the first date
+or media type written is kept.
 
-`output/processed.log` records which (Shard, Artifact kind) pairs are done, one
-`<shard> <kind>` line each, such as `CC-MAIN-20250101000000-20250101010101-00000 onion`. A
-run only extracts the requested kinds not yet done for a Shard, and a pair is recorded only
-after its results file is saved. Lines written before kinds were tracked (bare Archive file
-names) are ignored, so those Shards are processed again.
+A run only extracts the requested kinds not yet done for a Shard, and a pair joins
+`processed` only once all its Sightings are in the store: a run killed in between does
+the pair again, which changes nothing. A store that can't be reached stops the run before
+anything is downloaded. If the store needs a password, it is read from
+`CC_EXTRACT_KVROCKS_PASSWORD`, never from an option. More in
+[`documentation/FEATURES.md`](documentation/FEATURES.md), section 9.
 
 ## Running on a Cluster
 
-One process runs on one machine, so a Crawl spread over a cluster is split: each process
-takes a slice of the paths file (`--offset`, `--limit`) and writes to its own
-`--output-dir`, so no two processes write the same file. `cc-extract merge <DIR>...`
-then combines their results files, deduplicated as above (`processed.log` files are not
-merged). [`examples/slurm/crawl.sh`](examples/slurm/crawl.sh) runs this as a SLURM array job,
-several processes per node, and [`examples/slurm/merge.sh`](examples/slurm/merge.sh) merges
-the results once it has finished; replace their `<...>` placeholders first.
+Each process takes a slice of the paths file (`--offset`, `--limit`). Several processes on
+one machine can write to the same store: each writes its own Shards, and writes only add.
+Runs across several nodes are not supported with the store yet: every process must reach
+the same store, and nothing yet decides whether the nodes write to one store over the
+network or each to its own, copied together afterwards.
+[`examples/slurm/crawl.sh`](examples/slurm/crawl.sh), a SLURM array job running several
+processes per node, is kept as a starting point; it does not work with the store until
+then.
