@@ -184,6 +184,12 @@ fn expected_sightings() -> Vec<Findings> {
 /// A fresh working directory for `test_name`: `archives` in `download/`
 /// and a `warc.paths` file listing the fixture Shard.
 fn workspace(test_name: &str, archives: &[(&str, Vec<u8>)]) -> PathBuf {
+    workspace_listing(test_name, archives, &[ARCHIVE_URI.to_string()])
+}
+
+/// A fresh working directory for `test_name`: `archives` in `download/`
+/// and a `warc.paths` file listing `paths`.
+fn workspace_listing(test_name: &str, archives: &[(&str, Vec<u8>)], paths: &[String]) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(test_name);
     // Start clean: a previous aborted run may have left files behind.
     let _ = fs::remove_dir_all(&dir);
@@ -191,8 +197,18 @@ fn workspace(test_name: &str, archives: &[(&str, Vec<u8>)]) -> PathBuf {
     for (file_name, bytes) in archives {
         fs::write(dir.join("download").join(file_name), bytes).unwrap();
     }
-    fs::write(dir.join("warc.paths"), format!("{ARCHIVE_URI}\n")).unwrap();
+    let lines: String = paths.iter().map(|path| format!("{path}\n")).collect();
+    fs::write(dir.join("warc.paths"), lines).unwrap();
     dir
+}
+
+/// Shard `n` of the fixture's Crawl (the fixture Shard is 0), and the
+/// file name and paths file line of its WARC Archive.
+fn nth_shard(n: u32) -> (String, String, String) {
+    let shard = SHARD.replace("-00000", &format!("-{n:05}"));
+    let warc_name = format!("{shard}.warc.gz");
+    let uri = ARCHIVE_URI.replace(WARC_NAME, &warc_name);
+    (shard, warc_name, uri)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +473,21 @@ fn favicon_alone_reads_only_wat() {
 /// pairs undone: re-running the same command retries them.
 const EXIT_UNDONE: i32 = 3;
 
+/// The exit status of a run that went to the end with nothing to retry,
+/// but some pairs given up: their Archives failed the same way on 3 runs.
+const EXIT_GIVEN_UP: i32 = 4;
+
+/// Run the binary in `workspace` on its `warc.paths` with `args`, writing
+/// to `store`; returns its exit status and what it printed on stderr.
+fn run(store: &TestStore, workspace: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = cc_extract_into(store, workspace)
+        .args(args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.code(), stderr)
+}
+
 /// An Archive that fails to parse leaves the kinds reading it undone, and
 /// the run, which goes on to the end, exits with `EXIT_UNDONE`. Here the
 /// WET Archive isn't gzip: `onion` (WAT + WET) is left undone, `favicon`
@@ -516,6 +547,9 @@ fn a_failed_store_write_exits_undone() {
         "the summary should count the Shard as failed:\n{stderr}"
     );
     assert!(store.members("processed").is_empty());
+    // The store may work again on the next run: nothing counts toward
+    // giving the Archive up.
+    assert!(store.members("failures").is_empty());
 }
 
 /// A store that can't be reached stops the run at start-up, naming it,
@@ -834,6 +868,8 @@ fn an_image_that_cannot_be_saved_exits_undone() {
         store.members("processed"),
         BTreeSet::from([format!("{SHARD} onion")])
     );
+    // Nothing counts toward giving the Archive up: it parsed.
+    assert!(store.members("failures").is_empty());
 }
 
 /// `--save-images` without `inline-favicon` is accepted, and the run says
@@ -858,4 +894,179 @@ fn save_images_without_inline_favicon_says_none_will_be_saved() {
         "the run should say no image will be saved:\n{stderr}"
     );
     assert!(!dir.join("images").exists());
+}
+
+/// The command a Slice's process runs: `--offset 0 --limit 2` over a paths
+/// file of 4 Shards, `favicon` from WARC.
+const SLICE_ARGS: [&str; 8] = ["-o", "0", "-l", "2", "-e", "favicon", "--formats", "warc"];
+
+/// A working directory for `test_name` with 4 Shards: their WARC Archives
+/// in `download/`, the second one's not gzip. Returns it with the second
+/// Archive's file name.
+fn four_shards_second_corrupt(test_name: &str) -> (PathBuf, String) {
+    let shards: Vec<(String, String, String)> = (0..4).map(nth_shard).collect();
+    let archives: Vec<(&str, Vec<u8>)> = shards
+        .iter()
+        .enumerate()
+        .map(|(n, (_, warc_name, _))| {
+            let bytes = if n == 1 {
+                b"not gzip".to_vec()
+            } else {
+                warc_archive()
+            };
+            (warc_name.as_str(), bytes)
+        })
+        .collect();
+    let paths: Vec<String> = shards.iter().map(|(_, _, uri)| uri.clone()).collect();
+    let dir = workspace_listing(test_name, &archives, &paths);
+    (dir, shards[1].1.clone())
+}
+
+/// Running the same command again after exit 3 retries the undone pairs of
+/// its Slice, never going on past it, and an Archive failing the same way
+/// on every run is given up on the third: that run exits 4, and the next
+/// one schedules nothing, exits 4 again and names the Archive and its last
+/// error.
+#[test]
+fn reruns_stay_in_their_slice_and_give_up_an_archive_failing_on_three() {
+    let test_name = "reruns_stay_in_their_slice_and_give_up_an_archive_failing_on_three";
+    let Some(store) = TestStore::take(test_name) else {
+        return;
+    };
+    let (dir, corrupt) = four_shards_second_corrupt(test_name);
+    let (first_shard, _, _) = nth_shard(0);
+
+    for (run_number, expected) in [(1, EXIT_UNDONE), (2, EXIT_UNDONE), (3, EXIT_GIVEN_UP)] {
+        let (code, stderr) = run(&store, &dir, &SLICE_ARGS);
+
+        assert_eq!(code, Some(expected), "run {run_number}:\n{stderr}");
+        assert_eq!(
+            store.members("processed"),
+            BTreeSet::from([format!("{first_shard} favicon")]),
+            "run {run_number}"
+        );
+        for n in [2, 3] {
+            let (shard, _, _) = nth_shard(n);
+            assert!(
+                !stderr.contains(&shard),
+                "run {run_number} went past its Slice:\n{stderr}"
+            );
+        }
+        if run_number == 3 {
+            assert!(
+                stderr.contains(&format!("{corrupt}: given up")),
+                "run 3 should give the Archive up:\n{stderr}"
+            );
+        }
+    }
+
+    let (code, stderr) = run(&store, &dir, &SLICE_ARGS);
+
+    assert_eq!(code, Some(EXIT_GIVEN_UP), "run 4:\n{stderr}");
+    assert!(
+        stderr.contains("No Shards to process."),
+        "run 4 should schedule nothing:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Given-up Archives in the Slice: 1\n"),
+        "run 4 should count the given-up Archive at start-up:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "  {corrupt}: favicon undone, last error: Parse error: "
+        )),
+        "run 4 should name the Archive and its last error:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("1 skipped, 0 failed, 1 given up"),
+        "the summary should count the given-up Shard:\n{stderr}"
+    );
+}
+
+/// Deleting a given-up Archive's record, with the command the docs give,
+/// schedules it again, its count started over: the next failure is its
+/// first, and the run exits 3.
+#[test]
+fn deleting_its_record_retries_a_given_up_archive() {
+    let test_name = "deleting_its_record_retries_a_given_up_archive";
+    let Some(store) = TestStore::take(test_name) else {
+        return;
+    };
+    let (dir, corrupt) = four_shards_second_corrupt(test_name);
+    for _ in 0..3 {
+        run(&store, &dir, &SLICE_ARGS);
+    }
+
+    store.command(&["DEL", &format!("failures:{corrupt}")]);
+    let (code, stderr) = run(&store, &dir, &SLICE_ARGS);
+
+    assert_eq!(code, Some(EXIT_UNDONE), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{corrupt}: failure counted on 1 of 3 runs")),
+        "the count should start over:\n{stderr}"
+    );
+}
+
+/// Given up, the WET Archive leaves `onion` (WAT + WET) given up under the
+/// default Plan, while `favicon` (WAT) is done. No other Plan is looked for
+/// on its own: `--formats warc` plans around the WET, and with the WARC
+/// Archive `onion` is done.
+#[test]
+fn a_given_up_wet_leaves_onion_until_formats_plan_around_it() {
+    let test_name = "a_given_up_wet_leaves_onion_until_formats_plan_around_it";
+    let Some(store) = TestStore::take(test_name) else {
+        return;
+    };
+    let dir = workspace(
+        test_name,
+        &[(WAT_NAME, wat_archive()), (WET_NAME, b"not gzip".to_vec())],
+    );
+
+    for _ in 0..3 {
+        run(&store, &dir, &[]);
+    }
+    let (code, stderr) = run(&store, &dir, &[]);
+
+    assert_eq!(code, Some(EXIT_GIVEN_UP), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{SHARD} — onion given up ({WET_NAME}), skipping")),
+        "the Shard should not be scheduled:\n{stderr}"
+    );
+    assert_eq!(
+        store.members("processed"),
+        BTreeSet::from([format!("{SHARD} favicon")])
+    );
+
+    fs::write(dir.join("download").join(WARC_NAME), warc_archive()).unwrap();
+    let (code, stderr) = run(&store, &dir, &["--formats", "warc"]);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        store.members("processed"),
+        BTreeSet::from([format!("{SHARD} favicon"), format!("{SHARD} onion")])
+    );
+}
+
+/// `--max-memory` caps only in-memory downloads: without `--transport
+/// memory` it is accepted, and the run says at start-up that it has no
+/// effect.
+#[test]
+fn max_memory_without_the_memory_transport_says_it_has_no_effect() {
+    let dir = workspace(
+        "max_memory_without_the_memory_transport_says_it_has_no_effect",
+        &[],
+    );
+
+    // It stops at the store it can't reach, after the start-up lines.
+    let output = cc_extract(&dir)
+        .args(["--max-memory", "2.5", "--kvrocks", &no_store(&dir)])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("--max-memory only caps --transport memory: it has no effect here"),
+        "the run should say --max-memory has no effect:\n{stderr}"
+    );
 }

@@ -48,6 +48,7 @@ pub use plan::{FormatRequirement, Plan, PlanError};
 pub use store::{KvrocksStore, StoreAddress};
 
 use std::error::Error;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read};
 use std::iter;
@@ -244,6 +245,29 @@ fn is_read_timeout(err: &reqwest::Error) -> bool {
             .is_some_and(|cause| cause.kind() == io::ErrorKind::TimedOut)
     });
     err.is_timeout() && !err.is_connect() && !system_timeout
+}
+
+/// Whether a download failed in a way that repeats by nature, so that
+/// counts toward giving the Archive up: the server answered with a client
+/// error status (4xx), such as 404 Not Found, which it will answer again.
+///
+/// Every other failure may not happen again, and doesn't count: 408
+/// (Request Timeout) and 429 (Too Many Requests) ask to come back later, a
+/// 5xx is the server's own trouble, and a timeout, a connection error, a
+/// body cut short or a local file that can't be written say nothing about
+/// the Archive.
+///
+/// `err` is a download's error as returned: a `reqwest::Error`, boxed as it
+/// is, holds the status it was made from (`Response::error_for_status`).
+pub fn download_failure_repeats(err: &(dyn Error + Send + Sync + 'static)) -> bool {
+    let status = err
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status);
+    status.is_some_and(|status| {
+        status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    })
 }
 
 /// Directory where the disk and mmap Transports keep downloaded Archives,
@@ -581,12 +605,112 @@ pub enum Transport {
 /// Progress is reported every this many records.
 const PROGRESS_EVERY: u64 = 10_000;
 
+/// Why an Archive couldn't be parsed.
+#[derive(Debug)]
+pub enum ParseError {
+    /// Its bytes can't be read as an Archive: not gzip, cut short, a
+    /// malformed record. Parsing them again fails the same way.
+    Corrupt(io::Error),
+    /// A local file couldn't be opened, read or written: the Archive in
+    /// `download/` missing or unreadable, the mmap copy that can't be
+    /// created, a disk full while writing it. Nothing says the Archive is
+    /// bad.
+    Local(io::Error),
+}
+
+impl ParseError {
+    /// Whether parsing the same bytes would fail again: such a failure
+    /// counts toward giving the Archive up.
+    pub fn repeats(&self) -> bool {
+        matches!(self, ParseError::Corrupt(_))
+    }
+
+    /// An error met while decoding an Archive: `Local` if a local file
+    /// failed (`LocalFile` marked it), `Corrupt` otherwise.
+    ///
+    /// `io::Error::get_ref` returns the error an `io::Error` was made from
+    /// with `io::Error::new`, if any; `is::<T>()` says whether it is a `T`.
+    fn from_decoding(err: io::Error) -> Self {
+        if err
+            .get_ref()
+            .is_some_and(|inner| inner.is::<LocalFileError>())
+        {
+            ParseError::Local(err)
+        } else {
+            ParseError::Corrupt(err)
+        }
+    }
+}
+
+/// The underlying error's message: what failed, whichever the kind.
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::Corrupt(err) | ParseError::Local(err) => err.fmt(f),
+        }
+    }
+}
+
+impl Error for ParseError {}
+
+/// A local file the parser reads or writes, whose errors are marked as its
+/// own.
+///
+/// ## Telling apart where an error came from
+///
+/// Decoding stacks readers: the record parser reads the gzip decoder, which
+/// reads the file. Whichever of them fails, the error comes out of the top
+/// one as an `io::Error`, and a disk failing to read looks like bytes
+/// failing to decode. So the file's own errors are wrapped as they leave
+/// it: `io::Error::new(kind, error)` builds an `io::Error` carrying any
+/// error inside, here a `LocalFileError`, and the readers above pass it up
+/// as it is. Its kind is kept, so a reader retrying on `Interrupted` still
+/// does. `ParseError::from_decoding` then looks for the mark.
+struct LocalFile<T>(T);
+
+impl<R: Read> Read for LocalFile<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf).map_err(LocalFileError::mark)
+    }
+}
+
+impl<W: io::Write> io::Write for LocalFile<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf).map_err(LocalFileError::mark)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush().map_err(LocalFileError::mark)
+    }
+}
+
+/// An error a `LocalFile` returned, as its mark.
+#[derive(Debug)]
+struct LocalFileError(io::Error);
+
+impl LocalFileError {
+    /// `err`, marked as a local file's.
+    fn mark(err: io::Error) -> io::Error {
+        io::Error::new(err.kind(), LocalFileError(err))
+    }
+}
+
+/// The file's own message: the mark doesn't show.
+impl fmt::Display for LocalFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Error for LocalFileError {}
+
 /// Read every page record of one `format` Archive once and hand it to
 /// every extractor.
 ///
 /// When this returns, each extractor holds what it found in the Archive;
 /// `Extractor::into_findings` hands that over. The function itself never
-/// looks at which Artifact kinds it is feeding.
+/// looks at which Artifact kinds it is feeding. An error says whether the
+/// Archive's bytes are to blame (`ParseError`).
 ///
 /// ## Synchronous on purpose
 ///
@@ -607,12 +731,18 @@ pub fn parse_archive(
     format: Format,
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), ParseError> {
     let records_scanned = match transport {
         // `File` and `Cursor<Vec<u8>>` both implement `Read`, so one
-        // streaming loop serves both.
-        Transport::Disk(path) => parse_stream(fs::File::open(path)?, format, shard, extractors)?,
-        Transport::Memory(data) => parse_stream(Cursor::new(data), format, shard, extractors)?,
+        // streaming loop serves both. A `Cursor` never fails to read: every
+        // error then comes from the bytes.
+        Transport::Disk(path) => {
+            let file = fs::File::open(path).map_err(ParseError::Local)?;
+            parse_stream(LocalFile(file), format, shard, extractors)
+                .map_err(ParseError::from_decoding)?
+        }
+        Transport::Memory(data) => parse_stream(Cursor::new(data), format, shard, extractors)
+            .map_err(ParseError::from_decoding)?,
         Transport::Mmap(path) => parse_mmap(&path, format, shard, extractors)?,
     };
 
@@ -709,12 +839,15 @@ fn parse_stream<R: Read>(
 /// Windows can't remove an open file: there the copy keeps its name until
 /// the function returns (`TempFile`), and a killed process leaves it
 /// behind.
+///
+/// Only decompressing reads the Archive's bytes: every other step fails on
+/// a local file (`ParseError::Local`), and so does writing the copy.
 fn parse_mmap(
     path: &Path,
     format: Format,
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
-) -> Result<u64, Box<dyn Error + Send + Sync>> {
+) -> Result<u64, ParseError> {
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
     let copy_path = with_suffix(path, &format!(".{}.mmap", process::id()));
 
@@ -732,15 +865,21 @@ fn parse_mmap(
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&copy_path)?;
+        .open(&copy_path)
+        .map_err(ParseError::Local)?;
     #[cfg(unix)]
-    fs::remove_file(&copy_path)?;
+    fs::remove_file(&copy_path).map_err(ParseError::Local)?;
     #[cfg(not(unix))]
     {
         _copy_name = TempFile::new(copy_path);
     }
-    io::copy(&mut MultiGzDecoder::new(fs::File::open(path)?), &mut copy)?;
-    let copy_size = copy.metadata()?.len();
+    let archive = fs::File::open(path).map_err(ParseError::Local)?;
+    io::copy(
+        &mut MultiGzDecoder::new(LocalFile(archive)),
+        &mut LocalFile(&mut copy),
+    )
+    .map_err(ParseError::from_decoding)?;
+    let copy_size = copy.metadata().map_err(ParseError::Local)?.len();
     eprintln!(
         "  [{}] Decompressed: {:.1} MB",
         filename,
@@ -749,7 +888,7 @@ fn parse_mmap(
 
     // `unsafe`: the mapping assumes no one changes the file while it is
     // mapped. Without a name, no other process can open the copy to do so.
-    let mmap = unsafe { memmap2::Mmap::map(&copy)? };
+    let mmap = unsafe { memmap2::Mmap::map(&copy).map_err(ParseError::Local)? };
     let mut records_scanned = 0;
 
     for record in warc_parser::WarcSliceIter::new(&mmap, format.record_type()) {

@@ -12,7 +12,7 @@
 // New concepts: async/await, Tokio runtime, reqwest streaming, spawn_blocking,
 // bounded concurrency with buffer_unordered, Arc for shared ownership.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env::{self, VarError};
 use std::error::Error;
 use std::fs::{self, File};
@@ -26,14 +26,14 @@ use futures::stream::{self, StreamExt};
 
 use cc_extract::inline_favicon::save_images;
 use cc_extract::store::{
-    DEFAULT_SOCKET, PASSWORD_VARIABLE, Store, StoreResult, artifact_count, load_processed,
-    save_then_mark,
+    DEFAULT_SOCKET, FailureRecord, GIVE_UP_AFTER, PASSWORD_VARIABLE, RunId, Store, StoreResult,
+    artifact_count, load_failures, load_processed, record_failure, save_then_mark,
 };
 use cc_extract::{
     ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
     HttpClient, InlineFaviconExtractor, KvrocksStore, OnionEngine, OnionExtractor, Plan,
     READ_TIMEOUT, Shard, StoreAddress, Transport, download_archive, download_archive_to_memory,
-    download_path, parse_archive,
+    download_failure_repeats, download_path, parse_archive,
 };
 
 // ---------------------------------------------------------------------------
@@ -205,6 +205,75 @@ fn get_available_memory() -> Option<u64> {
     None
 }
 
+/// Bytes in the GB the memory messages and `--max-memory` count in: 2^30,
+/// as `1 << 30` writes it.
+const BYTES_PER_GB: u64 = 1 << 30;
+
+/// `bytes` in GB, for messages.
+fn gigabytes(bytes: u64) -> f64 {
+    bytes as f64 / BYTES_PER_GB as f64
+}
+
+/// Read `--max-memory`: a positive number of GB, fractions allowed.
+///
+/// `f64::parse` also accepts `inf` and `NaN`, which are no amount of
+/// memory: `is_finite` turns them away.
+fn parse_gigabytes(value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(gb) if gb.is_finite() && gb > 0.0 => Ok(gb),
+        _ => Err(format!("expected a positive number of GB, got '{value}'")),
+    }
+}
+
+/// The memory that caps in-memory jobs, in bytes, and where it comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryLimit {
+    /// The RAM the system reports available.
+    Available(u64),
+    /// `--max-memory`: this process's share of the machine.
+    MaxMemory(u64),
+}
+
+impl MemoryLimit {
+    fn bytes(self) -> u64 {
+        match self {
+            MemoryLimit::Available(bytes) | MemoryLimit::MaxMemory(bytes) => bytes,
+        }
+    }
+}
+
+/// How many in-memory jobs to run: `requested`, unless fewer Plans of
+/// `largest_plan` bytes fit in the smaller of the `available` RAM and
+/// `max_memory`, either one alone when the other is unknown or not given.
+/// Never fewer than 1. Also returns the limit, when it lowered the count.
+///
+/// Several processes sharing a machine each see all of its available RAM:
+/// `max_memory` is one process's share.
+fn memory_jobs(
+    requested: usize,
+    largest_plan: u64,
+    available: Option<u64>,
+    max_memory: Option<u64>,
+) -> (usize, Option<MemoryLimit>) {
+    let limit = match (available, max_memory) {
+        (Some(available), Some(max)) if max < available => MemoryLimit::MaxMemory(max),
+        (Some(available), _) => MemoryLimit::Available(available),
+        (None, Some(max)) => MemoryLimit::MaxMemory(max),
+        (None, None) => return (requested, None),
+    };
+    // `max(1)` on the divisor never divides by zero; on the result, keeps
+    // one job running whatever the memory.
+    let fit = (limit.bytes() / largest_plan.max(1)).max(1);
+    // On a 32-bit system a count of jobs can't hold every `u64`: so many
+    // fit that the count requested does.
+    let fit = usize::try_from(fit).unwrap_or(usize::MAX);
+    if fit < requested {
+        (fit, Some(limit))
+    } else {
+        (requested, None)
+    }
+}
+
 // Parsed command-line configuration.
 //
 // Uses `clap` derive — the idiomatic Rust way to define CLI interfaces.
@@ -223,10 +292,11 @@ fn get_available_memory() -> Option<u64> {
 )]
 #[command(after_long_help = "\
 Exit status:
-  0  Every Shard taken on done for every requested kind (paths file lines it can't use are skipped)
+  0  Every Shard of the Slice done for every requested kind (paths file lines it can't use are skipped)
   1  Stopped early, such as on a missing or unreadable paths file or an unreachable store: fix the cause, then run again
   2  Invalid option or value
-  3  Some Shards left with kinds undone (failed download, parse, store write or image save): run the same command again")]
+  3  Some Shards left with kinds a run may still do (failed download, parse, store write or image save): run the same command again
+  4  Nothing left to retry, but some kinds given up: an Archive they read failed the same way on 3 runs (the summary lists them)")]
 struct Config {
     /// Path to a WARC, WAT or WET paths file (supports .gz)
     ///
@@ -234,18 +304,19 @@ struct Config {
     /// file doesn't decide which Formats are downloaded (see --formats).
     input: String,
 
-    /// Maximum number of Shards to process (default: all)
+    /// Number of paths to process after --offset, the Slice (default: all the rest)
     ///
-    /// Shards already done for every requested kind are skipped and not
-    /// counted, so a run repeated with the same --offset goes on past the
-    /// paths the first run covered.
+    /// Every path of the Slice is considered, and none after it: Shards
+    /// already done for every requested kind are skipped, the others
+    /// processed. Running the same command again covers the same paths,
+    /// and retries what they left undone.
     #[arg(short, long)]
     limit: Option<usize>,
 
     /// Skip the first N paths in the file (for SLURM array partitioning)
     ///
     /// Combined with --limit, this gives each of several processes its own
-    /// slice: process 0 gets --offset 0 --limit 1000, process 1 gets
+    /// Slice: process 0 gets --offset 0 --limit 1000, process 1 gets
     /// --offset 1000 --limit 1000, etc. (see examples/slurm/).
     #[arg(short, long, default_value_t = 0)]
     offset: usize,
@@ -300,6 +371,19 @@ struct Config {
     #[arg(short, long, value_enum, default_value_t = TransportChoice::Disk)]
     transport: TransportChoice,
 
+    /// Most RAM this process's in-memory downloads may hold, in GB of 2^30 bytes (default: the available RAM)
+    ///
+    /// With --transport memory, jobs are capped so that each one's Archives
+    /// fit in the smaller of the available RAM and this amount. Processes
+    /// sharing a machine each see all of its available RAM: give each one
+    /// its share. Fractions are allowed (0.5). No effect with the other
+    /// Transports.
+    //
+    // `value_parser` names the function `clap` reads the value with, here
+    // to refuse a number that is no amount of memory (exit status 2).
+    #[arg(long, value_name = "GB", value_parser = parse_gigabytes)]
+    max_memory: Option<f64>,
+
     /// Search used to find .onion addresses
     #[arg(long, value_enum, default_value_t = OnionEngine::Memchr)]
     onion_engine: OnionEngine,
@@ -339,6 +423,19 @@ struct ScheduledShard {
     plan: Plan,
     /// One Archive per Format in the Plan.
     archives: Vec<ArchivePath>,
+    /// Whether some of the Shard's missing kinds were left out of the Plan,
+    /// given up.
+    partly_given_up: bool,
+}
+
+/// An Archive that failed to download or parse in this run.
+struct Failure {
+    archive: ArchivePath,
+    /// As logged: `Download error: …` or `Parse error: …`.
+    message: String,
+    /// Whether it fails this way by nature (a 404, bytes that don't
+    /// decode), and so counts toward giving the Archive up.
+    counted: bool,
 }
 
 /// The outcome of processing a single Shard — passed back from each
@@ -349,12 +446,16 @@ struct ScheduledShard {
 /// main task merges them sequentially — no locks needed.
 struct ShardResult {
     shard: Shard,
+    plan: Plan,
+    partly_given_up: bool,
     /// What each kind found, for the kinds whose Archives all parsed.
     found: Vec<(ArtifactKind, Findings)>,
     /// The kinds left undone because one of their Archives failed.
     undone: Vec<ArtifactKind>,
     /// The Archives that were downloaded and parsed.
     parsed: Vec<ArchivePath>,
+    /// The Archives that failed, and how.
+    failures: Vec<Failure>,
     download_time: Duration,
     parse_time: Duration,
 }
@@ -388,20 +489,25 @@ async fn fetch(
 /// Parse each downloaded Archive of one Shard with the extractors of the
 /// kinds that read its Format.
 ///
-/// Returns what each kind found, merged over the Archives it reads, and the
-/// Archives that parsed. Sightings from different Archives are unioned
-/// (`Findings::merge`), never joined record by record. An Archive that
-/// fails to parse contributes nothing: its extractors, and what they found
-/// before the error, are dropped.
+/// Returns what each kind found, merged over the Archives it reads, the
+/// Archives that parsed, and those that failed. Sightings from different
+/// Archives are unioned (`Findings::merge`), never joined record by record.
+/// An Archive that fails to parse contributes nothing: its extractors, and
+/// what they found before the error, are dropped.
 fn parse_archives(
     downloaded: Vec<(ArchivePath, Transport)>,
     shard: &Shard,
     plan: &Plan,
     onion_engine: OnionEngine,
     transport_choice: TransportChoice,
-) -> (BTreeMap<ArtifactKind, Findings>, Vec<ArchivePath>) {
+) -> (
+    BTreeMap<ArtifactKind, Findings>,
+    Vec<ArchivePath>,
+    Vec<Failure>,
+) {
     let mut found: BTreeMap<ArtifactKind, Findings> = BTreeMap::new();
     let mut parsed = Vec::new();
+    let mut failures = Vec::new();
 
     for (archive, transport) in downloaded {
         // One boxed extractor per kind reading this Archive's Format.
@@ -428,11 +534,19 @@ fn parse_archives(
                 }
                 parsed.push(archive);
             }
-            Err(err) => eprintln!("  [{}] Parse error: {}", archive.file_name(), err),
+            Err(err) => {
+                let message = format!("Parse error: {}", err);
+                eprintln!("  [{}] {}", archive.file_name(), message);
+                failures.push(Failure {
+                    counted: err.repeats(),
+                    archive,
+                    message,
+                });
+            }
         }
     }
 
-    (found, parsed)
+    (found, parsed, failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -522,15 +636,119 @@ async fn print_totals(store: &mut impl Store, kinds: &[ArtifactKind]) {
 }
 
 /// Exit status of a run that went to the end but left some (Shard, kind)
-/// pairs undone: running the same command again retries them. A run that
-/// did everything exits with 0, one that stops early with 1. 2 is taken:
-/// `clap` exits with it on invalid arguments.
+/// pairs undone that a run may still do: running the same command again
+/// retries them. A run that did everything exits with 0, one that stops
+/// early with 1. 2 is taken: `clap` exits with it on invalid arguments.
 const EXIT_UNDONE: u8 = 3;
+
+/// Exit status of a run that went to the end with nothing to retry, but
+/// some pairs of its Slice given up: their Plan reads an Archive given up,
+/// whether by this run or an earlier one. Running the same command again
+/// would change nothing.
+const EXIT_GIVEN_UP: u8 = 4;
+
+/// A given-up Archive of the Slice, as the summary lists it.
+struct GivenUp {
+    /// The requested kinds it leaves undone.
+    kinds: BTreeSet<ArtifactKind>,
+    /// The error of the latest run that counted a failure on it.
+    last_error: String,
+}
+
+/// Note in `given_up` that the Archive `archive` (its file name) leaves
+/// `kind` undone, with `last_error`.
+fn note_given_up(
+    given_up: &mut BTreeMap<String, GivenUp>,
+    archive: &str,
+    kind: ArtifactKind,
+    last_error: &str,
+) {
+    given_up
+        .entry(archive.to_string())
+        .or_insert_with(|| GivenUp {
+            kinds: BTreeSet::new(),
+            last_error: last_error.to_string(),
+        })
+        .kinds
+        .insert(kind);
+}
+
+/// What the run did with the Shards of its Slice, for the summary. Each
+/// Shard is counted once, in the first of these that applies: skipped
+/// (every requested kind done before the run), failed (a kind left undone
+/// that a later run may do), given up (only given-up kinds left undone),
+/// processed.
+#[derive(Default)]
+struct Tally {
+    processed: usize,
+    skipped: usize,
+    failed: usize,
+    given_up: usize,
+    /// How many Artifacts of each kind were new to the store.
+    new_artifacts: BTreeMap<ArtifactKind, usize>,
+    /// Download and parse time of the processed Shards.
+    download_time: Duration,
+    parse_time: Duration,
+}
+
+/// Print the summary, and return the run's exit status: `EXIT_UNDONE` if
+/// some Shard failed, else `EXIT_GIVEN_UP` if some pair of the Slice is
+/// given up, else 0.
+async fn finish(
+    store: &mut impl Store,
+    kinds: &[ArtifactKind],
+    tally: Tally,
+    given_up: &BTreeMap<String, GivenUp>,
+) -> ExitCode {
+    eprintln!(
+        "\nSummary: {} processed, {} skipped, {} failed, {} given up, new: {}",
+        tally.processed,
+        tally.skipped,
+        tally.failed,
+        tally.given_up,
+        count_list(tally.new_artifacts)
+    );
+    print_totals(store, kinds).await;
+    if tally.processed > 0 {
+        let avg_dl = tally.download_time.as_secs_f64() / tally.processed as f64;
+        let avg_parse = tally.parse_time.as_secs_f64() / tally.processed as f64;
+        eprintln!(
+            "Avg per Shard: {:.1}s download, {:.1}s parsing",
+            avg_dl, avg_parse
+        );
+    }
+    if !given_up.is_empty() {
+        eprintln!(
+            "Given up: {} Archive(s) of the Slice (to retry one, DEL failures:<file name> in the \
+             store; all of them, DEL failures)",
+            given_up.len()
+        );
+        for (archive, GivenUp { kinds, last_error }) in given_up {
+            let kinds: Vec<ArtifactKind> = kinds.iter().copied().collect();
+            eprintln!(
+                "  {}: {} undone, last error: {}",
+                archive,
+                kind_list(&kinds),
+                last_error
+            );
+        }
+    }
+
+    if tally.failed > 0 {
+        ExitCode::from(EXIT_UNDONE)
+    } else if !given_up.is_empty() {
+        ExitCode::from(EXIT_GIVEN_UP)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
 
 /// Main crawl pipeline — download and parse each Shard's Archives.
 ///
 /// Returns `EXIT_UNDONE` if a Shard was left with a kind undone, by a
-/// failed download, parse, store write or image save.
+/// failed download, parse, store write or image save, that a later run may
+/// still do; otherwise `EXIT_GIVEN_UP` if some pair of the Slice is given
+/// up.
 async fn run_crawl(config: Config) -> ExitCode {
     let input = config.input.clone();
     let limit_display = match config.limit {
@@ -603,9 +821,13 @@ async fn run_crawl(config: Config) -> ExitCode {
         Some(dir) => format!(", save images to: {}", dir.display()),
         None => String::new(),
     };
+    let memory_display = match config.max_memory {
+        Some(gb) => format!(", max memory: {} GB", gb),
+        None => String::new(),
+    };
     eprintln!(
         "Reading paths from '{}' (extract: {}{}, limit: {}{}, jobs: {}, delete after: {}, \
-         transport: {}, onion engine: {}{}{})",
+         transport: {}{}, onion engine: {}{}{})",
         input,
         kind_list(&kinds),
         formats_display,
@@ -614,6 +836,7 @@ async fn run_crawl(config: Config) -> ExitCode {
         capped_jobs,
         config.delete,
         cli_name(&transport_choice),
+        memory_display,
         cli_name(&onion_engine),
         store_display,
         images_display
@@ -622,6 +845,10 @@ async fn run_crawl(config: Config) -> ExitCode {
     // without that kind.
     if config.save_images.is_some() && !kinds.contains(&ArtifactKind::InlineFavicon) {
         eprintln!("Note: inline-favicon is not requested: no image will be saved");
+    }
+    // Accepted all the same, so one command line can serve every Transport.
+    if config.max_memory.is_some() && transport_choice != TransportChoice::Memory {
+        eprintln!("Note: --max-memory only caps --transport memory: it has no effect here");
     }
 
     // --- Open and read the paths file ---
@@ -656,11 +883,14 @@ async fn run_crawl(config: Config) -> ExitCode {
             process::exit(1);
         });
 
+    // The Slice: the `--limit` paths after the first `--offset`, blank
+    // lines not counted. `take(usize::MAX)` takes them all.
     let uris: Vec<String> = lines
         .into_iter()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .skip(config.offset)
+        .take(config.limit.unwrap_or(usize::MAX))
         .collect();
 
     if uris.is_empty() {
@@ -672,7 +902,7 @@ async fn run_crawl(config: Config) -> ExitCode {
     }
 
     eprintln!(
-        "Found {} path(s) in file{}",
+        "Slice: {} path(s){}",
         uris.len(),
         if config.offset > 0 {
             format!(" (after skipping {})", config.offset)
@@ -681,11 +911,12 @@ async fn run_crawl(config: Config) -> ExitCode {
         }
     );
 
-    // --- Connect to the store, read the done pairs ---
+    // --- Connect to the store, read the done pairs and the failures ---
     //
     // After the checks that need no store, before anything is downloaded:
     // a store that can't be reached stops the run here. Only the done
-    // marks are read; the results stay in the store.
+    // marks and the failure records are read; the results stay in the
+    // store.
     let mut store = KvrocksStore::connect(&config.kvrocks, store_password())
         .await
         .unwrap_or_else(|err| {
@@ -698,6 +929,11 @@ async fn run_crawl(config: Config) -> ExitCode {
     let processed = load_processed(&mut store)
         .await
         .unwrap_or_else(|err| stop_unreadable(&config.kvrocks, err));
+    let mut failure_records = load_failures(&mut store)
+        .await
+        .unwrap_or_else(|err| stop_unreadable(&config.kvrocks, err));
+    // What this run's failure records are made unique by.
+    let run = RunId::now();
     let start_totals = totals(&mut store, &kinds)
         .await
         .unwrap_or_else(|err| stop_unreadable(&config.kvrocks, err));
@@ -711,11 +947,22 @@ async fn run_crawl(config: Config) -> ExitCode {
     // --- Schedule: the requested kinds still missing for each Shard ---
     //
     // We do this upfront so we know exactly which Shards to process
-    // concurrently. A Shard done for every requested kind is skipped and
-    // doesn't count toward the limit; any other is planned for its missing
-    // kinds only, and its Plan's Archive paths are derived from the line.
+    // concurrently. Every path of the Slice is considered. A Shard done for
+    // every requested kind is skipped; any other is planned for its missing
+    // kinds only, leaving out those whose Plan reads a given-up Archive,
+    // and its Plan's Archive paths are derived from the line.
     let mut work_items: Vec<ScheduledShard> = Vec::new();
-    let mut skip_count: usize = 0;
+    let mut tally = Tally {
+        new_artifacts: kinds.iter().map(|&kind| (kind, 0)).collect(),
+        ..Tally::default()
+    };
+    // The given-up Archives of the Slice, by file name.
+    let mut given_up: BTreeMap<String, GivenUp> = BTreeMap::new();
+    // The records are handed in rather than captured: a closure borrowing
+    // `failure_records` would keep the result loop from adding to them.
+    let is_given_up = |records: &HashMap<String, FailureRecord>, archive: &str| -> bool {
+        records.get(archive).is_some_and(FailureRecord::given_up)
+    };
 
     for (i, uri) in uris.iter().enumerate() {
         let path = match ArchivePath::parse(uri) {
@@ -735,24 +982,56 @@ async fn run_crawl(config: Config) -> ExitCode {
 
         if missing.is_empty() {
             eprintln!("[{}] {} — already processed, skipping", i + 1, shard);
-            skip_count += 1;
+            tally.skipped += 1;
             continue;
         }
 
-        if let Some(limit) = config.limit
-            && work_items.len() >= limit
-        {
-            eprintln!("Reached processing limit of {}. Stopping.", limit);
-            break;
-        }
+        // The Formats whose Archive of this Shard is given up: no kind
+        // reading one is planned, and the Archive is not downloaded.
+        let avoided: FormatSet = path
+            .dataset()
+            .available_formats()
+            .iter()
+            .filter(|&format| {
+                path.in_format(format)
+                    .is_some_and(|archive| is_given_up(&failure_records, archive.file_name()))
+            })
+            .collect();
 
         // A Plan fails only on a configuration no Shard of this Dataset can
         // meet (such as `--formats wat` on CC-NEWS), so the run stops here,
         // before anything is downloaded.
-        let plan = Plan::new(path.dataset(), &missing, forced).unwrap_or_else(|err| {
-            eprintln!("Error: [{}] {}: {}", i + 1, shard, err);
-            process::exit(1);
-        });
+        let (plan, left_out) = Plan::avoiding(path.dataset(), &missing, forced, avoided)
+            .unwrap_or_else(|err| {
+                eprintln!("Error: [{}] {}: {}", i + 1, shard, err);
+                process::exit(1);
+            });
+
+        // Each kind left out is a given-up pair, for the summary.
+        let mut given_up_archives: BTreeSet<String> = BTreeSet::new();
+        for &(kind, formats) in &left_out {
+            for format in formats.iter() {
+                let archive = path
+                    .in_format(format)
+                    .expect("only Formats whose path derives are avoided");
+                let name = archive.file_name();
+                note_given_up(&mut given_up, name, kind, &failure_records[name].last_error);
+                given_up_archives.insert(name.to_string());
+            }
+        }
+        let left_out_display = || {
+            let kinds: Vec<ArtifactKind> = left_out.iter().map(|&(kind, _)| kind).collect();
+            let archives: Vec<String> = given_up_archives.iter().cloned().collect();
+            format!("{} given up ({})", kind_list(&kinds), archives.join(", "))
+        };
+        let Some(plan) = plan else {
+            eprintln!("[{}] {} — {}, skipping", i + 1, shard, left_out_display());
+            tally.given_up += 1;
+            continue;
+        };
+        if !left_out.is_empty() {
+            eprintln!("[{}] {} — {}", i + 1, shard, left_out_display());
+        }
 
         // `collect` into `Option<Vec<_>>` gives `None` if any Format's path
         // can't be derived.
@@ -776,14 +1055,16 @@ async fn run_crawl(config: Config) -> ExitCode {
             shard,
             plan,
             archives,
+            partly_given_up: !left_out.is_empty(),
         });
     }
 
+    // Only the Archives leaving out a requested kind not yet done count.
+    eprintln!("Given-up Archives in the Slice: {}", given_up.len());
+
     if work_items.is_empty() {
         eprintln!("No Shards to process.");
-        eprintln!("\nSummary: 0 processed, {} skipped, 0 failed", skip_count);
-        print_totals(&mut store, &kinds).await;
-        return ExitCode::SUCCESS;
+        return finish(&mut store, &kinds, tally, &given_up).await;
     }
 
     // --- Cap concurrent jobs based on available RAM (memory Transport only) ---
@@ -795,37 +1076,50 @@ async fn run_crawl(config: Config) -> ExitCode {
     // Without a cap, a 16-core machine with 8 GB of RAM would try to hold
     // 16 Plans simultaneously — guaranteed OOM.
     //
-    // We query available RAM once, after scheduling, and divide it by the
-    // largest estimated Plan among the scheduled Shards: the worst case of
-    // what one job can hold. `buffer_unordered` then provides natural
-    // backpressure: when a job finishes and frees its buffers, the next one
-    // starts and allocates new ones.
+    // We query available RAM once, after scheduling, and divide the smaller
+    // of it and `--max-memory` by the largest estimated Plan among the
+    // scheduled Shards: the worst case of what one job can hold. Several
+    // processes on one machine each see all of its available RAM;
+    // `--max-memory` is one process's share. `buffer_unordered` then
+    // provides natural backpressure: when a job finishes and frees its
+    // buffers, the next one starts and allocates new ones.
     let effective_jobs = if transport_choice == TransportChoice::Memory {
         let largest_plan = work_items
             .iter()
             .map(|item| item.plan.formats().estimated_size())
             .max()
-            .unwrap_or(1)
-            .max(1); // never divide by zero
-        if let Some(available) = get_available_memory() {
-            let max_jobs = (available / largest_plan).max(1) as usize;
-            if max_jobs < capped_jobs {
-                eprintln!(
-                    "Warning: available RAM ({:.1} GB) limits in-memory jobs to {} \
-                     (requested {}, up to {:.1} GB per Shard). Use --transport disk or \
-                     free memory for more concurrency.",
-                    available as f64 / 1_073_741_824.0,
-                    max_jobs,
-                    capped_jobs,
-                    largest_plan as f64 / 1_073_741_824.0,
-                );
-                max_jobs
-            } else {
-                capped_jobs
+            .unwrap_or(1);
+        // `as` from a float to an integer rounds toward zero, and saturates
+        // at the integer's bounds rather than wrapping.
+        let max_memory = config
+            .max_memory
+            .map(|gb| (gb * BYTES_PER_GB as f64) as u64);
+        let (jobs, limit) = memory_jobs(
+            capped_jobs,
+            largest_plan,
+            get_available_memory(),
+            max_memory,
+        );
+        let limited_by = match limit {
+            Some(MemoryLimit::Available(bytes)) => {
+                Some(format!("available RAM ({:.1} GB)", gigabytes(bytes)))
             }
-        } else {
-            capped_jobs // Can't detect RAM — proceed with CPU-capped jobs
+            Some(MemoryLimit::MaxMemory(bytes)) => {
+                Some(format!("--max-memory ({:.1} GB)", gigabytes(bytes)))
+            }
+            None => None,
+        };
+        if let Some(limited_by) = limited_by {
+            eprintln!(
+                "Warning: {} limits in-memory jobs to {} (requested {}, up to {:.1} GB per \
+                 Shard). Use --transport disk or more memory for more concurrency.",
+                limited_by,
+                jobs,
+                capped_jobs,
+                gigabytes(largest_plan),
+            );
         }
+        jobs
     } else {
         capped_jobs // Archives go to disk — no memory concern
     };
@@ -870,6 +1164,7 @@ async fn run_crawl(config: Config) -> ExitCode {
                  shard,
                  plan,
                  archives,
+                 partly_given_up,
              }| {
                 // Clone the shared client for this task. The `reqwest::Client`
                 // in `HttpClient` is an `Arc` inside, so the clone is cheap
@@ -895,11 +1190,21 @@ async fn run_crawl(config: Config) -> ExitCode {
                     // read that Archive can still finish.
                     let download_start = Instant::now();
                     let mut downloaded: Vec<(ArchivePath, Transport)> = Vec::new();
+                    let mut failures: Vec<Failure> = Vec::new();
                     for archive in archives {
                         match fetch(&client, &archive, transport_choice).await {
                             Ok(transport) => downloaded.push((archive, transport)),
                             Err(err) => {
-                                eprintln!("  [{}] Download error: {}", archive.file_name(), err)
+                                let message = format!("Download error: {}", err);
+                                eprintln!("  [{}] {}", archive.file_name(), message);
+                                // `&*err`: `*` reaches the error inside the
+                                // `Box`, `&` borrows it, as the
+                                // `&dyn Error` the function reads.
+                                failures.push(Failure {
+                                    counted: download_failure_repeats(&*err),
+                                    archive,
+                                    message,
+                                });
                             }
                         }
                     }
@@ -913,9 +1218,12 @@ async fn run_crawl(config: Config) -> ExitCode {
                     if downloaded.is_empty() {
                         return ShardResult {
                             shard,
+                            plan,
+                            partly_given_up,
                             found: Vec::new(),
                             undone: kinds,
                             parsed: Vec::new(),
+                            failures,
                             download_time,
                             parse_time: Duration::ZERO,
                         };
@@ -960,11 +1268,15 @@ async fn run_crawl(config: Config) -> ExitCode {
                     let parse_time = parse_start.elapsed();
 
                     // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
-                    // the task panicked: then no Archive counts as parsed.
-                    let (mut by_kind, parsed) = parse_result.unwrap_or_else(|err| {
-                        eprintln!("  [{}] Task panic: {}", shard, err);
-                        (BTreeMap::new(), Vec::new())
-                    });
+                    // the task panicked: then no Archive counts as parsed, and
+                    // no failure is counted against any (a bug, not a sign of
+                    // a bad Archive).
+                    let (mut by_kind, parsed, parse_failures) =
+                        parse_result.unwrap_or_else(|err| {
+                            eprintln!("  [{}] Task panic: {}", shard, err);
+                            (BTreeMap::new(), Vec::new(), Vec::new())
+                        });
+                    failures.extend(parse_failures);
                     eprintln!(
                         "  [{}] Parsing time: {:.1}s",
                         shard,
@@ -996,9 +1308,12 @@ async fn run_crawl(config: Config) -> ExitCode {
 
                     ShardResult {
                         shard,
+                        plan,
+                        partly_given_up,
                         found,
                         undone,
                         parsed,
+                        failures,
                         download_time,
                         parse_time,
                     }
@@ -1010,9 +1325,9 @@ async fn run_crawl(config: Config) -> ExitCode {
     // --- Collect results back on the main task ---
     //
     // `buffer_unordered` yields results as futures complete. We process
-    // them sequentially here: save each done kind's images (with
-    // `--save-images`), write its Sightings to the store, mark the
-    // (Shard, kind) pair done, and optionally delete files.
+    // them sequentially here: record the failures that count, save each
+    // done kind's images (with `--save-images`), write its Sightings to the
+    // store, mark the (Shard, kind) pair done, and optionally delete files.
     //
     // This is a key design choice: concurrent *work*, sequential *writing*.
     // No locks, no race conditions — the simplest correct approach.
@@ -1025,19 +1340,52 @@ async fn run_crawl(config: Config) -> ExitCode {
     // unpolled for `READ_TIMEOUT` fails on its next poll, data or not, so a
     // write must stay well under it: one Shard's writes cost the same
     // however much the store already holds.
-    let mut process_count: usize = 0;
-    let mut fail_count: usize = 0;
-    let mut new_counts: BTreeMap<ArtifactKind, usize> =
-        kinds.iter().map(|&kind| (kind, 0)).collect();
-    let mut total_download = Duration::ZERO;
-    let mut total_parse = Duration::ZERO;
-
     // `pin_mut!` pins the stream to the stack so we can poll it.
     // This is needed because `buffer_unordered` returns a stream that
     // must be pinned to be polled (a Rust async trait requirement).
     futures::pin_mut!(shard_stream);
 
     while let Some(result) = shard_stream.next().await {
+        // --- Count the failures that repeat by nature ---
+        //
+        // One record per Archive and run; the third run's gives the Archive
+        // up. A record the store can't take is reported, and simply not
+        // counted: the run that meets the failure again counts it.
+        for failure in result.failures.iter().filter(|failure| failure.counted) {
+            let name = failure.archive.file_name();
+            match record_failure(&mut store, &run, name, &failure.message).await {
+                Ok(true) => {
+                    let record = failure_records
+                        .entry(name.to_string())
+                        .or_insert(FailureRecord {
+                            runs: 0,
+                            last_error: String::new(),
+                        });
+                    record.runs += 1;
+                    record.last_error = failure.message.clone();
+                    if record.given_up() {
+                        eprintln!(
+                            "  [{}] {}: given up, failed the same way on {} runs: no Plan \
+                             reading it is scheduled until its record is deleted from the store",
+                            result.shard, name, record.runs
+                        );
+                    } else {
+                        eprintln!(
+                            "  [{}] {}: failure counted on {} of {} runs",
+                            result.shard, name, record.runs, GIVE_UP_AFTER
+                        );
+                    }
+                }
+                // The same Archive twice in one run (a Shard listed twice):
+                // counted once.
+                Ok(false) => {}
+                Err(err) => eprintln!(
+                    "  [{}] Warning: cannot record the failure of {} in the store: {}",
+                    result.shard, name, err
+                ),
+            }
+        }
+
         // For each done kind: save its images, write its Sightings, *then*
         // mark the pair done. A crash or failed write in between leaves the
         // pair unmarked, never marked with its Sightings or images missing
@@ -1070,7 +1418,7 @@ async fn run_crawl(config: Config) -> ExitCode {
             }
             // Counted even when the write fails part-way: what it added
             // is in the store, and won't be new to the next run.
-            let new_artifacts = new_counts.entry(kind).or_default();
+            let new_artifacts = tally.new_artifacts.entry(kind).or_default();
             let saved = save_then_mark(&mut store, kind, &findings, &result.shard, new_artifacts);
             if let Err(err) = saved.await {
                 eprintln!(
@@ -1088,20 +1436,51 @@ async fn run_crawl(config: Config) -> ExitCode {
             );
         }
 
-        if undone.is_empty() {
-            process_count += 1;
-            total_download += result.download_time;
-            total_parse += result.parse_time;
-        } else {
+        // A kind left undone by an Archive given up now is a given-up pair:
+        // no later run does it. A later run may do the others.
+        let mut retryable: Vec<ArtifactKind> = Vec::new();
+        let mut given_up_now: Vec<ArtifactKind> = Vec::new();
+        for kind in undone {
+            let mut reads_given_up = false;
+            for failure in &result.failures {
+                let name = failure.archive.file_name();
+                if is_given_up(&failure_records, name)
+                    && result
+                        .plan
+                        .kinds_reading(failure.archive.format())
+                        .contains(&kind)
+                {
+                    let last_error = &failure_records[name].last_error;
+                    note_given_up(&mut given_up, name, kind, last_error);
+                    reads_given_up = true;
+                }
+            }
+            if reads_given_up {
+                given_up_now.push(kind);
+            } else {
+                retryable.push(kind);
+            }
+        }
+        if !given_up_now.is_empty() {
+            eprintln!("  [{}] {} given up", result.shard, kind_list(&given_up_now));
+        }
+
+        if !retryable.is_empty() {
             // Kinds whose write failed were pushed last: back to declaration
             // order, as in every other kind list.
-            undone.sort();
+            retryable.sort();
             eprintln!(
                 "  [{}] Error: {} will be extracted again next run",
                 result.shard,
-                kind_list(&undone)
+                kind_list(&retryable)
             );
-            fail_count += 1;
+            tally.failed += 1;
+        } else if result.partly_given_up || !given_up_now.is_empty() {
+            tally.given_up += 1;
+        } else {
+            tally.processed += 1;
+            tally.download_time += result.download_time;
+            tally.parse_time += result.parse_time;
         }
 
         // With the memory Transport there is no local file to delete — the
@@ -1120,27 +1499,66 @@ async fn run_crawl(config: Config) -> ExitCode {
         eprintln!();
     }
 
-    // --- Summary ---
-    eprintln!(
-        "\nSummary: {} processed, {} skipped, {} failed, new: {}",
-        process_count,
-        skip_count,
-        fail_count,
-        count_list(new_counts)
-    );
-    print_totals(&mut store, &kinds).await;
-    if process_count > 0 {
-        let avg_dl = total_download.as_secs_f64() / process_count as f64;
-        let avg_parse = total_parse.as_secs_f64() / process_count as f64;
-        eprintln!(
-            "Avg per Shard: {:.1}s download, {:.1}s parsing",
-            avg_dl, avg_parse
+    finish(&mut store, &kinds, tally, &given_up).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = BYTES_PER_GB;
+
+    #[test]
+    fn max_memory_below_the_available_ram_lowers_the_cap() {
+        assert_eq!(
+            memory_jobs(8, GB, Some(16 * GB), Some(2 * GB)),
+            (2, Some(MemoryLimit::MaxMemory(2 * GB)))
         );
     }
 
-    if fail_count > 0 {
-        ExitCode::from(EXIT_UNDONE)
-    } else {
-        ExitCode::SUCCESS
+    #[test]
+    fn max_memory_above_the_available_ram_changes_nothing() {
+        for available in [4 * GB, 16 * GB] {
+            assert_eq!(
+                memory_jobs(8, GB, Some(available), Some(64 * GB)),
+                memory_jobs(8, GB, Some(available), None),
+                "{available} bytes available"
+            );
+        }
+        assert_eq!(
+            memory_jobs(8, GB, Some(4 * GB), None),
+            (4, Some(MemoryLimit::Available(4 * GB)))
+        );
+        assert_eq!(memory_jobs(8, GB, Some(16 * GB), None), (8, None));
+    }
+
+    #[test]
+    fn max_memory_alone_caps_when_the_ram_is_unknown() {
+        assert_eq!(
+            memory_jobs(8, GB, None, Some(3 * GB)),
+            (3, Some(MemoryLimit::MaxMemory(3 * GB)))
+        );
+        assert_eq!(memory_jobs(8, GB, None, None), (8, None));
+    }
+
+    #[test]
+    fn at_least_one_job_runs() {
+        assert_eq!(
+            memory_jobs(8, GB, Some(16 * GB), Some(GB / 10)),
+            (1, Some(MemoryLimit::MaxMemory(GB / 10)))
+        );
+        assert_eq!(
+            memory_jobs(8, GB, Some(0), None),
+            (1, Some(MemoryLimit::Available(0)))
+        );
+    }
+
+    #[test]
+    fn max_memory_is_a_positive_number_of_gb() {
+        assert_eq!(parse_gigabytes("12"), Ok(12.0));
+        assert_eq!(parse_gigabytes("0.5"), Ok(0.5));
+        for refused in ["0", "-1", "", "twelve", "inf", "NaN"] {
+            assert!(parse_gigabytes(refused).is_err(), "{refused:?}");
+        }
     }
 }

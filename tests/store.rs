@@ -2,7 +2,8 @@
 //
 // After each Shard, the crawl writes each done kind's Findings to the store,
 // then marks the (Shard, kind) pair done (`save_then_mark`); at start-up it
-// reads the done pairs back (`load_processed`). `MemoryStore` behaves as
+// reads the done pairs back (`load_processed`), and the failures counted on
+// each Archive (`record_failure`, `load_failures`). `MemoryStore` behaves as
 // kvrocks does for the few commands the store uses, so these tests need no
 // server; `crawl_cli.rs` runs the same code against a real kvrocks.
 
@@ -12,9 +13,11 @@
 mod common;
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use cc_extract::store::{
-    MemoryStore, Store, Write, artifact_count, load_processed, save_then_mark,
+    FailureRecord, GIVE_UP_AFTER, MemoryStore, RunId, Store, Write, artifact_count, load_failures,
+    load_processed, record_failure, save_then_mark,
 };
 use cc_extract::{ArtifactKind, Findings, InlineFavicon, Shard, Sighting};
 use common::{findings_in, normalized};
@@ -391,6 +394,103 @@ async fn new_artifacts_are_those_the_store_did_not_hold() {
     assert_eq!(second_new, 1);
     let total = artifact_count(&mut store, ArtifactKind::Onion).await;
     assert_eq!(total.unwrap(), 3);
+}
+
+/// An Archive of the made-up Crawl, as its failures are recorded.
+const ARCHIVE: &str = "CC-MAIN-20250101000000-20250101010101-00001.warc.wet.gz";
+
+/// The `n`th run of the crawl, started `n` minutes after the first.
+fn run(n: u64) -> RunId {
+    RunId::new(
+        Duration::from_secs(1_735_689_600 + 60 * n),
+        4_000 + n as u32,
+    )
+}
+
+/// What the store says of `ARCHIVE`'s failures, `None` if nothing counts.
+async fn failures_of_archive(store: &mut MemoryStore) -> Option<FailureRecord> {
+    load_failures(store).await.unwrap().remove(ARCHIVE)
+}
+
+/// An Archive is given up once failures were counted on 3 runs, not 2, and
+/// the error kept is the latest run's, whatever order the runs wrote in.
+#[tokio::test]
+async fn failures_on_three_runs_give_an_archive_up() {
+    let mut store = MemoryStore::new();
+    record_failure(&mut store, &run(1), ARCHIVE, "Parse error: first")
+        .await
+        .unwrap();
+    // A run started later may finish, and record, first.
+    record_failure(&mut store, &run(3), ARCHIVE, "Parse error: third")
+        .await
+        .unwrap();
+
+    let two_runs = failures_of_archive(&mut store).await.unwrap();
+    assert_eq!(two_runs.runs, 2);
+    assert!(!two_runs.given_up());
+
+    record_failure(&mut store, &run(2), ARCHIVE, "Parse error: second")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        failures_of_archive(&mut store).await,
+        Some(FailureRecord {
+            runs: 3,
+            last_error: "Parse error: third".to_string()
+        })
+    );
+    assert!(failures_of_archive(&mut store).await.unwrap().given_up());
+    assert_eq!(GIVE_UP_AFTER, 3);
+}
+
+/// A run records an Archive's failure once: a second record from the same
+/// run adds nothing, and says so.
+#[tokio::test]
+async fn one_run_counts_one_failure() {
+    let mut store = MemoryStore::new();
+
+    let first = record_failure(&mut store, &run(1), ARCHIVE, "Parse error: first").await;
+    assert!(first.unwrap());
+    let again = record_failure(&mut store, &run(1), ARCHIVE, "Parse error: again").await;
+    assert!(!again.unwrap());
+
+    assert_eq!(
+        failures_of_archive(&mut store).await,
+        Some(FailureRecord {
+            runs: 1,
+            last_error: "Parse error: first".to_string()
+        })
+    );
+}
+
+/// Deleting an Archive's record, or every record, starts its count over:
+/// a failure afterwards is its first, the earlier ones not counted again.
+#[tokio::test]
+async fn deleting_the_records_starts_the_count_over() {
+    for key in [format!("failures:{ARCHIVE}"), "failures".to_string()] {
+        let mut store = MemoryStore::new();
+        for n in 1..=3 {
+            record_failure(&mut store, &run(n), ARCHIVE, "Parse error: early")
+                .await
+                .unwrap();
+        }
+
+        store.delete(&key);
+        assert_eq!(failures_of_archive(&mut store).await, None, "{key}");
+
+        record_failure(&mut store, &run(4), ARCHIVE, "Parse error: late")
+            .await
+            .unwrap();
+        assert_eq!(
+            failures_of_archive(&mut store).await,
+            Some(FailureRecord {
+                runs: 1,
+                last_error: "Parse error: late".to_string()
+            }),
+            "{key}"
+        );
+    }
 }
 
 /// Write the onions `shard_findings` lists first; returns how many were new

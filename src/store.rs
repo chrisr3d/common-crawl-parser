@@ -19,6 +19,9 @@
 //   mmh3:<value>,         set   SHA-256s of the inline favicons having
 //   sha1:<hex>, md5:<hex>       that value
 //   processed             set   `<shard> <kind>`, one per done pair
+//   failures              set   `<archive> <run>`, one per counted failure
+//   failures:<archive>    hash  the error message of each run (`<run>`)
+//                               that counted a failure on the Archive
 //
 // `<artifact>` is an onion address, a favicon URL, or the SHA-256 of an
 // inline favicon. One Sighting is one Page in an Artifact's set: a Page is
@@ -26,6 +29,9 @@
 // as before, by the set itself.
 //
 // An image's bytes are never written: `--save-images` puts them on disk.
+//
+// `<archive>` is an Archive's file name, `<run>` a `RunId`. A failure is
+// counted only when both keys hold it (see `load_failures`).
 //
 // ## Only adding, never replacing
 //
@@ -37,7 +43,8 @@
 // ## One seam, two stores
 //
 // The functions below the two stores (`save_then_mark`, `load_processed`,
-// `artifact_count`) decide what is written and in which order. They reach
+// `artifact_count`, `record_failure`, `load_failures`) decide what is
+// written and in which order. They reach
 // the store only through the `Store` trait: the crawl passes them a
 // `KvrocksStore`, the tests a `MemoryStore`, so the tests run the code the
 // crawl runs without a server.
@@ -46,8 +53,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::process;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redis::aio::MultiplexedConnection;
 use redis::{
@@ -76,7 +84,7 @@ pub enum Write {
     /// is set already.
     HashSetIfAbsent {
         key: String,
-        field: &'static str,
+        field: String,
         value: String,
     },
 }
@@ -110,6 +118,13 @@ pub trait Store {
 
     /// How many members the set at `key` has (`SCARD`).
     fn count(&mut self, key: &str) -> impl Future<Output = StoreResult<usize>> + Send;
+
+    /// The fields of the hash at each of `keys`, in the same order: one
+    /// `HGETALL` each, sent together in one round trip.
+    fn fields_of_each(
+        &mut self,
+        keys: &[String],
+    ) -> impl Future<Output = StoreResult<Vec<HashMap<String, String>>>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +160,13 @@ impl MemoryStore {
     pub fn stop_failing(&mut self) {
         self.writes_left = None;
     }
+
+    /// Remove the set or hash at `key`, as `DEL` does: what a user does by
+    /// hand, such as deleting failure records to retry an Archive.
+    pub fn delete(&mut self, key: &str) {
+        self.sets.remove(key);
+        self.hashes.remove(key);
+    }
 }
 
 impl Store for MemoryStore {
@@ -167,9 +189,9 @@ impl Store for MemoryStore {
                     .insert(member.clone()),
                 Write::HashSetIfAbsent { key, field, value } => {
                     let hash = self.hashes.entry(key.clone()).or_default();
-                    let absent = !hash.contains_key(*field);
+                    let absent = !hash.contains_key(field);
                     if absent {
-                        hash.insert(field.to_string(), value.clone());
+                        hash.insert(field.clone(), value.clone());
                     }
                     absent
                 }
@@ -194,6 +216,17 @@ impl Store for MemoryStore {
 
     async fn count(&mut self, key: &str) -> StoreResult<usize> {
         Ok(self.sets.get(key).map_or(0, BTreeSet::len))
+    }
+
+    async fn fields_of_each(
+        &mut self,
+        keys: &[String],
+    ) -> StoreResult<Vec<HashMap<String, String>>> {
+        let mut all = Vec::with_capacity(keys.len());
+        for key in keys {
+            all.push(self.fields(key).await?);
+        }
+        Ok(all)
     }
 }
 
@@ -251,7 +284,7 @@ impl Store for KvrocksStore {
             match write {
                 Write::SetAdd { key, member } => pipe.cmd("SADD").arg(key).arg(member),
                 Write::HashSetIfAbsent { key, field, value } => {
-                    pipe.cmd("HSETNX").arg(key).arg(*field).arg(value)
+                    pipe.cmd("HSETNX").arg(key).arg(field).arg(value)
                 }
             };
         }
@@ -270,6 +303,22 @@ impl Store for KvrocksStore {
 
     async fn count(&mut self, key: &str) -> StoreResult<usize> {
         self.read("SCARD", key).await
+    }
+
+    async fn fields_of_each(
+        &mut self,
+        keys: &[String],
+    ) -> StoreResult<Vec<HashMap<String, String>>> {
+        // A pipeline, as `write` sends: the replies come back in the order
+        // of the keys. One with no command sends nothing.
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for key in keys {
+            pipe.cmd("HGETALL").arg(key);
+        }
+        Ok(pipe.query_async(&mut self.connection).await?)
     }
 }
 
@@ -363,7 +412,7 @@ fn push_fields<const N: usize>(
     for (field, value) in fields {
         batch.push(Write::HashSetIfAbsent {
             key: key.to_string(),
-            field,
+            field: field.to_string(),
             value,
         });
     }
@@ -539,6 +588,205 @@ pub async fn artifact_count(store: &mut impl Store, kind: ArtifactKind) -> Store
 }
 
 // ---------------------------------------------------------------------------
+// Failure records
+// ---------------------------------------------------------------------------
+
+/// How many runs must count a failure on an Archive before it is given up:
+/// no Plan reading it is scheduled again until its records are deleted.
+pub const GIVE_UP_AFTER: usize = 3;
+
+/// The set listing every counted failure, `<archive> <run>`.
+const FAILURES_KEY: &str = "failures";
+
+/// The hash holding the error message of each run that counted a failure
+/// on `archive`.
+fn failures_key(archive: &str) -> String {
+    format!("{FAILURES_KEY}:{archive}")
+}
+
+/// One run of the crawl, as its failure records name it: when it started,
+/// since the Unix epoch, to the nanosecond, and its process id, written
+/// `<seconds>.<nanoseconds>-<process id>`.
+///
+/// Two runs share a `RunId` only if they started in the same nanosecond in
+/// processes with the same id: never on one machine, where two processes
+/// running at once have different ids, and as good as never on two
+/// machines whose stores are combined. So each run's failure is a record of
+/// its own.
+///
+/// ## Ordering by deriving `Ord`
+///
+/// `#[derive(PartialOrd, Ord)]` compares two structs field by field, in
+/// the order the fields are declared: by start time first (`Duration` is
+/// `Ord` itself), the process id deciding only between runs started at the
+/// same instant. The latest run is then simply the largest `RunId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunId {
+    started: Duration,
+    process: u32,
+}
+
+impl RunId {
+    /// The run that started `started` after the Unix epoch, in the process
+    /// `process`.
+    pub fn new(started: Duration, process: u32) -> Self {
+        RunId { started, process }
+    }
+
+    /// This run: started now, in this process.
+    ///
+    /// `duration_since` fails only if the system clock is set before 1970;
+    /// such a run is taken as started at 0, as old as runs come.
+    pub fn now() -> Self {
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        RunId::new(started, process::id())
+    }
+}
+
+/// `{:09}` pads the nanoseconds to nine digits: `.000000500` is 500 ns,
+/// where `.500` would read as half a second.
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{:09}-{}",
+            self.started.as_secs(),
+            self.started.subsec_nanos(),
+            self.process
+        )
+    }
+}
+
+/// Reads back what `Display` writes.
+impl FromStr for RunId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || format!("not a run: {value}");
+        let (started, process) = value.split_once('-').ok_or_else(invalid)?;
+        let (seconds, nanos) = started.split_once('.').ok_or_else(invalid)?;
+        let nanos: u32 = nanos.parse().map_err(|_| invalid())?;
+        if nanos >= 1_000_000_000 {
+            return Err(invalid());
+        }
+        Ok(RunId {
+            started: Duration::new(seconds.parse().map_err(|_| invalid())?, nanos),
+            process: process.parse().map_err(|_| invalid())?,
+        })
+    }
+}
+
+/// What the store holds about one Archive's counted failures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailureRecord {
+    /// How many runs counted a failure on it.
+    pub runs: usize,
+    /// The error message of the latest of those runs.
+    pub last_error: String,
+}
+
+impl FailureRecord {
+    /// Whether the Archive is given up: no Plan reading it is scheduled.
+    pub fn given_up(&self) -> bool {
+        self.runs >= GIVE_UP_AFTER
+    }
+}
+
+/// Record that `run` counted a failure on `archive` (its file name), with
+/// `message`. Returns whether the record is new: a run records an Archive's
+/// failure once, a second record changing nothing.
+///
+/// Two writes, both only adding: the message joins the Archive's hash,
+/// under the run, then `<archive> <run>` joins `failures`. In that order, a
+/// reader finding the record listed finds its message too.
+pub async fn record_failure(
+    store: &mut impl Store,
+    run: &RunId,
+    archive: &str,
+    message: &str,
+) -> StoreResult<bool> {
+    let writes = [
+        Write::HashSetIfAbsent {
+            key: failures_key(archive),
+            field: run.to_string(),
+            value: message.to_string(),
+        },
+        Write::SetAdd {
+            key: FAILURES_KEY.to_string(),
+            member: format!("{archive} {run}"),
+        },
+    ];
+    let changed = store.write(&writes).await?;
+    Ok(changed.into_iter().any(|changed| changed))
+}
+
+/// Each Archive with failures counted, by file name, with what the store
+/// holds about them. Reads `failures`, then the hashes of the Archives it
+/// lists, all at once: two round trips, whatever the number of Shards or
+/// failures.
+///
+/// ## A record in two keys
+///
+/// A failure counts only when both keys hold it: its member in `failures`
+/// *and* its run's field in `failures:<archive>`. Writes can only add, so
+/// retrying an Archive is done by deleting keys, and either deletion starts
+/// a count over:
+///
+/// - `DEL failures:<archive>` removes one Archive's runs: the members left
+///   in `failures` find no field, and count nothing.
+/// - `DEL failures` removes every Archive's runs: the hashes left behind
+///   are no longer listed. A later failure lists only its own run, so the
+///   old fields beside it count nothing either.
+///
+/// A record half-written (a process killed between the two writes) counts
+/// nothing: the failure is counted again on a later run, if it repeats.
+pub async fn load_failures(store: &mut impl Store) -> StoreResult<HashMap<String, FailureRecord>> {
+    // The runs `failures` lists for each Archive.
+    let mut listed: HashMap<String, HashSet<String>> = HashMap::new();
+    for member in store.members(FAILURES_KEY).await? {
+        if let Some((archive, run)) = member.split_once(' ') {
+            listed
+                .entry(archive.to_string())
+                .or_default()
+                .insert(run.to_string());
+        }
+    }
+
+    // `unzip` splits the pairs into two lists in the same order: the
+    // Archives, and the runs listed for each.
+    let (archives, listed_runs): (Vec<String>, Vec<HashSet<String>>) = listed.into_iter().unzip();
+    let keys: Vec<String> = archives
+        .iter()
+        .map(|archive| failures_key(archive))
+        .collect();
+    let hashes = store.fields_of_each(&keys).await?;
+
+    let mut failures = HashMap::new();
+    for ((archive, runs), messages) in archives.into_iter().zip(listed_runs).zip(hashes) {
+        // The runs both keys hold, with their messages; a field that isn't
+        // a run (written by hand) counts nothing, like an unknown kind in
+        // `processed`.
+        let counted: Vec<(RunId, String)> = messages
+            .into_iter()
+            .filter(|(run, _)| runs.contains(run))
+            .filter_map(|(run, message)| Some((run.parse().ok()?, message)))
+            .collect();
+        let count = counted.len();
+        // `max_by_key` on an empty list is `None`: nothing counts.
+        if let Some((_, last_error)) = counted.into_iter().max_by_key(|&(run, _)| run) {
+            let record = FailureRecord {
+                runs: count,
+                last_error,
+            };
+            failures.insert(archive, record);
+        }
+    }
+    Ok(failures)
+}
+
+// ---------------------------------------------------------------------------
 // Where the store is
 // ---------------------------------------------------------------------------
 
@@ -666,6 +914,17 @@ mod tests {
         StoreAddress::Tcp {
             host: host.to_string(),
             port,
+        }
+    }
+
+    #[test]
+    fn a_run_reads_back_as_written() {
+        let run = RunId::new(Duration::new(1_735_689_600, 500), 4242);
+        // The nanoseconds padded: 500 ns, not half a second.
+        assert_eq!(run.to_string(), "1735689600.000000500-4242");
+        assert_eq!("1735689600.000000500-4242".parse(), Ok(run));
+        for not_a_run in ["1735689600-4242", "1735689600.1000000000-4242", "x.0-1"] {
+            assert!(not_a_run.parse::<RunId>().is_err(), "{not_a_run}");
         }
     }
 

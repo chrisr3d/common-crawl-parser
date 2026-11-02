@@ -121,7 +121,7 @@ impl fmt::Display for Format {
 /// of its members' bits: WAT + WET is `0b010 | 0b100 = 0b110`. Set
 /// operations then become single integer operations:
 ///
-/// - union: `a | b`
+/// - union: `a | b`, intersection: `a & b`
 /// - "every member of `a` is in `b`": no bit of `a` is outside `b`, so
 ///   `a & !b == 0`
 ///
@@ -150,6 +150,15 @@ impl FormatSet {
 
     pub fn union(self, other: FormatSet) -> FormatSet {
         FormatSet(self.0 | other.0)
+    }
+
+    /// The Formats in both sets: `a & b`.
+    pub fn intersection(self, other: FormatSet) -> FormatSet {
+        FormatSet(self.0 & other.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == FormatSet::EMPTY
     }
 
     /// The Formats in the set, in declaration order.

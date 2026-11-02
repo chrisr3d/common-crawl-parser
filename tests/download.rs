@@ -8,7 +8,9 @@
 //
 // A download must also end: one whose server stops sending data fails after
 // the client's read timeout, while a slow one that keeps receiving data is
-// never cut. Those tests download from a server of their own on 127.0.0.1.
+// never cut. A failed download says whether its failure would happen again
+// (a 404), and so counts toward giving the Archive up. Those tests download
+// from a server of their own on 127.0.0.1.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -17,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cc_extract::{HttpClient, download_to, download_to_memory, save_archive};
+use cc_extract::{
+    HttpClient, download_failure_repeats, download_to, download_to_memory, save_archive,
+};
 use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
 
@@ -60,7 +64,11 @@ fn file_names(dir: &Path) -> Vec<String> {
 /// Start a server on a free port of 127.0.0.1, on a thread of its own, that
 /// reads one HTTP request and answers it with `respond`. Returns the URL of
 /// the Archive to request from it.
-fn serve_once(respond: fn(TcpStream)) -> String {
+///
+/// `respond` is any closure run once (`FnOnce`), so it can hold what it
+/// answers with; `Send + 'static`, as the thread it moves to may outlive
+/// this call.
+fn serve_once(respond: impl FnOnce(TcpStream) + Send + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/{}", listener.local_addr().unwrap(), ARCHIVE_NAME);
     thread::spawn(move || {
@@ -83,6 +91,13 @@ fn stall(mut stream: TcpStream) {
     let _ = stream.write_all(&[b'x'; 500]);
     // Blocks until the client closes the connection (the read returns 0).
     let _ = stream.read(&mut [0; 1]);
+}
+
+/// Answer with `status`, such as `404 Not Found`, and an empty body.
+fn answer(status: &'static str) -> impl FnOnce(TcpStream) + Send + 'static {
+    move |mut stream| {
+        let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+    }
 }
 
 /// The chunks of a slow download's body.
@@ -224,4 +239,44 @@ async fn slow_download_to_memory_still_receiving_data_completes() {
     // Longer than the read timeout in all, yet not cut.
     assert!(started.elapsed() > READ_TIMEOUT);
     assert_eq!(downloaded, slow_chunks().concat());
+}
+
+/// A download answered 404 fails the same way every time: its failure
+/// counts toward giving the Archive up, on disk as in memory. 408, 429 and
+/// 503 say to come back later, and a stalled download may come through on
+/// the next run: those don't count.
+#[tokio::test]
+async fn only_download_failures_that_repeat_count() {
+    let dir = download_dir("only_download_failures_that_repeat_count");
+    let client = HttpClient::new(READ_TIMEOUT).unwrap();
+    let statuses = [
+        ("404 Not Found", true),
+        ("408 Request Timeout", false),
+        ("429 Too Many Requests", false),
+        ("503 Service Unavailable", false),
+    ];
+
+    for (status, counted) in statuses {
+        let url = serve_once(answer(status));
+        let to_disk = download_to(&client, &url, &dir.join(ARCHIVE_NAME)).await;
+        assert_eq!(
+            download_failure_repeats(&*to_disk.unwrap_err()),
+            counted,
+            "{status}, on disk"
+        );
+
+        let url = serve_once(answer(status));
+        let to_memory = download_to_memory(&client, &url).await;
+        assert_eq!(
+            download_failure_repeats(&*to_memory.unwrap_err()),
+            counted,
+            "{status}, in memory"
+        );
+    }
+
+    let url = serve_once(stall);
+    let stalled = timeout(READ_TIMEOUT + MARGIN, download_to_memory(&client, &url))
+        .await
+        .expect("the stalled download hung");
+    assert!(!download_failure_repeats(&*stalled.unwrap_err()));
 }

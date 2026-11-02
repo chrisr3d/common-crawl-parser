@@ -67,6 +67,10 @@ pub fn cheapest_plan(
 // Plans
 // ---------------------------------------------------------------------------
 
+/// The kinds `Plan::avoiding` left out, each with the avoided Formats it
+/// read.
+pub type LeftOut = Vec<(ArtifactKind, FormatSet)>;
+
 /// What one Shard reads: for each requested kind, the Formats its
 /// extractor reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +103,43 @@ impl Plan {
             }
         };
         Plan::within(formats, kinds)
+    }
+
+    /// Plan `kinds` as `new` does, leaving out each kind that reads one of
+    /// the `avoided` Formats (such as one whose Archive was given up). The
+    /// kinds left are planned again as if only they were requested, until
+    /// none of them reads one.
+    ///
+    /// Returns the Plan of the kinds left, `None` when none is, and each
+    /// kind left out with the avoided Formats it read. No other Plan is
+    /// looked for around an avoided Format: a kind is left out even if
+    /// another of its combinations would do (`forced` Formats can plan
+    /// around one).
+    pub fn avoiding(
+        dataset: Dataset,
+        kinds: &[ArtifactKind],
+        forced: Option<FormatSet>,
+        avoided: FormatSet,
+    ) -> Result<(Option<Plan>, LeftOut), PlanError> {
+        let mut left_out = Vec::new();
+        let mut kinds = kinds.to_vec();
+        // Each pass leaves out at least one kind or ends the loop, so it
+        // ends after at most one pass per kind.
+        while !kinds.is_empty() {
+            let plan = Plan::new(dataset, &kinds, forced)?;
+            let reading_avoided: LeftOut = plan
+                .reads
+                .iter()
+                .map(|&(kind, reads)| (kind, reads.intersection(avoided)))
+                .filter(|(_, avoided_read)| !avoided_read.is_empty())
+                .collect();
+            if reading_avoided.is_empty() {
+                return Ok((Some(plan), left_out));
+            }
+            kinds.retain(|kind| !reading_avoided.iter().any(|(left, _)| left == kind));
+            left_out.extend(reading_avoided);
+        }
+        Ok((None, left_out))
     }
 
     /// Each of `kinds` reading the cheapest of its combinations inside
@@ -341,6 +382,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.formats(), FormatSet::of(&[Warc]));
+    }
+
+    #[test]
+    fn a_kind_reading_an_avoided_format_is_left_out_and_the_rest_planned_again() {
+        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
+
+        let (plan, left_out) =
+            Plan::avoiding(Dataset::CcMain, &kinds, None, FormatSet::of(&[Wet])).unwrap();
+
+        assert_eq!(
+            plan,
+            Some(Plan::new(Dataset::CcMain, &[ArtifactKind::Favicon], None).unwrap())
+        );
+        assert_eq!(plan.unwrap().formats(), FormatSet::of(&[Wat]));
+        assert_eq!(left_out, [(ArtifactKind::Onion, FormatSet::of(&[Wet]))]);
+    }
+
+    #[test]
+    fn no_other_plan_is_looked_for_around_an_avoided_format() {
+        // `favicon` could read WARC instead: it is left out all the same.
+        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
+        let wat = FormatSet::of(&[Wat]);
+
+        assert_eq!(
+            Plan::avoiding(Dataset::CcMain, &kinds, None, wat),
+            Ok((
+                None,
+                vec![(ArtifactKind::Onion, wat), (ArtifactKind::Favicon, wat)]
+            ))
+        );
+    }
+
+    #[test]
+    fn forced_formats_can_plan_around_an_avoided_one() {
+        let warc = FormatSet::of(&[Warc]);
+        let (plan, left_out) = Plan::avoiding(
+            Dataset::CcMain,
+            &[ArtifactKind::Onion],
+            Some(warc),
+            FormatSet::of(&[Wet]),
+        )
+        .unwrap();
+
+        assert_eq!(plan.unwrap().formats(), warc);
+        assert!(left_out.is_empty());
+    }
+
+    #[test]
+    fn nothing_avoided_plans_as_new_does() {
+        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
+        assert_eq!(
+            Plan::avoiding(Dataset::CcMain, &kinds, None, FormatSet::EMPTY),
+            Ok((
+                Some(Plan::new(Dataset::CcMain, &kinds, None).unwrap()),
+                vec![]
+            ))
+        );
     }
 
     #[test]

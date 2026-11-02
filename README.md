@@ -121,13 +121,14 @@ Arguments:
   <INPUT>  Path to a WARC, WAT or WET paths file (supports .gz)
 
 Options:
-  -l, --limit <LIMIT>                Maximum number of Shards to process (default: all)
+  -l, --limit <LIMIT>                Number of paths to process after --offset, the Slice (default: all the rest)
   -o, --offset <OFFSET>              Skip the first N paths in the file (for SLURM array partitioning) [default: 0]
   -j, --jobs <JOBS>                  Number of concurrent download+parse tasks (default: number of CPU cores)
   -d, --delete                       Delete each Shard's Archives once parsed
   -e, --extract <EXTRACT>            Artifact kinds to extract, comma-separated [default: onion,favicon] [possible values: onion, favicon, inline-favicon]
       --formats <FORMATS>            Formats to download for every Shard, comma-separated (default: the cheapest ones serving every kind) [possible values: warc, wat, wet]
   -t, --transport <TRANSPORT>        How downloaded Archives reach the parser [default: disk] [possible values: disk, memory, mmap]
+      --max-memory <GB>              Most RAM this process's in-memory downloads may hold, in GB of 2^30 bytes (default: the available RAM)
       --onion-engine <ONION_ENGINE>  Search used to find .onion addresses [default: memchr] [possible values: memchr, regex]
       --kvrocks <SOCKET|URL>         kvrocks store receiving results and done marks: a Unix socket path, or a redis://host:port URL [default: /tmp/kvrocks.sock]
       --save-images <DIR>            Save each inline favicon image as DIR/<first 2 hex digits of its SHA-256>/<SHA-256>
