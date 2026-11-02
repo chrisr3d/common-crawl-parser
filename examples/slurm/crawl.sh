@@ -14,7 +14,7 @@
 # Two levels of parallelism:
 #   - Level 1: SLURM array tasks, one node each, PATHS_PER_TASK paths each
 #   - Level 2: within each array task, PROCESSES_PER_NODE independent
-#     cc-extract processes, each with its own non-overlapping slice of the
+#     cc-extract processes, each with its own non-overlapping Slice of the
 #     paths file (--offset / --limit)
 #
 # With the values below, 10 array tasks cover 100,000 paths, about one CC-MAIN
@@ -33,13 +33,15 @@
 # Re-run one task: sbatch --array=3 examples/slurm/crawl.sh
 #
 # This script exits with 0 even when some of its processes left Shards to
-# retry or stopped early (see the end). Re-run those tasks (once the cause of
-# an early stop is fixed).
+# retry, gave Archives up or stopped early (see the end). Re-run the tasks
+# with Shards to retry, or stopped early (once the cause is fixed).
 #
-# A re-run resumes: each process reads the done (Shard, kind) pairs from the
-# store and skips them. Done Shards don't count toward --limit, though, so a
-# process whose slice is partly done goes on into the next process's slice.
-# The store's writes only add, so the overlap costs time, not correctness.
+# A re-run resumes: each process covers the same Slice, reads the done
+# (Shard, kind) pairs from the store and skips them, so it retries only the
+# pairs its Slice left undone. An Archive failing the same way on 3 runs (a
+# 404, bytes that don't decode) is given up, and its process then exits with
+# 4 rather than 3: re-running that process changes nothing until the Archive's
+# record is deleted from the store (see FEATURES.md, section 9).
 #SBATCH --job-name=cc-extract
 #SBATCH --account=<account>
 #SBATCH --partition=<partition>
@@ -95,9 +97,12 @@ if [ "${JOBS_PER_PROCESS}" -lt 1 ]; then
 fi
 
 # With --transport memory, each job holds its Shard's Archives in RAM
-# (~240 MB for WAT + WET, ~1 GB for WARC). Every process caps its jobs by
-# the node's free RAM, not by its share of it, so check that
-# PROCESSES_PER_NODE x JOBS_PER_PROCESS Shards fit in the node's memory.
+# (~240 MB for WAT + WET, ~1 GB for WARC). Every process sees all of the
+# node's available RAM, so each one is given its share with --max-memory:
+# the node's RAM (MemTotal, in kB) divided by PROCESSES_PER_NODE, in GB of
+# 2^30 bytes. awk computes it with a fraction, which bash's arithmetic can't.
+MAX_MEMORY_PER_PROCESS=$(awk -v processes="${PROCESSES_PER_NODE}" \
+    '/^MemTotal:/ { printf "%.2f", $2 / 1048576 / processes }' /proc/meminfo)
 
 # Base offset for this array task
 TASK_OFFSET=$((SLURM_ARRAY_TASK_ID * PATHS_PER_TASK))
@@ -105,7 +110,7 @@ TASK_OFFSET=$((SLURM_ARRAY_TASK_ID * PATHS_PER_TASK))
 echo "=== Array task ${SLURM_ARRAY_TASK_ID} ==="
 echo "Node: $(hostname), CPUs: ${CPUS}"
 echo "Task offset: ${TASK_OFFSET}, paths per task: ${PATHS_PER_TASK}"
-echo "Processes: ${PROCESSES_PER_NODE}, paths per process: ${PATHS_PER_PROCESS}, jobs per process: ${JOBS_PER_PROCESS}"
+echo "Processes: ${PROCESSES_PER_NODE}, paths per process: ${PATHS_PER_PROCESS}, jobs per process: ${JOBS_PER_PROCESS}, memory per process: ${MAX_MEMORY_PER_PROCESS} GB"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -130,6 +135,7 @@ for i in $(seq 0 $((PROCESSES_PER_NODE - 1))); do
         --limit "${PATHS_PER_PROCESS}" \
         --jobs "${JOBS_PER_PROCESS}" \
         --transport memory \
+        --max-memory "${MAX_MEMORY_PER_PROCESS}" \
         --kvrocks "${KVROCKS}" &
 
     PIDS+=($!)
@@ -143,15 +149,19 @@ echo ""
 # Wait for every process and collect exit codes
 # ---------------------------------------------------------------------------
 # A process exits with:
-#   0     every Shard of its slice done for every kind in EXTRACT
+#   0     every Shard of its Slice done for every kind in EXTRACT
 #   3     it ran to the end, but some Shards failed (download, parse or
 #         store write): they are not marked done in the store, and running
 #         the same command again retries them
+#   4     it ran to the end with nothing to retry, but some pairs given up:
+#         an Archive they read failed the same way on 3 runs (its log's
+#         summary lists them); running it again changes nothing
 #   other it stopped early, such as on an unreachable store or an
 #         --offset past the end of the paths file (1), on invalid arguments
 #         (2), or killed by a signal (128 + its number): fix the cause first
 # ---------------------------------------------------------------------------
 TO_RETRY=0
+GIVEN_UP=0
 STOPPED=0
 for j in "${!PIDS[@]}"; do
     wait "${PIDS[$j]}"
@@ -162,6 +172,10 @@ for j in "${!PIDS[@]}"; do
             echo "  Process ${j} finished with Shards to retry"
             TO_RETRY=$((TO_RETRY + 1))
             ;;
+        4)
+            echo "  Process ${j} finished with given-up Archives (see its summary)"
+            GIVEN_UP=$((GIVEN_UP + 1))
+            ;;
         *)
             echo "  Process ${j} stopped early with exit code ${EXIT_CODE}"
             STOPPED=$((STOPPED + 1))
@@ -170,4 +184,4 @@ for j in "${!PIDS[@]}"; do
 done
 
 echo ""
-echo "=== Array task ${SLURM_ARRAY_TASK_ID} finished: $((PROCESSES_PER_NODE - TO_RETRY - STOPPED))/${PROCESSES_PER_NODE} processes done, ${TO_RETRY} with Shards to retry, ${STOPPED} stopped early ==="
+echo "=== Array task ${SLURM_ARRAY_TASK_ID} finished: $((PROCESSES_PER_NODE - TO_RETRY - GIVEN_UP - STOPPED))/${PROCESSES_PER_NODE} processes done, ${TO_RETRY} with Shards to retry, ${GIVEN_UP} with given-up Archives, ${STOPPED} stopped early ==="
