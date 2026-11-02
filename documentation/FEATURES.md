@@ -211,6 +211,15 @@ removes it once it is closed, after a kill too (only a crash of the node leaves
 one); Lustre and GPFS keep such files on their servers. Windows can't remove an open file: there the copy keeps its
 name until the parse ends, and a killed process leaves it behind.
 
+The data may end only between two records. The gzip stream can end cleanly
+with the last record unfinished: data ending inside a record, in its headers or
+before the end of its body (read or passed over, whatever the record's type),
+fails the Archive on every Transport, with the same message, `the Archive ends
+inside a record`. Otherwise the rest of the Archive would be dropped without a
+word and its pair marked done. A record missing its `Content-Length` is still
+read as one with an empty body, and a body running into the next record is not
+detected.
+
 ## 5. Onion extraction
 
 Code: `src/onion_search.rs`, `OnionExtractor` in `src/extractor.rs`.
@@ -561,9 +570,10 @@ against the Archive, at most once per run.
 
 - Counted: a download answered with an HTTP 4xx status other than 408 and 429
   (a 404 on a derived WAT or WET path), and a parse error from the Archive's
-  bytes (not gzip, cut short, a malformed record), on any Transport. An
-  Archive corrupt in `download/` counts too: it is parsed again, not
-  downloaded again.
+  bytes (not gzip, a gzip member damaged or cut short, data ending inside a
+  record), on any Transport. An Archive corrupt in `download/` counts too: it
+  is parsed again, not downloaded again. Its message ends with where in the
+  compressed Archive it broke, `(at byte X of Y)` (see Known limitations).
 - Not counted: timeouts (the 60 s without data included), connection errors,
   5xx, 408 and 429, a body cut short of its `Content-Length` (a download
   error), local I/O errors (a file in `download/` that can't be opened, a disk
@@ -733,6 +743,14 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
 - **One bad record drops the Archive.** A read or decompression error aborts
   the Archive, dropping everything found in it; the kinds reading it are left
   undone, and after 3 runs failing on it the Archive is given up (section 9).
+  The error gives its position in the Archive, `(at byte X of Y)`: X
+  compressed bytes read when it came, Y the compressed size. X runs past the
+  fault by up to the rest of its gzip member (whose checksum is checked at
+  its end) and 32 KiB (the decoder reads ahead); a record cut at the end of
+  the data gives X = Y. The log line, `failures:<archive>` and the summary's
+  given-up list show it, so a run tells whether damaged Archives break at
+  their start or further in, where reading on from the next gzip member
+  would keep the records on either side of the fault.
 - **A download is cut only when no data comes at all.** A server sending a
   few bytes now and then, each within 60 s, keeps a download going however
   slow it is: there is no minimum speed.

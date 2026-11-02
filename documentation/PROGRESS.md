@@ -1545,3 +1545,77 @@ the rest, all zero, from `#[derive(Default)]`.
 The test server's `serve_once(respond: impl FnOnce(TcpStream) + Send + 'static)` takes a
 closure rather than a `fn` pointer, so `answer("404 Not Found")` can return one holding its
 status line; `Send + 'static` because it moves to another thread, which may outlive the call.
+
+---
+
+## Step 30: A Record Cut Short Fails, and Every Corrupt Error Says Where
+
+### What we built
+
+The gzip stream of an Archive can end cleanly with its last record unfinished. The record
+parsers read most such cuts as the end of the records: `WarcRecordIter` on data ending in a
+record's headers or in a body it passed over, `WarcSliceIter` (mmap) on any of them. The pair
+was then marked done with the rest of the Archive missing, and no failure counted. Only a body
+being read and cut short failed, and only on `disk` and `memory`. Now data ending inside a
+record, headers or body, read or passed over, whatever its type, fails on every Transport with
+one message, `the Archive ends inside a record`, as `ParseError::Corrupt`: counted, given up
+after 3 runs. Data ending between two records is still the end; a record missing its
+`Content-Length` still reads as one with an empty body.
+
+Every `Corrupt` error now ends with where it broke, `(at byte X of Y)`: X compressed bytes
+read when it came, Y the compressed Archive's size. The failure records already keep each
+counted message per Archive, so a large run tells, with no other code, how often Archives are
+damaged and whether they break at their start or further in, where reading on from the next
+gzip member would keep the records on either side of the fault. `Local` errors carry no
+position.
+
+- **The parsers** (`src/warc_parser.rs`): `cut_record()` builds the one error (kind
+  `UnexpectedEof`). `WarcRecordIter` returns it on EOF in the headers or a header line without
+  its `\n` (a blank line cut after its `\r` included), and reads bodies, kept or skipped,
+  through `read_full`, which returns it on EOF before the end. `WarcSliceIter`'s
+  items became `io::Result<WarcSlice>`: no `\r\n\r\n` after a `WARC/`, or a body past the end
+  of the data, is `Some(Err(..))`, then `None`.
+- **The position** (`src/lib.rs`): `ParseError::Corrupt { error, at, size }`, its `Display`
+  appending the position. A `Position` holds the compressed bytes read (a `Cell<u64>`, added to
+  by the `Counted` reader under the gzip decoder) and the size (the file's length, or the
+  buffer's in memory); `parse_stream` and `parse_mmap` turn each error into a `ParseError`
+  with `Position::error`. X runs past the fault: the decoder reads 32 KiB at a time and checks
+  a member's checksum at its end, so by up to the rest of the member and one read. A record
+  cut at the end is found once all bytes were read, so X = Y.
+- **Tests**: `tests/parse_failures.rs` (a last gzip member holding a record cut in its headers,
+  in its blank line, in a skipped `request` body, in a read `response` body: `Corrupt`, `the
+  Archive ends inside a record (at byte Y of Y)` on all three Transports; a member in the
+  middle of a 200 KB Archive of incompressible pages with 16 bytes flipped: the same message on
+  all three, X past the damage and at most 32 KiB past the member's end;
+  the earlier corrupt cases give the size, the local ones no position), `tests/download.rs`
+  (an in-memory download whose server announces 1,000 bytes, sends 500 and closes fails, and
+  doesn't count: hyper already checks the body against `Content-Length`).
+
+### Rust concepts introduced
+
+**End of data: the normal end or an error**
+`Read::read` returning `Ok(0)` only says the data ended. Whether it may end there is the
+caller's to say: between records it is the end (`None`), inside one an error. `read_exact`
+says so with its own `UnexpectedEof`, but the gzip decoder returns the same kind for a member
+cut short, so its error can't be relabelled by kind; `read_full` loops on `read` itself and
+builds its error only where `read` returned `Ok(0)`, passing every other error up as it is.
+
+**An iterator whose items are `Result`s**
+`Iterator<Item = io::Result<T>>` gives three answers where `Option<T>` gives two: an item, an
+error, or the end. An iterator that fails should then return `None`, so a caller that ignores
+the error doesn't spin on it: `WarcSliceIter` moves its position to the end before returning
+the error.
+
+**`Cell`: one count, two holders**
+The gzip decoder owns the reader it reads, until parsing ends, but the count is read while it
+still does. A `&mut u64` inside the reader would lock the count away for as long as the reader
+lives. `Cell<u64>` changes through a shared reference (`set`, `get`): the reader holds one
+`&Position`, the caller another. `Cell` hands out copies, never references into its value, so no
+reference can see the value change under it; it isn't `Sync`, so both holders stay on one
+thread. The `Cell` is declared before the readers borrowing it: locals drop in reverse order,
+so it outlives them.
+
+**Comparing lengths instead of adding offsets**
+`content_length > data.len() - body_start` asks the same as `body_start + content_length >
+data.len()`, but can't overflow: `body_start` is never past the end, while a malformed
+`Content-Length` can be near `usize::MAX`.

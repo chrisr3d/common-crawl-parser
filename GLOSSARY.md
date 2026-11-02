@@ -28,6 +28,10 @@ _Avoid_: archive type, input type, file type
 One downloadable Common Crawl file: one Shard in one Format.
 _Avoid_: WARC (when any Format is meant), segment
 
+**Record**:
+One entry of an Archive, with its own headers and body. One Page spans several Records of a WARC (its request, response and metadata); each Format reads one type of Record and passes over the rest.
+_Avoid_: entry, item; record for a Page
+
 ### Extraction
 
 **Artifact kind**:
