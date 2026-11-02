@@ -17,7 +17,7 @@ Common Crawl's own grouping of files inside a Crawl (100 per Crawl, 1,000 files 
 _Avoid_: using it for a single file
 
 **Shard**:
-One file-level slice of a Dataset, identified like `CC-MAIN-20260807101845-20260807131845-00000` or `CC-NEWS-20251001064107-04363`, published as one Archive per Format the Dataset offers.
+One file-level part of a Dataset, identified like `CC-MAIN-20260807101845-20260807131845-00000` or `CC-NEWS-20251001064107-04363`, published as one Archive per Format the Dataset offers.
 _Avoid_: segment, WARC file, archive
 
 **Format**:
@@ -53,3 +53,13 @@ _Avoid_: mapping, minimum format
 **Plan**:
 The Formats read for one Shard: the cheapest combination, among those its Dataset offers, that meets the Format requirement of every requested Artifact kind.
 _Avoid_: strategy
+
+### Running
+
+**Slice**:
+A contiguous range of a paths file's lines, given to one run; running the same command again covers the same lines.
+_Avoid_: range, chunk, partition (and slice for a Shard)
+
+**Given-up Archive**:
+An Archive that failed to download or parse, for a reason that repeats (such as a 404 or bytes corrupt at the source), on enough runs that no Plan reading it is scheduled again.
+_Avoid_: hopeless Shard, dead Archive, failed Archive

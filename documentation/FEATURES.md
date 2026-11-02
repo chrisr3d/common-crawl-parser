@@ -24,7 +24,7 @@ and writes what it finds to a kvrocks store (see section 9):
 are extracted in the same pass over each Archive.
 
 ```text
-paths file ──▶ schedule Shards (offset, skip the kinds done, limit)
+paths file ──▶ schedule the Slice's Shards (offset, limit; skip the kinds done or given up)
            ──▶ plan each Shard's Formats (cheapest serving every kind)
            ──▶ download its Archives (to disk or to memory) ┐ up to --jobs Shards
            ──▶ parse them on the blocking thread pool       ┘ in flight at once
@@ -55,12 +55,18 @@ The Dataset is read from the path's prefix: `crawl-data/CC-MAIN-<crawl>/` or
 
 Shards are selected in this order:
 
-1. `--offset N` drops the first N paths.
-2. A Shard whose every requested kind is already marked done for it in the
-   store is skipped. Otherwise it is scheduled for the missing kinds
-   only.
-3. `--limit N` stops once N Shards are scheduled. Skipped Shards don't count
-   toward the limit.
+1. The Slice: `--offset N` drops the first N paths, and `--limit M` keeps the
+   M paths after them (default: all the rest). Blank lines don't count. No
+   path after the Slice is read.
+2. Every path of the Slice is considered. A Shard whose every requested kind
+   is already marked done for it in the store is skipped. Otherwise it is
+   scheduled for the missing kinds only, less those given up (section 9).
+   A line that can't be used is reported and skipped, still counting toward
+   `--limit`.
+
+Running the same command again covers the same Slice: after exit 3, it
+retries the Slice's undone pairs, and once they are all done it schedules
+nothing. To go on to the next paths, move `--offset`.
 
 ## 2. Artifact kinds, Format requirements and Plans
 
@@ -105,6 +111,13 @@ are not joined record by record. A (Shard, kind) pair is done only when every
 Archive that kind reads has been downloaded and parsed; a failed
 WET Archive leaves `onion` undone but still lets `favicon` finish from WAT.
 
+A kind whose Plan reads a given-up Archive (section 9) is left out of the
+Shard's Plan, and the kinds left are planned again as if only they were
+requested: with the WET given up, `favicon` is planned alone (WAT), `onion`
+is given up. No other Plan is looked for around the Archive, even when one
+exists (`onion` could read WARC); `--formats` can force one, such as
+`--formats warc`.
+
 ## 3. Download
 
 Each Archive is fetched over HTTPS with `reqwest` (rustls, no OpenSSL). One HTTP
@@ -143,7 +156,8 @@ any other, with
 `Download error: no data received for 60 s`: on `disk` and `mmap` its `.part`
 file is removed, so nothing appears at the Archive's name; the kinds reading
 that Archive are left undone, the run carries on with the other Shards and
-exits with 3, and the next run downloads the Archive again. The wait starts
+exits with 3, and the next run downloads the Archive again, a timeout never
+counting toward giving it up (section 9). The wait starts
 over with each chunk, so a slow download that keeps receiving data is never
 cut, however long it takes in all. A connection whose peer is gone is already
 failed by TCP keepalive (on in `reqwest`: a probe after 15 s idle, then every
@@ -447,13 +461,21 @@ the 60 s a download may go without data.
 The number of jobs (default: one per logical CPU core) is capped in two steps:
 
 1. At most 2x the number of logical CPU cores.
-2. With `--transport memory` only, at most `available RAM / largest Plan`,
-   where the largest Plan is the biggest estimated size among the scheduled
-   Shards' Plans (~240 MB for WAT + WET, ~1 GB for WARC). RAM is read from
-   `sysctl` on macOS or `/proc/meminfo` on Linux; on other platforms this cap is
-   skipped.
+2. With `--transport memory` only, at most `memory / largest Plan`, where the
+   largest Plan is the biggest estimated size among the scheduled Shards'
+   Plans (~240 MB for WAT + WET, ~1 GB for WARC), and the memory the smaller
+   of the available RAM and `--max-memory` (in GB of 2^30 bytes, fractions
+   allowed). RAM is read from `sysctl` on macOS or `/proc/meminfo` on Linux
+   (`MemAvailable`); on other platforms `--max-memory` alone caps, and
+   without it this cap is skipped. Never fewer than one job.
 
-Each cap prints a warning when it lowers the requested value.
+Each cap prints a warning when it lowers the requested value, the memory one
+saying whether the available RAM or `--max-memory` lowered it. Every process
+reads the available RAM of the whole machine: several processes sharing one
+each see all of it, so each needs `--max-memory` set to its share (the
+machine's RAM divided by the number of processes). Without `--transport
+memory`, `--max-memory` is accepted, and a start-up line says it has no
+effect.
 
 ## 9. The results store
 
@@ -486,6 +508,8 @@ that can't be reached stops the run with exit status 1, naming it.
 | `image:<sha256>` | hash | `media_type` (declared by the first Page written), `mmh3` (signed decimal), `sha1`, `md5` (lowercase hex) |
 | `mmh3:<value>`, `sha1:<hex>`, `md5:<hex>` | set | SHA-256s of the inline favicons with that hash |
 | `processed` | set | `<shard> <kind>`, one per done pair |
+| `failures` | set | `<archive> <run>`, one per failure counted on an Archive |
+| `failures:<archive>` | hash | `<run>`: the error message of each run that counted a failure on the Archive |
 
 `<artifact>` is the onion address, the favicon URL, or the inline favicon's
 SHA-256. A Page's `<id>` is the first 16 bytes of the SHA-256 of
@@ -497,10 +521,16 @@ link the kinds seen on one Page: from an onion to the inline favicons of the
 Pages naming it, then to their `mmh3`, and through `mmh3:<value>` to every
 other image sharing it. No image bytes are written to the store (section 7).
 
+In the failure records, `<archive>` is an Archive's file name
+(`CC-MAIN-…-00001.warc.wet.gz`) and `<run>` a run's start time since the Unix
+epoch, to the nanosecond, and process id: `1735689600.000000500-4242`. Two runs
+never share one on a machine, and as good as never across machines whose
+stores are combined.
+
 **Only adding.** Every write is a `SADD` or an `HSETNX` (set a hash field only
 if absent): nothing written is ever removed or changed, so the first `date` or
 `media_type` written is the one kept, and writing the same Shard again changes
-nothing.
+nothing. Two stores combine by union, failure records included.
 
 **Writing one Shard.** For each kind whose Archives all parsed, the Shard's
 Sightings are written in pipelined batches (many commands sent before the
@@ -523,7 +553,52 @@ kinds and Shards, and exits with 3.
 a member without a kind this version knows is ignored, its pairs done again. A
 later run with more kinds extracts only the new ones for the Shards already
 done. A Shard whose download or parse failed is not marked for the kinds
-reading the failed Archive, and is retried on the next run.
+reading the Archive that failed, and is retried on the next run, unless the
+Archive is given up.
+
+**Given-up Archives.** Some failures come back on every run: they are counted
+against the Archive, at most once per run.
+
+- Counted: a download answered with an HTTP 4xx status other than 408 and 429
+  (a 404 on a derived WAT or WET path), and a parse error from the Archive's
+  bytes (not gzip, cut short, a malformed record), on any Transport. An
+  Archive corrupt in `download/` counts too: it is parsed again, not
+  downloaded again.
+- Not counted: timeouts (the 60 s without data included), connection errors,
+  5xx, 408 and 429, a body cut short of its `Content-Length` (a download
+  error), local I/O errors (a file in `download/` that can't be opened, a disk
+  full writing a download or the mmap copy), store writes and image saves.
+
+Each counted failure is one record, written to both keys above with writes
+that only add: the run's message in `failures:<archive>` under `<run>`, then
+`<archive> <run>` in `failures`. A failure counts only when both keys hold
+it, so a record half-written by a killed run counts nothing. At start-up the
+records are read in two round trips: `failures`, then the hashes of the
+Archives it lists, sent together.
+
+After 3 runs counted a failure on it (fixed, with no option), the Archive is
+given up, and so is every pair whose Plan reads it: such a pair is not
+scheduled, and the given-up Archive is not downloaded (section 2). A pair done
+later all the same, through `--formats` planning around the Archive, is
+marked done as usual: done wins over any record. The run that gives an
+Archive up says so at that Shard; at start-up, a line gives the number of
+given-up Archives in the Slice (those leaving out a requested kind not yet
+done), and the summary lists each with the kinds it leaves undone and its last
+error.
+
+To retry, delete the records: the Archive is scheduled again, its count
+started over. An Archive corrupt in `download/` is parsed again as it is: remove
+the file there too, so it is downloaded again.
+
+```sh
+redis-cli -s /tmp/kvrocks.sock DEL failures:<archive file name>   # one Archive
+redis-cli -s /tmp/kvrocks.sock DEL failures                       # every Archive
+```
+
+Deleting `failures:<archive>` leaves the Archive's members in `failures`
+with no message to match, and deleting `failures` leaves each Archive's
+hash with no member listing it: either way nothing counts, and a later
+failure counts from one. The hashes left behind are ignored.
 
 A done mark doesn't say which matching rules extracted the pair, so a change to
 the rules (such as onions found in any case and v3 checksums verified, or
@@ -532,40 +607,50 @@ on: the pairs already done keep what the older rules found, and nothing redoes
 them. Results under one set of rules take a fresh store, or a namespace of
 their own.
 
-The summary at the end reports processed, skipped and failed Shards (a Shard
-left with any kind undone, by a failed download, parse, store write or image
-save), the Artifacts new to the store per kind (those `SADD` added to
-`artifacts:<kind>`), the total per kind (that set's size), and average download
-and parse time per Shard. Each Shard's log also gives the time its writes took,
-and with `--save-images` how many new images it saved. The exit status tells
-whether any Shard failed (see section 11).
+The summary at the end reports processed, skipped, failed and given-up Shards,
+each Shard of the Slice in one of them: skipped (every requested kind done
+before the run), failed (a kind left undone that a later run may do, by a
+failed download, parse, store write or image save), given up (only given-up
+kinds left undone), processed (the others). Then the Artifacts new to the store
+per kind (those `SADD` added to `artifacts:<kind>`), the total per kind (that
+set's size), average download and parse time per processed Shard, and the
+given-up Archives. Each Shard's log also gives the time its writes took, and
+with `--save-images` how many new images it saved. The exit status tells
+whether any Shard failed, or only given-up pairs are left (see section 11).
 
 ## 10. HPC batch mode
 
 For runs over a whole Crawl (about 100,000 Shards) on a cluster,
-`--offset` and `--limit` give each process its own slice of the paths file.
+`--offset` and `--limit` give each process its own Slice of the paths file.
+Running a process's command again covers its Slice only: after exit 3 it
+retries the undone pairs left there, and an Archive failing the same way on
+every run is given up after 3, so a script re-running on exit 3 comes to an
+end (exit 0, or 4 with given-up pairs left). With `--transport memory`, each
+process caps its jobs at its own share of the machine's RAM with
+`--max-memory`.
 
 Runs across several nodes are not supported with the store yet: every process
 must reach the same store, and nothing decides yet whether the nodes write to
 one store over the network or each to its own, copied together afterwards.
 `examples/slurm/crawl.sh` (an array of 10 tasks, each one a whole node, each
-running 20 processes over 500 paths with `--transport memory`) is kept as a
-starting point, marked as not working with the store. Several processes on one
-machine can share one store: each writes its own Shards, and the writes only
-add.
+running 20 processes over 500 paths with `--transport memory`, each given the
+node's RAM divided by 20 with `--max-memory`) is kept as a starting point,
+marked as not working with the store. Several processes on one machine can
+share one store: each writes its own Shards, and the writes only add.
 
 ## 11. CLI reference
 
 | Flag | Default | Effect |
 |---|---|---|
 | `<INPUT>` | | Paths file (WARC, WAT or WET), plain or `.gz`. Required. |
-| `-l`, `--limit N` | all | Process at most N Shards this run, not counting Shards already done for every requested kind |
+| `-l`, `--limit N` | all | Cover the N paths after the offset, the Slice: Shards done skipped, none after it read |
 | `-o`, `--offset N` | 0 | Skip the first N paths |
 | `-j`, `--jobs N` | CPU cores | Shards in flight at once (capped, see section 8) |
 | `-d`, `--delete` | off | Delete each Shard's Archives from `download/` once parsed (not with `-t memory`) |
 | `-e`, `--extract K,...` | `onion,favicon` | Artifact kinds: `onion`, `favicon`, `inline-favicon` |
 | `--formats F,...` | the Plan | Force the Formats downloaded: `warc`, `wat`, `wet` |
 | `-t`, `--transport T` | `disk` | `disk`, `memory` or `mmap` |
+| `--max-memory GB` | available RAM | With `-t memory`, the most RAM the process's downloads may hold, in GB of 2^30 bytes (section 8) |
 | `--onion-engine E` | `memchr` | `memchr` or `regex` |
 | `--kvrocks SOCKET\|URL` | `/tmp/kvrocks.sock` | The store: a Unix socket path, or `redis://host:port` |
 | `--save-images DIR` | off | Write each inline favicon image to `DIR/<first two hex digits of its SHA-256>/<SHA-256>` (section 7) |
@@ -578,13 +663,15 @@ command again:
 
 | Code | Meaning | Run again? |
 |---|---|---|
-| 0 | Every Shard taken on done for every requested kind | No need |
+| 0 | Every Shard of the Slice done for every requested kind | No need |
 | 1 | Stopped early, such as on a missing or unreadable paths file, an unreachable store, an `--offset` past the end, or a Plan no Shard can meet | Once the cause is fixed |
 | 2 | Invalid option or value (`clap`'s code for usage errors) | Once the command is fixed |
-| 3 | Ran to the end with some Shards left with kinds undone: a failed download, parse, store write or image save | Yes, the same command |
+| 3 | Ran to the end with some Shards left with kinds a run may still do: a failed download, parse, store write or image save | Yes, the same command |
+| 4 | Ran to the end with nothing left to retry, but some pairs of the Slice given up, by this run or an earlier one: an Archive they read failed the same way on 3 runs | Only once the given-up Archives' records are deleted, or with `--formats` planning around them (section 9) |
 
 Early stops come before anything is downloaded or written. Shards that fail
-don't stop the run: the others go on, and the run exits with 3 at the end.
+don't stop the run: the others go on, and the run exits with 3 at the end. 3
+wins over 4: a run with both retryable and given-up pairs left exits with 3.
 Paths file lines the run can't use (not a Common Crawl path, or one whose other
 Formats' paths can't be derived) are reported and skipped: they are no Shard
 to retry, and leave the exit status at 0.
@@ -626,13 +713,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   Unix socket it is on that machine. Over TCP the traffic, password included,
   is not encrypted: keep the store on the same machine or a trusted network.
   Runs across several nodes are not supported yet (section 10).
-- **`--limit` counts Shards to do, not paths.** Re-running a slice with the same
-  `--offset` and `--limit` after some of its Shards are done goes on past the
-  slice's end, into the next process's paths. The store's writes only add, so
-  this costs time, not correctness.
-- **The RAM guard sees the whole machine.** Each process divides the free RAM by
-  its largest Plan on its own, so several processes on one node can together
-  schedule more in-memory Shards than fit.
 - **Onion Sightings keep no context.** The store records which page mentioned
   the address, not where on the page or in what role (link, header, plain
   text).
@@ -652,7 +732,7 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
     Windows-1252 characters as HTML maps them.
 - **One bad record drops the Archive.** A read or decompression error aborts
   the Archive, dropping everything found in it; the kinds reading it are left
-  undone and retried on the next run.
+  undone, and after 3 runs failing on it the Archive is given up (section 9).
 - **A download is cut only when no data comes at all.** A server sending a
   few bytes now and then, each within 60 s, keeps a download going however
   slow it is: there is no minimum speed.

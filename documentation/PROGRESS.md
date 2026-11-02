@@ -1454,3 +1454,94 @@ instead of trying to write where it can't.
 **Struct update syntax in tests**
 `InlineFavicon { sha1: .., md5: .., ..png(..) }` builds a second image from the first, giving
 only the fields that differ; the rest are moved from the value after `..`.
+
+---
+
+## Step 29: Slices, Given-Up Archives, and a Process's Share of RAM
+
+### What we built
+
+Several processes splitting one paths file, each with its own `--offset` / `--limit` and one
+shared store, had three problems on a re-run. `--limit` counted Shards to do, so a re-run of a
+partly done Slice went on into the next process's paths. An Archive failing the same way on
+every run (a 404 on a derived WAT or WET path, bytes corrupt at the source or in `download/`)
+left every run exiting with 3, and a script re-running on 3 never stopped. And each process
+capped its in-memory jobs by all of the machine's free RAM.
+
+- **Slices**: `--limit N` now covers the N non-blank paths after `--offset`, every one
+  considered (done Shards skipped, unusable lines reported), none after it read. Running the
+  same command again retries only the Slice's undone pairs; to advance, move `--offset`.
+- **Counted failures** (`src/lib.rs`): `download_failure_repeats` says whether a download error
+  is an HTTP 4xx other than 408 and 429; `parse_archive` fails with a `ParseError`, `Corrupt`
+  (the Archive's bytes: not gzip, cut short, a malformed record) or `Local` (a file that can't
+  be opened or read, the mmap copy that can't be written), on every Transport. Timeouts,
+  connection errors, 5xx, 408, 429, local I/O, store writes and image saves don't count.
+- **Failure records** (`src/store.rs`): one per Archive and run, written with the existing
+  add-only writes: the message in the hash `failures:<archive>` under the run's `RunId`
+  (`<seconds>.<nanoseconds>-<pid>` of its start), then `<archive> <run>` in the set `failures`.
+  A failure counts only when both keys hold it, so deleting either (`DEL failures:<archive>`
+  for one Archive, `DEL failures` for all) starts the count over, and a record half-written by
+  a kill counts nothing. `load_failures` reads them in two round trips, the hashes pipelined
+  (`Store::fields_of_each`).
+- **Given up after 3 runs** (`GIVE_UP_AFTER`): a pair whose Plan reads a given-up Archive is not
+  scheduled. `Plan::avoiding` leaves out the kinds reading an avoided Format and plans the rest
+  again as if only they were requested, so with the WET given up `favicon` still reads WAT; no
+  other Plan is looked for, but `--formats warc` plans around it. Done wins over any record.
+- **Exit 4** (`EXIT_GIVEN_UP`): the run went to the end, nothing retryable is left, and some
+  pair of the Slice is given up. 3 wins over 4. A start-up line counts the Slice's given-up
+  Archives; the summary counts given-up Shards beside processed, skipped and failed, and lists
+  each given-up Archive with the kinds it leaves undone and its last error.
+- **`--max-memory <GB>`**: with `-t memory`, jobs are capped by the smaller of the available RAM
+  and this share (`memory_jobs`, a pure function); the warning says which one lowered them.
+  Without `-t memory`, a start-up note says it has no effect. `crawl.sh` passes the node's
+  RAM divided by its processes, and counts exit 4 apart from "to retry".
+- **Tests**: `tests/store.rs` (3 runs give up, 2 don't, one run counts once, the latest run's
+  error kept, deleting either key starts over), `tests/download.rs` (404 counts; 408, 429, 503
+  and a stalled download don't, on disk and in memory), `tests/parse_failures.rs` (corrupt bytes
+  repeat on every Transport; a missing file, a directory, an mmap copy in the way don't), unit
+  tests of `Plan::avoiding` and `memory_jobs`, and `tests/crawl_cli.rs` end to end: the same
+  `-o 0 -l 2` command run 4 times never touches paths 3 and 4 and exits 3, 3, 4, 4; `DEL` of
+  the record schedules the Archive again; a given-up WET leaves `onion` until `--formats warc`.
+
+### Rust concepts introduced
+
+**Marking errors where they start**
+An `io::Error` can carry any error inside it: `io::Error::new(kind, payload)`. `LocalFile<T>`,
+a one-field wrapper (*newtype*) implementing `Read` and `Write`, wraps each error its file
+returns in a `LocalFileError` as it leaves. The gzip decoder and the record parser above it
+pass errors up as they are, so at the top `err.get_ref()` (the payload, if any) and
+`is::<LocalFileError>()` tell a disk failing to read from bytes failing to decode, where the
+error's kind alone could not.
+
+**Deriving `Ord` on a struct**
+`#[derive(PartialOrd, Ord)]` compares fields in declaration order, like a tuple: `RunId`
+compares start times first (a `Duration`, itself `Ord`), process ids only for runs started at
+the same instant. The latest run is then `max_by_key(|&(run, _)| run)`, `None` for an empty
+list. `{:09}` writes its nanoseconds padded, so `.000000500` doesn't read as half a second.
+
+**`unzip`**
+`listed.into_iter().unzip()` splits an iterator of pairs into two collections in the same
+order: the Archives, to build the keys sent in one pipeline, and the runs listed for each, to
+`zip` back with the replies.
+
+**A function as a `clap` value parser**
+`#[arg(value_parser = parse_gigabytes)]` reads the value with any `fn(&str) -> Result<T, E>`:
+here one refusing `0`, negatives, `inf` and `NaN` (`f64::parse` accepts the last two;
+`is_finite` turns them away), so a bad value is a usage error (exit 2) before anything runs.
+
+**Numeric conversions that can't wrap**
+`as` from `f64` to `u64` rounds toward zero and saturates at the bounds; `usize::try_from(u64)`
+fails instead of truncating on a 32-bit system, and `unwrap_or(usize::MAX)` says what that
+means here: so many jobs fit that the count requested does.
+
+**`take(usize::MAX)` for "no limit"**
+An `Option<usize>` limit becomes one iterator chain: `.skip(offset).take(limit.unwrap_or(usize::MAX))`.
+
+**Struct update with `Default`**
+`Tally { new_artifacts: .., ..Tally::default() }` gives the one field that differs and takes
+the rest, all zero, from `#[derive(Default)]`.
+
+**Closures that own what they answer with**
+The test server's `serve_once(respond: impl FnOnce(TcpStream) + Send + 'static)` takes a
+closure rather than a `fn` pointer, so `answer("404 Not Found")` can return one holding its
+status line; `Send + 'static` because it moves to another thread, which may outlive the call.

@@ -6,7 +6,7 @@ This project is also a **hands-on Rust tutorial** — each step introduces new l
 
 ## Purpose
 
-Common Crawl publishes petabytes of crawled web pages. Each Shard of a Crawl (one file-level slice of it) comes in up to three Formats: WARC (raw HTTP responses, ~1 GB), WAT (JSON metadata extracted from them, ~170 MB) and WET (their plain text, ~70 MB). This tool downloads, for each Shard, the cheapest Formats that hold what was asked for, parses them, and extracts the requested Artifact kinds:
+Common Crawl publishes petabytes of crawled web pages. Each Shard of a Crawl (one file-level part of it) comes in up to three Formats: WARC (raw HTTP responses, ~1 GB), WAT (JSON metadata extracted from them, ~170 MB) and WET (their plain text, ~70 MB). This tool downloads, for each Shard, the cheapest Formats that hold what was asked for, parses them, and extracts the requested Artifact kinds:
 
 | Artifact kind | What | Formats it can read |
 |---------------|------|---------------------|
@@ -30,10 +30,10 @@ The project was built incrementally and now features the following:
 8. **Ripgrep-style parsing** — Transport (`-t`) and onion search engine (`--onion-engine`) selectable at runtime
 9. **Sighting metadata** — Record the page URL, crawl date and Shard of each Artifact found
 10. **In-memory parsing** — Parse from memory with `--transport memory` to skip disk I/O entirely
-11. **Resource guards** — Layered concurrency caps (CPU cores, available RAM) prevent oversubscription and OOM
+11. **Resource guards** — Layered concurrency caps (CPU cores, available RAM, a process's share of it with `--max-memory`) prevent oversubscription and OOM
 12. **Incremental extraction** — Pick Artifact kinds with `-e`; a later run adds kinds without redoing the ones already done
 13. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them): on CC-MAIN, `onion` and `favicon` read WAT + WET (~240 MB) instead of WARC (~1 GB), `favicon` alone WAT only
-14. **HPC batch mode** — Split a Crawl across processes with `--offset` and `--limit`, all writing to one store; runs across several nodes are not supported with the store yet (the SLURM example in [`examples/slurm/`](examples/slurm/) is kept as a starting point)
+14. **HPC batch mode** — Split a Crawl across processes with `--offset` and `--limit`, each covering its own Slice of the paths file, all writing to one store; running the same command again retries only what its Slice left undone, and an Archive failing the same way on 3 runs is given up instead of retried forever. Runs across several nodes are not supported with the store yet (the SLURM example in [`examples/slurm/`](examples/slurm/) is kept as a starting point)
 
 Additional features:
 
@@ -84,7 +84,7 @@ cargo build                                    # compile (debug)
 cargo build --release                          # compile (optimized — ~5.6s per 864MB archive)
 cargo run -- warc.paths                        # download & parse every Shard
 cargo run -- warc.paths.gz                     # same, from gzipped paths file
-cargo run -- warc.paths -l 3                   # process up to 3 Shards
+cargo run -- warc.paths -l 3                   # process the first 3 paths only
 cargo run -- warc.paths -j 2                   # 2 concurrent Shards (default: CPU cores)
 cargo run -- warc.paths -d                     # delete each Shard's Archives after parsing
 cargo run -- warc.paths -e onion               # extract onions only (default: onion,favicon)
@@ -95,12 +95,13 @@ cargo run -- wat.paths.gz                      # any Format's paths file: Shards
 cargo run -- warc.paths --formats warc         # force the Formats downloaded per Shard
 cargo run -- warc.paths -t disk                # parse from the downloaded file (default)
 cargo run -- warc.paths -t memory              # parse from memory (no disk I/O)
+cargo run -- warc.paths -t memory --max-memory 12  # ... holding at most 12 GB of Archives
 cargo run -- warc.paths -t mmap                # decompress + mmap (needs disk space)
 cargo run -- warc.paths --onion-engine regex   # regex::bytes instead of memchr (default)
 cargo run -- warc.paths.gz -l 3 -j 2 -d        # combined (short flags)
 cargo run -- warc.paths.gz -l 3 -j 2 -t memory -e onion  # combined with in-memory parsing
 cargo run -- warc.paths --limit 3 --jobs 2 --delete --transport disk  # combined (long flags)
-cargo run -- warc.paths -o 1000 -l 1000        # one slice of a Crawl
+cargo run -- warc.paths -o 1000 -l 1000        # one Slice of a Crawl: paths 1001 to 2000
 cargo run -- warc.paths --kvrocks run/kvrocks.sock       # the store on another socket
 cargo run -- warc.paths --kvrocks redis://127.0.0.1:6666  # the store over TCP
 CC_EXTRACT_KVROCKS_PASSWORD=secret cargo run -- warc.paths  # a store (namespace) with a password
@@ -185,8 +186,9 @@ decompression.
 The `memory` Transport holds every Archive of a Shard's Plan in RAM (~240 MB for WAT + WET,
 ~1 GB for WARC) × concurrent jobs. Layered resource guards automatically cap concurrency:
 jobs are limited to 2× CPU cores, and with `--transport memory`, further limited by available
-RAM (queried on macOS and Linux) divided by the largest estimated Plan among the scheduled
-Shards, to prevent OOM.
+RAM (queried on macOS and Linux), or `--max-memory` GB if lower, divided by the largest
+estimated Plan among the scheduled Shards, to prevent OOM. Processes sharing a machine each
+see all of its available RAM: `--max-memory` gives each one its share.
 
 ## Results Store
 
@@ -204,6 +206,8 @@ suffix, such as `.warc.gz`). Kinds are named as on the command line:
 | `image:<sha256>` | hash | an inline favicon's `media_type`, Shodan favicon hash (`mmh3`, the number `http.favicon.hash:` takes), `sha1` and `md5` |
 | `mmh3:<value>`, `sha1:<hex>`, `md5:<hex>` | set | SHA-256s of the inline favicons with that hash |
 | `processed` | set | `<shard> <kind>`, one per done (Shard, kind) pair |
+| `failures` | set | `<archive> <run>`, one per failure counted on an Archive (its file name) |
+| `failures:<archive>` | hash | the error message of each run that counted a failure on the Archive |
 
 An `<artifact>` is a `.onion` address, a favicon URL, or the SHA-256 of an inline favicon (the
 store keeps no image bytes: `--save-images <dir>` writes each image to
@@ -227,13 +231,29 @@ A run only extracts the requested kinds not yet done for a Shard, and a pair joi
 `processed` only once all its Sightings are in the store: a run killed in between does
 the pair again, which changes nothing. A store that can't be reached stops the run before
 anything is downloaded. If the store needs a password, it is read from
-`CC_EXTRACT_KVROCKS_PASSWORD`, never from an option. More in
-[`documentation/FEATURES.md`](documentation/FEATURES.md), section 9.
+`CC_EXTRACT_KVROCKS_PASSWORD`, never from an option.
+
+A failure that comes back on every run (a download answered 404, an Archive whose bytes don't
+decode) is counted against its Archive, once per run. After 3 runs the Archive is given up: the
+kinds reading it are not scheduled again, the summary lists it with its last error, and a run
+with nothing else left to retry exits with 4. `--formats` can plan around it (a given-up WET:
+`--formats warc`). To retry it, delete its record (and an Archive corrupt in `download/`, so it
+is downloaded again):
+
+```sh
+redis-cli -s /tmp/kvrocks.sock DEL failures:<archive file name>   # retry one Archive
+redis-cli -s /tmp/kvrocks.sock DEL failures                       # retry every one
+```
+
+More in [`documentation/FEATURES.md`](documentation/FEATURES.md), section 9.
 
 ## Running on a Cluster
 
-Each process takes a slice of the paths file (`--offset`, `--limit`). Several processes on
-one machine can write to the same store: each writes its own Shards, and writes only add.
+Each process takes a Slice of the paths file (`--offset`, `--limit`): running the same command
+again covers the same paths, so a process re-run after exit 3 retries only its own undone
+pairs. Several processes on one machine can write to the same store: each writes its own
+Shards, and writes only add; with `--transport memory`, give each one its share of the RAM
+with `--max-memory`.
 Runs across several nodes are not supported with the store yet: every process must reach
 the same store, and nothing yet decides whether the nodes write to one store over the
 network or each to its own, copied together afterwards.
