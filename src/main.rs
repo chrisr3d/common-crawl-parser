@@ -17,12 +17,14 @@ use std::env::{self, VarError};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{self, ExitCode};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 
+use cc_extract::inline_favicon::save_images;
 use cc_extract::store::{
     DEFAULT_SOCKET, PASSWORD_VARIABLE, Store, StoreResult, artifact_count, load_processed,
     save_then_mark,
@@ -224,7 +226,7 @@ Exit status:
   0  Every Shard taken on done for every requested kind (paths file lines it can't use are skipped)
   1  Stopped early, such as on a missing or unreadable paths file or an unreachable store: fix the cause, then run again
   2  Invalid option or value
-  3  Some Shards left with kinds undone (failed download, parse or store write): run the same command again")]
+  3  Some Shards left with kinds undone (failed download, parse, store write or image save): run the same command again")]
 struct Config {
     /// Path to a WARC, WAT or WET paths file (supports .gz)
     ///
@@ -313,6 +315,15 @@ struct Config {
     // status 2), reported before anything runs.
     #[arg(long, value_name = "SOCKET|URL", default_value = DEFAULT_SOCKET)]
     kvrocks: StoreAddress,
+
+    /// Save each inline favicon image as DIR/<first 2 hex digits of its SHA-256>/<SHA-256>
+    ///
+    /// Its hashes (SHA-256, SHA-1, MD5, Shodan's mmh3) and media type go
+    /// to the store either way; without this option, its bytes are dropped
+    /// once hashed. A file already at an image's path is left as it is.
+    /// Only the inline-favicon kind finds images.
+    #[arg(long, value_name = "DIR")]
+    save_images: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +530,7 @@ const EXIT_UNDONE: u8 = 3;
 /// Main crawl pipeline — download and parse each Shard's Archives.
 ///
 /// Returns `EXIT_UNDONE` if a Shard was left with a kind undone, by a
-/// failed download, parse or store write.
+/// failed download, parse, store write or image save.
 async fn run_crawl(config: Config) -> ExitCode {
     let input = config.input.clone();
     let limit_display = match config.limit {
@@ -588,9 +599,13 @@ async fn run_crawl(config: Config) -> ExitCode {
     } else {
         String::new()
     };
+    let images_display = match &config.save_images {
+        Some(dir) => format!(", save images to: {}", dir.display()),
+        None => String::new(),
+    };
     eprintln!(
         "Reading paths from '{}' (extract: {}{}, limit: {}{}, jobs: {}, delete after: {}, \
-         transport: {}, onion engine: {}{})",
+         transport: {}, onion engine: {}{}{})",
         input,
         kind_list(&kinds),
         formats_display,
@@ -600,8 +615,14 @@ async fn run_crawl(config: Config) -> ExitCode {
         config.delete,
         cli_name(&transport_choice),
         cli_name(&onion_engine),
-        store_display
+        store_display,
+        images_display
     );
+    // Accepted all the same, so one command line can serve runs with and
+    // without that kind.
+    if config.save_images.is_some() && !kinds.contains(&ArtifactKind::InlineFavicon) {
+        eprintln!("Note: inline-favicon is not requested: no image will be saved");
+    }
 
     // --- Open and read the paths file ---
     // Supports both plain text and gzip-compressed (.gz) paths files.
@@ -989,8 +1010,9 @@ async fn run_crawl(config: Config) -> ExitCode {
     // --- Collect results back on the main task ---
     //
     // `buffer_unordered` yields results as futures complete. We process
-    // them sequentially here: write each done kind's Sightings to the
-    // store, mark the (Shard, kind) pair done, and optionally delete files.
+    // them sequentially here: save each done kind's images (with
+    // `--save-images`), write its Sightings to the store, mark the
+    // (Shard, kind) pair done, and optionally delete files.
     //
     // This is a key design choice: concurrent *work*, sequential *writing*.
     // No locks, no race conditions — the simplest correct approach.
@@ -1016,15 +1038,36 @@ async fn run_crawl(config: Config) -> ExitCode {
     futures::pin_mut!(shard_stream);
 
     while let Some(result) = shard_stream.next().await {
-        // For each done kind: write its Sightings, *then* mark the pair
-        // done. A crash or failed write in between leaves the pair
-        // unmarked, never marked with its Sightings missing (see
-        // `save_then_mark`). A kind whose write failed is left undone, like
-        // one whose Archive failed.
+        // For each done kind: save its images, write its Sightings, *then*
+        // mark the pair done. A crash or failed write in between leaves the
+        // pair unmarked, never marked with its Sightings or images missing
+        // (see `save_then_mark`). A kind whose write failed is left undone,
+        // like one whose Archive failed.
         let mut undone = result.undone;
         let store_start = Instant::now();
         let wrote_any = !result.found.is_empty();
         for (kind, findings) in result.found {
+            // With `--save-images`, a pair's images go to disk before its
+            // store writes, so before its mark: a pair marked done has every
+            // image saved. One that can't be saved leaves the pair undone,
+            // with nothing written to the store for it.
+            //
+            // `save_images` blocks this task on file writes, as the store
+            // writes hold it. Inline favicons are few (100 Shards of CC-MAIN
+            // held 1.6 MB of them as base64, Sightings included): a Shard's
+            // are written well under the downloads' `READ_TIMEOUT`.
+            if let Some(dir) = &config.save_images
+                && let Findings::InlineFavicons(favicons) = &findings
+            {
+                match save_images(dir, favicons) {
+                    Ok(saved) => eprintln!("  [{}] Saved {} new image(s)", result.shard, saved),
+                    Err(err) => {
+                        eprintln!("  [{}] Error: {}", result.shard, err);
+                        undone.push(kind);
+                        continue;
+                    }
+                }
+            }
             // Counted even when the write fails part-way: what it added
             // is in the store, and won't be new to the next run.
             let new_artifacts = new_counts.entry(kind).or_default();

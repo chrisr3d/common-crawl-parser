@@ -42,7 +42,7 @@ use cc_extract::store::{PASSWORD_VARIABLE, Store};
 use cc_extract::{
     ArtifactKind, Findings, InlineFavicon, KvrocksStore, Shard, Sighting, StoreAddress,
 };
-use common::{WarcBuilder, findings_in, http_response, normalized, wat_response_json};
+use common::{WarcBuilder, file_names, findings_in, http_response, normalized, wat_response_json};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::json;
@@ -113,11 +113,22 @@ fn wet_archive() -> Vec<u8> {
 /// A 1×1 PNG in base64, as a page embeds it. At 96 characters, it fills
 /// more than one of the 76-character lines Shodan's hash is computed on.
 const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==";
+/// The same PNG, decoded (`base64 -d | xxd -i`).
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x56, 0xc7, 0x2f, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
 /// The PNG's SHA-256, by Python's `hashlib.sha256(png).hexdigest()`.
 const PNG_SHA256: &str = "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d";
 /// The PNG's Shodan favicon hash, by Python's
 /// `mmh3.hash(codecs.encode(png, "base64"))`.
 const PNG_MMH3: i32 = 1_932_519_735;
+/// The PNG's SHA-1 and MD5, by `shasum -a 1` and `md5`.
+const PNG_SHA1: &str = "7679eec1d792d130b56cc3a3d9c55a750600ac64";
+const PNG_MD5: &str = "340680474585d738bda590f1675a0f46";
 
 /// A second page, embedding the same PNG as the first.
 const OTHER_PAGE: &str = "https://example.org/";
@@ -324,6 +335,15 @@ fn no_store(workspace: &Path) -> String {
 /// first 16 bytes of the SHA-256 of `"<shard> <page_url>"`, in hex.
 fn page_id(page_url: &str) -> String {
     sha256_hex(format!("{SHARD} {page_url}").as_bytes())[..32].to_string()
+}
+
+/// Where `--save-images images` puts the fixture PNG, under a workspace:
+/// `images/<first two hex digits of its SHA-256>/<SHA-256>`.
+fn saved_png(workspace: &Path) -> PathBuf {
+    workspace
+        .join("images")
+        .join(&PNG_SHA256[..2])
+        .join(PNG_SHA256)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +671,10 @@ fn inline_favicon_plans_warc_and_onion_rides_along() {
             PNG_SHA256.to_string(),
             InlineFavicon {
                 mmh3: PNG_MMH3,
+                sha1: PNG_SHA1.to_string(),
+                md5: PNG_MD5.to_string(),
                 media_type: "image/png".to_string(),
-                data: String::new(),
+                bytes: Vec::new(),
                 sightings: vec![sighting(PAGE, DATE), sighting(OTHER_PAGE, OTHER_DATE)],
             }
         )])))
@@ -667,8 +689,24 @@ fn inline_favicon_plans_warc_and_onion_rides_along() {
     };
     assert_eq!(
         store.fields(&format!("image:{PNG_SHA256}")),
-        strings(&[("media_type", "image/png"), ("mmh3", &PNG_MMH3.to_string())])
+        strings(&[
+            ("media_type", "image/png"),
+            ("mmh3", &PNG_MMH3.to_string()),
+            ("sha1", PNG_SHA1),
+            ("md5", PNG_MD5),
+        ])
     );
+    for index in [
+        format!("mmh3:{PNG_MMH3}"),
+        format!("sha1:{PNG_SHA1}"),
+        format!("md5:{PNG_MD5}"),
+    ] {
+        assert_eq!(
+            store.members(&index),
+            BTreeSet::from([PNG_SHA256.to_string()]),
+            "{index}"
+        );
+    }
     assert_eq!(
         store.members(&format!("inline-favicon:{PNG_SHA256}")),
         BTreeSet::from([page_id(PAGE), page_id(OTHER_PAGE)])
@@ -690,4 +728,134 @@ fn inline_favicon_plans_warc_and_onion_rides_along() {
         store.members("artifacts:inline-favicon"),
         BTreeSet::from([PNG_SHA256.to_string()])
     );
+
+    // Without `--save-images`, the image is written nowhere.
+    assert_eq!(file_names(&dir), ["download", "warc.paths"]);
+}
+
+/// With `--save-images`, each image of the fixture is on disk under its
+/// SHA-256, holding its exact bytes, with no temporary file beside it. A
+/// second run finds the Shard done and writes nothing.
+#[test]
+fn save_images_writes_each_image_under_its_sha256() {
+    let Some(store) = TestStore::take("save_images_writes_each_image_under_its_sha256") else {
+        return;
+    };
+    let dir = workspace(
+        "save_images_writes_each_image_under_its_sha256",
+        &[(WARC_NAME, inline_favicon_warc_archive())],
+    );
+    let args = ["-e", "inline-favicon", "--save-images", "images"];
+
+    crawl(&store, &dir, &args);
+
+    let path = saved_png(&dir);
+    assert_eq!(fs::read(&path).unwrap(), PNG);
+    assert_eq!(file_names(path.parent().unwrap()), [PNG_SHA256]);
+    assert_eq!(file_names(&dir.join("images")), [&PNG_SHA256[..2]]);
+    assert_eq!(
+        store.members("processed"),
+        BTreeSet::from([format!("{SHARD} inline-favicon")])
+    );
+
+    let written = fs::metadata(&path).unwrap().modified().unwrap();
+    let second_run = crawl(&store, &dir, &args);
+    assert!(
+        second_run.contains("already processed, skipping"),
+        "the second run should skip the Shard:\n{second_run}"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written);
+}
+
+/// A file already at an image's path is left as it is: one there is taken
+/// for the image, saved whole by an earlier run.
+#[test]
+fn save_images_leaves_an_existing_file_as_it_is() {
+    let Some(store) = TestStore::take("save_images_leaves_an_existing_file_as_it_is") else {
+        return;
+    };
+    let dir = workspace(
+        "save_images_leaves_an_existing_file_as_it_is",
+        &[(WARC_NAME, inline_favicon_warc_archive())],
+    );
+    let path = saved_png(&dir);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "written before").unwrap();
+
+    crawl(
+        &store,
+        &dir,
+        &["-e", "inline-favicon", "--save-images", "images"],
+    );
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "written before");
+    assert_eq!(
+        store.members("processed"),
+        BTreeSet::from([format!("{SHARD} inline-favicon")])
+    );
+}
+
+/// An image that can't be saved leaves `inline-favicon` undone for the
+/// Shard, with a message naming its path, and the run exits with
+/// `EXIT_UNDONE`; `onion`, reading the same Archive, is done. Here a
+/// regular file stands where the image's subdirectory should be.
+#[test]
+fn an_image_that_cannot_be_saved_exits_undone() {
+    let Some(store) = TestStore::take("an_image_that_cannot_be_saved_exits_undone") else {
+        return;
+    };
+    let dir = workspace(
+        "an_image_that_cannot_be_saved_exits_undone",
+        &[(WARC_NAME, inline_favicon_warc_archive())],
+    );
+    let path = saved_png(&dir);
+    fs::create_dir_all(dir.join("images")).unwrap();
+    fs::write(path.parent().unwrap(), "not a directory").unwrap();
+
+    let output = cc_extract_into(&store, &dir)
+        .args(["-e", "onion,inline-favicon", "--save-images", "images"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_UNDONE),
+        "cc-extract should exit undone:\n{stderr}"
+    );
+    // The binary names the path as it was given, relative to its directory.
+    let relative = path.strip_prefix(&dir).unwrap();
+    assert!(
+        stderr.contains(&relative.display().to_string()),
+        "the message should name {}:\n{stderr}",
+        relative.display()
+    );
+    assert_eq!(
+        store.members("processed"),
+        BTreeSet::from([format!("{SHARD} onion")])
+    );
+}
+
+/// `--save-images` without `inline-favicon` is accepted, and the run says
+/// at start-up that no image will be saved: only that kind finds images.
+#[test]
+fn save_images_without_inline_favicon_says_none_will_be_saved() {
+    let dir = workspace(
+        "save_images_without_inline_favicon_says_none_will_be_saved",
+        &[],
+    );
+
+    // It stops at the store it can't reach, after the start-up lines.
+    let output = cc_extract(&dir)
+        .args(["-e", "onion", "--save-images", "images"])
+        .args(["--kvrocks", &no_store(&dir)])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inline-favicon is not requested: no image will be saved"),
+        "the run should say no image will be saved:\n{stderr}"
+    );
+    assert!(!dir.join("images").exists());
 }

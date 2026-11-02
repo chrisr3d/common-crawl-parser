@@ -243,9 +243,11 @@ impl Extractor for InlineFaviconExtractor {
         for image in images {
             self.favicons
                 .entry(sha256_hex(&image.bytes))
-                // Shodan's hash and the base64 are computed the first time
-                // an image is seen only.
-                .or_insert_with(|| InlineFavicon::new(&image))
+                // The other hashes are computed the first time an image is
+                // seen only. The key is an owned `String`, so its borrow of
+                // `image` has ended: the closure can move `image` into the
+                // new entry.
+                .or_insert_with(|| InlineFavicon::new(image))
                 .add_sighting(sighting.clone());
         }
     }

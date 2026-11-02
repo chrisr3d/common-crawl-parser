@@ -90,6 +90,7 @@ cargo run -- warc.paths -d                     # delete each Shard's Archives af
 cargo run -- warc.paths -e onion               # extract onions only (default: onion,favicon)
 cargo run -- warc.paths -e onion,favicon       # later: adds favicons, skips the onion work done
 cargo run -- warc.paths -e onion,inline-favicon  # inline favicons need WARC; onions read it too
+cargo run -- warc.paths -e inline-favicon --save-images images  # also write each image to images/
 cargo run -- wat.paths.gz                      # any Format's paths file: Shards are the same
 cargo run -- warc.paths --formats warc         # force the Formats downloaded per Shard
 cargo run -- warc.paths -t disk                # parse from the downloaded file (default)
@@ -129,6 +130,7 @@ Options:
   -t, --transport <TRANSPORT>        How downloaded Archives reach the parser [default: disk] [possible values: disk, memory, mmap]
       --onion-engine <ONION_ENGINE>  Search used to find .onion addresses [default: memchr] [possible values: memchr, regex]
       --kvrocks <SOCKET|URL>         kvrocks store receiving results and done marks: a Unix socket path, or a redis://host:port URL [default: /tmp/kvrocks.sock]
+      --save-images <DIR>            Save each inline favicon image as DIR/<first 2 hex digits of its SHA-256>/<SHA-256>
   -h, --help                         Print help (see more with '--help')
 ```
 

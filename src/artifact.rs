@@ -387,8 +387,10 @@ mod tests {
     fn merging_inline_favicons_unions_sightings_and_keeps_the_first_description() {
         let favicon = |media_type: &str, sightings: Vec<Sighting>| InlineFavicon {
             mmh3: 1,
+            sha1: "sha1".to_string(),
+            md5: "md5".to_string(),
             media_type: media_type.to_string(),
-            data: "aGVsbG8=".to_string(),
+            bytes: b"hello".to_vec(),
             sightings,
         };
         let on_a = sighting("https://example.com/a", "shard-1.warc.gz");

@@ -43,19 +43,31 @@ fn sightings(entries: &[(&str, Vec<Sighting>)]) -> Findings {
     )
 }
 
-/// The SHA-256 of a made-up image.
+/// The hashes of a 1×1 PNG: SHA-256, SHA-1 and MD5 by `shasum` and `md5`,
+/// Shodan's by Python's `mmh3.hash(codecs.encode(png, "base64"))`.
 const IMAGE: &str = "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d";
+const IMAGE_SHA1: &str = "7679eec1d792d130b56cc3a3d9c55a750600ac64";
+const IMAGE_MD5: &str = "340680474585d738bda590f1675a0f46";
+const IMAGE_MMH3: i32 = 1_932_519_735;
 
-/// `Findings::InlineFavicons` holding `IMAGE`, declared as `media_type`.
+/// The PNG, declared as `media_type`, seen on `sightings`. Its bytes are
+/// left out: the store never keeps them.
+fn png(media_type: &str, sightings: Vec<Sighting>) -> InlineFavicon {
+    InlineFavicon {
+        mmh3: IMAGE_MMH3,
+        sha1: IMAGE_SHA1.to_string(),
+        md5: IMAGE_MD5.to_string(),
+        media_type: media_type.to_string(),
+        bytes: Vec::new(),
+        sightings,
+    }
+}
+
+/// `Findings::InlineFavicons` holding the PNG, declared as `media_type`.
 fn inline_favicon(media_type: &str, sightings: Vec<Sighting>) -> Findings {
     Findings::InlineFavicons(HashMap::from([(
         IMAGE.to_string(),
-        InlineFavicon {
-            mmh3: -1_932_519_735,
-            media_type: media_type.to_string(),
-            data: "aGVsbG8=".to_string(),
-            sightings,
-        },
+        png(media_type, sightings),
     )]))
 }
 
@@ -194,6 +206,86 @@ async fn writing_the_same_shard_twice_changes_nothing() {
     }
 
     assert_eq!(store, before);
+}
+
+/// `pairs` as a hash's fields, as `Store::fields` reads them.
+fn fields(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(field, value)| (field.to_string(), value.to_string()))
+        .collect()
+}
+
+/// An inline favicon is described by its media type and hashes, not its
+/// bytes, and can be found from each hash: the index sets of mmh3, SHA-1
+/// and MD5 hold its SHA-256.
+#[tokio::test]
+async fn an_inline_favicon_is_found_from_each_of_its_hashes() {
+    let mut store = MemoryStore::new();
+    let findings = inline_favicon("image/png", vec![on("https://a.example/", 0)]);
+
+    save_then_mark(
+        &mut store,
+        ArtifactKind::InlineFavicon,
+        &findings,
+        &shard(0),
+        &mut 0,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store.fields(&format!("image:{IMAGE}")).await.unwrap(),
+        fields(&[
+            ("media_type", "image/png"),
+            ("mmh3", "1932519735"),
+            ("sha1", IMAGE_SHA1),
+            ("md5", IMAGE_MD5),
+        ])
+    );
+    for index in [
+        "mmh3:1932519735".to_string(),
+        format!("sha1:{IMAGE_SHA1}"),
+        format!("md5:{IMAGE_MD5}"),
+    ] {
+        assert_eq!(store.members(&index).await.unwrap(), [IMAGE], "{index}");
+    }
+}
+
+/// Shodan's hash is 32 bits: two different images can share one, and its
+/// index then lists both, the second written adding to the first.
+#[tokio::test]
+async fn images_sharing_an_mmh3_both_stay_in_its_index() {
+    let other = "0f".repeat(32);
+    let other_image = InlineFavicon {
+        sha1: "0f".repeat(20),
+        md5: "0f".repeat(16),
+        ..png("image/png", vec![on("https://b.example/", 1)])
+    };
+    let mut store = MemoryStore::new();
+
+    save_then_mark(
+        &mut store,
+        ArtifactKind::InlineFavicon,
+        &inline_favicon("image/png", vec![on("https://a.example/", 0)]),
+        &shard(0),
+        &mut 0,
+    )
+    .await
+    .unwrap();
+    save_then_mark(
+        &mut store,
+        ArtifactKind::InlineFavicon,
+        &Findings::InlineFavicons(HashMap::from([(other.clone(), other_image)])),
+        &shard(1),
+        &mut 0,
+    )
+    .await
+    .unwrap();
+
+    let mut images = store.members("mmh3:1932519735").await.unwrap();
+    images.sort();
+    assert_eq!(images, [other, IMAGE.to_string()]);
 }
 
 /// Only the Sightings of `shard` among `findings`.

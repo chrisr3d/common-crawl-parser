@@ -2,16 +2,23 @@
 //
 // The favicon scanner decodes them (`favicon_search::InlineImage`); this
 // module describes one as the crawl keeps it: under the SHA-256 of its
-// bytes, with Shodan's hash of it, its media type and the image itself in
-// base64. The store keeps the hash and the media type, not the image.
+// bytes, with its other hashes, its media type and the image itself. The
+// store keeps the hashes and the media type, not the image, which
+// `--save-images` writes to disk (`save_images`).
 //
-// ## Two hashes, two jobs
+// ## Four hashes: one key, three ways in
 //
 // The SHA-256 identifies the image: a cryptographic hash, so two different
 // images never share one in practice, and a fixed standard that every tool
 // computes the same way (`sha256sum`, Python's `hashlib`), in any year.
-// Shodan's hash (`mmh3`) is only there to look the image up on Shodan: a
-// 32-bit MurmurHash3, fast but easy to collide on purpose.
+//
+// The other three are other common ways to identify an image, so it can be
+// looked up by whichever one is at hand: Shodan's favicon hash (`mmh3`),
+// MD5 and SHA-1. None of them can be the key: `mmh3` has 32 bits, so among
+// a million distinct images about 116 pairs share one, and an image can be
+// built to have any chosen value; MD5 and SHA-1 collide on purpose too. The
+// bytes are dropped once hashed, unless saved, so a hash left out now would
+// take crawling again: all three are computed with the SHA-256.
 //
 // ## Why not `std::hash::DefaultHasher`
 //
@@ -24,12 +31,22 @@
 // a standard, not by a library version.
 
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::Write as _;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::process;
 
+use md5::Md5;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::artifact::{ArtifactEntry, Sighting};
 use crate::favicon_search::InlineImage;
+// Private to the crate root, yet visible here: an item is visible in the
+// module that declares it and in all of that module's descendants.
+use crate::{TempFile, with_suffix};
 
 // ---------------------------------------------------------------------------
 // How an inline favicon is kept
@@ -41,10 +58,14 @@ pub struct InlineFavicon {
     /// Shodan's favicon hash of the image, to search Shodan with
     /// (`http.favicon.hash:<mmh3>`).
     pub mmh3: i32,
+    /// The image's SHA-1, in lower-case hex.
+    pub sha1: String,
+    /// The image's MD5, in lower-case hex.
+    pub md5: String,
     /// The media type declared by the first page it was seen on.
     pub media_type: String,
-    /// The image, in base64.
-    pub data: String,
+    /// The image itself, written to disk with `--save-images` only.
+    pub bytes: Vec<u8>,
     /// The pages it was seen on.
     pub sightings: Vec<Sighting>,
 }
@@ -54,12 +75,15 @@ pub struct InlineFavicon {
 pub type InlineFavicons = HashMap<String, InlineFavicon>;
 
 impl InlineFavicon {
-    /// `image`, not seen on any page yet.
-    pub fn new(image: &InlineImage) -> Self {
+    /// `image`, not seen on any page yet. Takes the image by value: its
+    /// bytes move into the result, not copied.
+    pub fn new(image: InlineImage) -> Self {
         Self {
             mmh3: shodan_mmh3(&image.bytes),
-            media_type: image.media_type.clone(),
-            data: base64_encode(&image.bytes),
+            sha1: sha1_hex(&image.bytes),
+            md5: md5_hex(&image.bytes),
+            media_type: image.media_type,
+            bytes: image.bytes,
             sightings: Vec::new(),
         }
     }
@@ -72,6 +96,66 @@ impl ArtifactEntry for InlineFavicon {
 }
 
 // ---------------------------------------------------------------------------
+// Saved images
+// ---------------------------------------------------------------------------
+
+/// Write each image of `favicons` to `<dir>/<first two hex digits of its
+/// SHA-256>/<SHA-256>`, unless a file is there already, creating the
+/// directories as needed; returns how many were written. The first image
+/// that can't be written fails the call, the message naming its path.
+///
+/// ## The layout
+///
+/// No extension: the media type is in the store (`image:<sha256>`), as the
+/// first page declared it, rightly or not. The first two hex digits split
+/// the images over 256 subdirectories: a directory of millions of files is
+/// slow to list, and on some filesystems to open a file in.
+///
+/// ## Complete or absent
+///
+/// As a downloaded Archive is (`save_archive`), each image is written to
+/// `<sha256>.<process id>.part` in its subdirectory, then renamed to its
+/// name: a killed process leaves at most a `.part` file, never part of an
+/// image under an image's name. So a file found at an image's name is that
+/// image, whole, and is left as it is. Two processes saving one image at
+/// the same time both rename theirs, the second replacing the first with
+/// the same bytes.
+pub fn save_images(
+    dir: &Path,
+    favicons: &InlineFavicons,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut saved = 0;
+    for (sha256, favicon) in favicons {
+        let path = dir.join(&sha256[..2]).join(sha256);
+        let written = save_image(&path, &favicon.bytes)
+            .map_err(|err| format!("cannot save the image {}: {}", path.display(), err))?;
+        if written {
+            saved += 1;
+        }
+    }
+    Ok(saved)
+}
+
+/// Write `bytes` to `path`, unless a file is there already; returns whether
+/// it was written.
+fn save_image(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    // `try_exists` tells "no file" from "can't tell" (such as a parent that
+    // is a regular file), which `exists` would both answer `false`: the
+    // second is an error, reported as such.
+    if path.try_exists()? {
+        return Ok(false);
+    }
+    if let Some(subdirectory) = path.parent() {
+        fs::create_dir_all(subdirectory)?;
+    }
+    let partial = TempFile::new(with_suffix(path, &format!(".{}.part", process::id())));
+    fs::write(partial.path(), bytes)?;
+    fs::rename(partial.path(), path)?;
+    partial.keep();
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Hashes
 // ---------------------------------------------------------------------------
 
@@ -80,15 +164,39 @@ impl ArtifactEntry for InlineFavicon {
 ///
 /// ## The `Digest` trait
 ///
-/// `sha2` is one of the RustCrypto hash crates (`sha1`, `sha3`, `blake2`,
-/// ...), which all implement the `Digest` trait of the `digest` crate:
-/// `Sha256::digest(bytes)` here would read `Sha3_256::digest(bytes)` with
-/// `sha3`. Its result is a fixed-size array of 32 bytes; written in hex,
-/// two digits per byte, it is the usual 64-character form.
+/// `sha2` is one of the RustCrypto hash crates (`sha1`, `md-5`, `sha3`,
+/// `blake2`, ...), which all implement the `Digest` trait of the `digest`
+/// crate: `Sha256::digest(bytes)` here reads `Sha1::digest(bytes)` in
+/// `sha1_hex` and `Md5::digest(bytes)` in `md5_hex`. Each gives a
+/// fixed-size array of bytes (32 for SHA-256, 20 for SHA-1, 16 for MD5);
+/// written in hex, two digits per byte, SHA-256 takes the usual 64
+/// characters.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    hex(&Sha256::digest(bytes))
+}
+
+/// The SHA-1 of `bytes`, in lower-case hex.
+///
+/// SHA-1 is broken for signatures (two different files with the same SHA-1
+/// have been built), so it is a way to look an image up, never its key.
+pub fn sha1_hex(bytes: &[u8]) -> String {
+    hex(&Sha1::digest(bytes))
+}
+
+/// The MD5 of `bytes`, in lower-case hex.
+///
+/// Like SHA-1, MD5 collides on purpose easily: a way to look an image up,
+/// never its key. The crate is published as `md-5`, `md5` being another
+/// crate's name on crates.io, and names its library `md5`: the name the
+/// code imports it by.
+pub fn md5_hex(bytes: &[u8]) -> String {
+    hex(&Md5::digest(bytes))
+}
+
+/// `digest` in lower-case hex, two digits per byte.
+fn hex(digest: &[u8]) -> String {
     let mut hex = String::with_capacity(2 * digest.len());
-    for byte in digest.iter() {
+    for byte in digest {
         // `fmt::Write` lets `write!` append to a `String`, which cannot
         // fail.
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
@@ -305,5 +413,20 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn sha1_hex_matches_fips_180_2() {
+        // The "abc" example of FIPS 180-2, appendix A.1, and the empty
+        // input.
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn md5_hex_matches_rfc_1321() {
+        // From the test suite of RFC 1321, appendix A.5.
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
     }
 }

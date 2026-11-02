@@ -312,6 +312,17 @@ pub fn write_archives(test_name: &str, archives: &[(&str, impl AsRef<[u8]>)]) ->
         .collect()
 }
 
+/// The names of the entries in `dir`, sorted: what a test expects a run to
+/// have left there.
+pub fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 // ---------------------------------------------------------------------------
 // Parsing and comparing results
 // ---------------------------------------------------------------------------
@@ -515,7 +526,10 @@ fn shorten(value: &impl Debug) -> String {
 /// - `<kind>:<artifact>` lists the ids of the Pages each was seen on;
 /// - `page:<id>` holds a Page's `page_url`, `date` and `shard`;
 /// - `page:<id>:<kind>` lists the Page's Artifacts, checked to agree;
-/// - `image:<sha256>` describes an inline favicon: `media_type`, `mmh3`.
+/// - `image:<sha256>` describes an inline favicon: `media_type`, `mmh3`,
+///   `sha1`, `md5`;
+/// - `mmh3:<value>`, `sha1:<hex>`, `md5:<hex>` list the SHA-256s of the
+///   images with that hash, checked to hold the inline favicon's.
 ///
 /// The layout is written out here rather than taken from the library, so a
 /// change to it fails the tests: consumers of the store read these keys.
@@ -545,10 +559,20 @@ pub async fn findings_in(store: &mut impl Store, kind: ArtifactKind) -> Findings
             }
             Findings::InlineFavicons(map) => {
                 let image = store.fields(&format!("image:{artifact}")).await.unwrap();
+                for hash in ["mmh3", "sha1", "md5"] {
+                    let index = format!("{hash}:{}", image[hash]);
+                    let images = store.members(&index).await.unwrap();
+                    assert!(
+                        images.contains(&artifact),
+                        "{index} doesn't list {artifact}"
+                    );
+                }
                 let favicon = InlineFavicon {
                     mmh3: image["mmh3"].parse().unwrap(),
+                    sha1: image["sha1"].clone(),
+                    md5: image["md5"].clone(),
                     media_type: image["media_type"].clone(),
-                    data: String::new(),
+                    bytes: Vec::new(),
                     sightings,
                 };
                 map.insert(artifact, favicon);
@@ -570,7 +594,7 @@ pub fn normalized(mut findings: Findings) -> Findings {
         Findings::InlineFavicons(map) => {
             for favicon in map.values_mut() {
                 sort(&mut favicon.sightings);
-                favicon.data.clear();
+                favicon.bytes.clear();
             }
         }
     }

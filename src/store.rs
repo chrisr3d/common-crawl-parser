@@ -14,13 +14,18 @@
 //   <kind>:<artifact>     set   ids of the Pages the Artifact was seen on
 //   page:<id>:<kind>      set   the Page's Artifacts of that kind
 //   artifacts:<kind>      set   every Artifact of the kind
-//   image:<sha256>        hash  `media_type`, `mmh3` of an inline favicon
+//   image:<sha256>        hash  `media_type`, `mmh3`, `sha1`, `md5` of an
+//                               inline favicon
+//   mmh3:<value>,         set   SHA-256s of the inline favicons having
+//   sha1:<hex>, md5:<hex>       that value
 //   processed             set   `<shard> <kind>`, one per done pair
 //
 // `<artifact>` is an onion address, a favicon URL, or the SHA-256 of an
 // inline favicon. One Sighting is one Page in an Artifact's set: a Page is
 // one URL in one Shard, so Sightings are deduplicated on `(page_url, shard)`
 // as before, by the set itself.
+//
+// An image's bytes are never written: `--save-images` puts them on disk.
 //
 // ## Only adding, never replacing
 //
@@ -399,11 +404,26 @@ fn push_writes(
     }
 
     if let Some(image) = found.image {
+        let mmh3 = image.mmh3.to_string();
         let fields = [
             ("media_type", image.media_type.clone()),
-            ("mmh3", image.mmh3.to_string()),
+            ("mmh3", mmh3.clone()),
+            ("sha1", image.sha1.clone()),
+            ("md5", image.md5.clone()),
         ];
         push_fields(batch, &format!("image:{artifact}"), fields);
+        // A hash given by another tool leads to the image's key. Several
+        // images can share one mmh3: its set then lists them all.
+        for index in [
+            format!("mmh3:{mmh3}"),
+            format!("sha1:{}", image.sha1),
+            format!("md5:{}", image.md5),
+        ] {
+            batch.push(Write::SetAdd {
+                key: index,
+                member: artifact.to_string(),
+            });
+        }
     }
 
     batch.push(Write::SetAdd {
