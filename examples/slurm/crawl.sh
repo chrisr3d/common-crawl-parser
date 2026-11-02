@@ -2,7 +2,11 @@
 #
 # crawl.sh — SLURM array job running cc-extract over a Crawl
 #
-# merge.sh, in the same directory, combines the results once it has finished.
+# NOT WORKING WITH THE KVROCKS STORE YET. Every process writes its results to
+# the store named by --kvrocks, and runs across several nodes are not
+# supported: nothing yet decides whether the nodes write to one store over
+# the network or each to its own, copied together afterwards. Kept as a
+# starting point until then.
 #
 # An example to adapt: replace every <...> placeholder for your cluster and
 # check the values under "Configuration" before submitting.
@@ -11,35 +15,31 @@
 #   - Level 1: SLURM array tasks, one node each, PATHS_PER_TASK paths each
 #   - Level 2: within each array task, PROCESSES_PER_NODE independent
 #     cc-extract processes, each with its own non-overlapping slice of the
-#     paths file (--offset / --limit) and its own --output-dir, so no two
-#     processes ever write the same file
+#     paths file (--offset / --limit)
 #
 # With the values below, 10 array tasks cover 100,000 paths, about one CC-MAIN
 # Crawl:
 #   - Array task 0 covers paths     0 -  9,999
-#   - Process 0.0  covers paths     0 -    499, written to ${OUTPUT_ROOT}/0/0/
-#   - Process 0.1  covers paths   500 -    999, written to ${OUTPUT_ROOT}/0/1/
+#   - Process 0.0  covers paths     0 -    499
+#   - Process 0.1  covers paths   500 -    999
 #   - ...
-#   - Process 9.19 covers paths 99,500 - 99,999, written to ${OUTPUT_ROOT}/9/19/
+#   - Process 9.19 covers paths 99,500 - 99,999
 #
 # Why several processes per node rather than one with --jobs <all cores>:
-# a process merges and saves its results files on one thread, after every
-# Shard. Separate processes share that work out and keep each file small.
+# a process writes each Shard's results to the store on one thread.
+# Separate processes share that work out.
 #
-# Submit:          JOB=$(sbatch --parsable examples/slurm/crawl.sh)
-# Then merge:      sbatch --dependency=afterok:${JOB} examples/slurm/merge.sh
+# Submit:          sbatch examples/slurm/crawl.sh
 # Re-run one task: sbatch --array=3 examples/slurm/crawl.sh
 #
 # This script exits with 0 even when some of its processes left Shards to
-# retry or stopped early (see the end), so afterok starts merge.sh anyway, on
-# the results so far. Re-run those tasks (once the cause of an early stop is
-# fixed), then merge.sh again.
+# retry or stopped early (see the end). Re-run those tasks (once the cause of
+# an early stop is fixed).
 #
-# A re-run resumes: each process reads the processed.log of its own
-# --output-dir and skips the (Shard, kind) pairs already done. Done Shards
-# don't count toward --limit, though, so a process whose slice is partly
-# done goes on into the next process's slice. merge.sh deduplicates, so the
-# overlap costs time, not correctness.
+# A re-run resumes: each process reads the done (Shard, kind) pairs from the
+# store and skips them. Done Shards don't count toward --limit, though, so a
+# process whose slice is partly done goes on into the next process's slice.
+# The store's writes only add, so the overlap costs time, not correctness.
 #SBATCH --job-name=cc-extract
 #SBATCH --account=<account>
 #SBATCH --partition=<partition>
@@ -66,9 +66,10 @@ BINARY="<path to common-crawl-parser>/target/release/cc-extract"
 # EXTRACT (see --formats in `cc-extract --help` to force them).
 PATHS_FILE="<path to wat.paths.gz>"
 
-# Each process writes to ${OUTPUT_ROOT}/<array task>/<process>/; merge.sh
-# reads them back from there.
-OUTPUT_ROOT="<path to output directory>"
+# The store every process writes to: a Unix socket path, or a
+# redis://host:port URL. Its password, if it needs one, goes in the
+# CC_EXTRACT_KVROCKS_PASSWORD environment variable.
+KVROCKS="<socket path or redis://host:port of the kvrocks store>"
 
 # Artifact kinds to extract. The default, onion,favicon, reads WAT + WET on
 # CC-MAIN (~240 MB per Shard); adding inline-favicon makes every kind read
@@ -110,8 +111,8 @@ echo ""
 # ---------------------------------------------------------------------------
 # Launch the processes in parallel
 # ---------------------------------------------------------------------------
-# Each process runs in the background (&) with its own offset, limit and
-# output directory. `wait` below blocks until all of them finish.
+# Each process runs in the background (&) with its own offset and limit.
+# `wait` below blocks until all of them finish.
 #
 # --transport memory parses each Archive from RAM, so nothing is written to
 # download/ (the disk Transports would write it under the current directory).
@@ -120,9 +121,8 @@ PIDS=()
 
 for i in $(seq 0 $((PROCESSES_PER_NODE - 1))); do
     OFFSET=$((TASK_OFFSET + i * PATHS_PER_PROCESS))
-    OUT_DIR="${OUTPUT_ROOT}/${SLURM_ARRAY_TASK_ID}/${i}"
 
-    echo "  Starting process ${i}: offset=${OFFSET}, limit=${PATHS_PER_PROCESS}, jobs=${JOBS_PER_PROCESS}, output=${OUT_DIR}"
+    echo "  Starting process ${i}: offset=${OFFSET}, limit=${PATHS_PER_PROCESS}, jobs=${JOBS_PER_PROCESS}"
 
     "${BINARY}" "${PATHS_FILE}" \
         --extract "${EXTRACT}" \
@@ -130,7 +130,7 @@ for i in $(seq 0 $((PROCESSES_PER_NODE - 1))); do
         --limit "${PATHS_PER_PROCESS}" \
         --jobs "${JOBS_PER_PROCESS}" \
         --transport memory \
-        --output-dir "${OUT_DIR}" &
+        --kvrocks "${KVROCKS}" &
 
     PIDS+=($!)
 done
@@ -145,9 +145,9 @@ echo ""
 # A process exits with:
 #   0     every Shard of its slice done for every kind in EXTRACT
 #   3     it ran to the end, but some Shards failed (download, parse or
-#         save): they are not marked in its processed.log, and running the
-#         same command again retries them
-#   other it stopped early, such as on an unreadable results file or an
+#         store write): they are not marked done in the store, and running
+#         the same command again retries them
+#   other it stopped early, such as on an unreachable store or an
 #         --offset past the end of the paths file (1), on invalid arguments
 #         (2), or killed by a signal (128 + its number): fix the cause first
 # ---------------------------------------------------------------------------
