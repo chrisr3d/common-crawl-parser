@@ -24,7 +24,7 @@ The project was built incrementally and now features the following:
 2. **HTTP download** — Fetch each Shard's Archives from Common Crawl servers
 3. **Archive parsing** — Decompress gzip-compressed Archives and read their WARC, WAT or WET records with a custom parser
 4. **Onion extraction** — Find `.onion` addresses in HTTP responses (WARC), metadata JSON (WAT) or page text (WET)
-5. **Favicon extraction** — Find the favicons HTML pages declare, resolved against the page's `<base href>`; inline images are recorded by their SHA-256, with Shodan's `mmh3` favicon hash
+5. **Favicon extraction** — Find the favicons HTML pages declare, resolved against the page's `<base href>`; inline images are recorded by their SHA-256, with their SHA-1, MD5 and Shodan's `mmh3` favicon hash, and saved to disk on request (`--save-images`)
 6. **Deduplication & results store** — Deduplicate Sightings and write them, Shard by Shard, to a kvrocks store, over a Unix socket or TCP
 7. **Concurrent processing** — Download and parse several Shards in parallel with async/tokio
 8. **Ripgrep-style parsing** — Transport (`-t`) and onion search engine (`--onion-engine`) selectable at runtime
@@ -200,17 +200,20 @@ suffix, such as `.warc.gz`). Kinds are named as on the command line:
 | `<kind>:<artifact>` | set | ids of the Pages the Artifact was seen on |
 | `page:<id>:<kind>` | set | the Page's Artifacts of that kind |
 | `artifacts:<kind>` | set | every Artifact of the kind |
-| `image:<sha256>` | hash | an inline favicon's `media_type` and Shodan favicon hash (`mmh3`, the number `http.favicon.hash:` takes) |
+| `image:<sha256>` | hash | an inline favicon's `media_type`, Shodan favicon hash (`mmh3`, the number `http.favicon.hash:` takes), `sha1` and `md5` |
+| `mmh3:<value>`, `sha1:<hex>`, `md5:<hex>` | set | SHA-256s of the inline favicons with that hash |
 | `processed` | set | `<shard> <kind>`, one per done (Shard, kind) pair |
 
 An `<artifact>` is a `.onion` address, a favicon URL, or the SHA-256 of an inline favicon (the
-image itself is not kept). A Page's `<id>` is the first 16 bytes of the SHA-256 of
-`"<shard> <page_url>"`, in hex. For instance:
+store keeps no image bytes: `--save-images <dir>` writes each image to
+`<dir>/<first two hex digits of its SHA-256>/<SHA-256>`). A Page's `<id>` is the first 16
+bytes of the SHA-256 of `"<shard> <page_url>"`, in hex. For instance:
 
 ```sh
 redis-cli -s /tmp/kvrocks.sock SMEMBERS artifacts:onion       # every onion found
 redis-cli -s /tmp/kvrocks.sock SMEMBERS onion:<address>       # the Pages it was seen on
 redis-cli -s /tmp/kvrocks.sock HGETALL page:<id>              # one Page
+redis-cli -s /tmp/kvrocks.sock SMEMBERS mmh3:<value>          # the images with a Shodan hash
 ```
 
 Sighting metadata is extracted from WARC headers (`WARC-Target-URI`, `WARC-Date`) during

@@ -16,8 +16,9 @@ and writes what it finds to a kvrocks store (see section 9):
 - `favicon`: every favicon URL an HTML page declares, with the pages that
   declare it.
 - `inline-favicon`: every favicon image a page embeds as a base64 `data:` URI,
-  identified by its SHA-256, with its media type, its Shodan hash and the pages
-  that embed it.
+  identified by its SHA-256, with its media type, its SHA-1, MD5 and Shodan
+  hash, and the pages that embed it; with `--save-images`, the image itself, on
+  disk.
 
 `-e` / `--extract` picks the kinds (default `onion,favicon`). All requested kinds
 are extracted in the same pass over each Archive.
@@ -374,18 +375,64 @@ pages, or written with other line breaks, is one Artifact: its Sightings in
 ```text
 media_type  image/png
 mmh3        1932519735
+sha1        7679eec1d792d130b56cc3a3d9c55a750600ac64
+md5         340680474585d738bda590f1675a0f46
 ```
 
 - `mmh3`: Shodan's favicon hash, the number its `http.favicon.hash:` filter
   takes: MurmurHash3 x86_32 (seed 0) of the base64 as Python's
   `codecs.encode(data, "base64")` writes it (a newline every 76 characters and
   at the end), read as a signed 32-bit number.
+- `sha1`, `md5`: the SHA-1 and MD5 of the image's bytes, in lowercase hex.
 - `media_type`: as the first Page written declares it, from the `data:` header,
   without parameters, in lower case
   (`data:Image/SVG+XML;charset=utf-8;base64,` gives `image/svg+xml`); empty if
   the URI declares none.
 
-The image itself is not kept: once hashed, its bytes are dropped.
+**Four hashes, one key.** The SHA-256 identifies the image: two different
+images never share one in practice, and every tool computes it the same way.
+The other three are other common ways to identify an image, so it can be
+looked up by whichever one is at hand. None of them can be the key. `mmh3` has 32 bits: among
+a million distinct images, about 116 pairs share one (the birthday bound), and
+an image can be built to have any chosen value. MD5 and SHA-1 can be made to
+collide on purpose too. All three are computed during the crawl: the bytes are
+dropped once hashed, so a hash left out could only be added by crawling again.
+
+**Found from any hash.** Each of the three leads back to the images having it:
+the sets `mmh3:<value>` (signed decimal, as in `image:<sha256>`), `sha1:<hex>`
+and `md5:<hex>` hold their SHA-256s. A set can list several images; for `mmh3`,
+that is expected.
+
+```sh
+redis-cli -s /tmp/kvrocks.sock SMEMBERS mmh3:1932519735  # the images with that Shodan hash
+redis-cli -s /tmp/kvrocks.sock HGETALL image:<sha256>    # one image's hashes and media type
+```
+
+**Saving the images.** The store holds no image bytes. Without
+`--save-images`, they are dropped once hashed. With `--save-images <dir>`, each
+image of a Shard is written to `<dir>/<first two hex digits of its
+SHA-256>/<SHA-256>`, such as `images/49/49e1dad4…c00d`:
+
+- No extension: the media type is in the store, as the first Page declared it,
+  rightly or not. The first two hex digits spread the images over 256
+  subdirectories, as a directory of millions of files is slow to list.
+- Each file is written under a temporary name in its subdirectory
+  (`<sha256>.<process id>.part`), then renamed to its own: a killed run leaves
+  at most a `.part` file, never part of an image under an image's name. So a
+  file already at an image's path is that image, and is left as it is.
+  Directories are created as needed.
+- A (Shard, `inline-favicon`) pair's images are all on disk before its writes to
+  the store, so before it is marked done. One that can't be written (a
+  directory not writable, a regular file where a subdirectory should be) leaves
+  the pair undone, with a message naming its path, and the run exits with 3.
+- Given without `inline-favicon` requested, the option is accepted, and a line
+  at start-up says no image will be saved.
+
+A pair done without `--save-images` keeps no image: a later run with the option
+skips it, done, and saves only the images of the pairs it extracts. An image
+written before SHA-1 and MD5 were computed has neither, nor any index entry,
+until a pair extracted later finds it again and adds them; nothing redoes the
+pairs already done (see section 9, resuming).
 
 ## 8. Concurrency and resource guards
 
@@ -413,7 +460,8 @@ Each cap prints a warning when it lowers the requested value.
 Results and done marks go to a [kvrocks](https://kvrocks.apache.org/) store:
 the Redis protocol, its data kept on disk (RocksDB) rather than in RAM. No
 results file is written: nothing goes under the working directory but
-`download/` and the mmap Transport's temporary file.
+`download/`, the mmap Transport's temporary file and, if asked to go there, the
+images `--save-images` writes (section 7).
 
 **Reaching it.** `--kvrocks` names a Unix socket (default `/tmp/kvrocks.sock`)
 or gives a `redis://host:port` URL. A socket reaches a store on the same
@@ -435,7 +483,8 @@ that can't be reached stops the run with exit status 1, naming it.
 | `<kind>:<artifact>` | set | ids of the Pages the Artifact was seen on |
 | `page:<id>:<kind>` | set | the Page's Artifacts of that kind |
 | `artifacts:<kind>` | set | every Artifact of the kind |
-| `image:<sha256>` | hash | `media_type` (declared by the first Page written), `mmh3` (signed decimal) |
+| `image:<sha256>` | hash | `media_type` (declared by the first Page written), `mmh3` (signed decimal), `sha1`, `md5` (lowercase hex) |
+| `mmh3:<value>`, `sha1:<hex>`, `md5:<hex>` | set | SHA-256s of the inline favicons with that hash |
 | `processed` | set | `<shard> <kind>`, one per done pair |
 
 `<artifact>` is the onion address, the favicon URL, or the inline favicon's
@@ -445,7 +494,8 @@ Shard written again gives the same keys, and each set lists 32 characters per
 Page rather than its URL. One Sighting is one Page in an Artifact's set: the
 same page crawled in two Shards is two Pages, two Sightings. The forward sets
 link the kinds seen on one Page: from an onion to the inline favicons of the
-Pages naming it, then to their `mmh3`.
+Pages naming it, then to their `mmh3`, and through `mmh3:<value>` to every
+other image sharing it. No image bytes are written to the store (section 7).
 
 **Only adding.** Every write is a `SADD` or an `HSETNX` (set a hash field only
 if absent): nothing written is ever removed or changed, so the first `date` or
@@ -483,11 +533,12 @@ them. Results under one set of rules take a fresh store, or a namespace of
 their own.
 
 The summary at the end reports processed, skipped and failed Shards (a Shard
-left with any kind undone, by a failed download, parse or store write), the
-Artifacts new to the store per kind (those `SADD` added to `artifacts:<kind>`),
-the total per kind (that set's size), and average download and parse time per
-Shard. Each Shard's log also gives the time its writes took. The exit status
-tells whether any Shard failed (see section 11).
+left with any kind undone, by a failed download, parse, store write or image
+save), the Artifacts new to the store per kind (those `SADD` added to
+`artifacts:<kind>`), the total per kind (that set's size), and average download
+and parse time per Shard. Each Shard's log also gives the time its writes took,
+and with `--save-images` how many new images it saved. The exit status tells
+whether any Shard failed (see section 11).
 
 ## 10. HPC batch mode
 
@@ -517,6 +568,7 @@ add.
 | `-t`, `--transport T` | `disk` | `disk`, `memory` or `mmap` |
 | `--onion-engine E` | `memchr` | `memchr` or `regex` |
 | `--kvrocks SOCKET\|URL` | `/tmp/kvrocks.sock` | The store: a Unix socket path, or `redis://host:port` |
+| `--save-images DIR` | off | Write each inline favicon image to `DIR/<first two hex digits of its SHA-256>/<SHA-256>` (section 7) |
 
 The store's password, if it needs one, is read from the
 `CC_EXTRACT_KVROCKS_PASSWORD` environment variable, never from an option.
@@ -529,7 +581,7 @@ command again:
 | 0 | Every Shard taken on done for every requested kind | No need |
 | 1 | Stopped early, such as on a missing or unreadable paths file, an unreachable store, an `--offset` past the end, or a Plan no Shard can meet | Once the cause is fixed |
 | 2 | Invalid option or value (`clap`'s code for usage errors) | Once the command is fixed |
-| 3 | Ran to the end with some Shards left with kinds undone: a failed download, parse or store write | Yes, the same command |
+| 3 | Ran to the end with some Shards left with kinds undone: a failed download, parse, store write or image save | Yes, the same command |
 
 Early stops come before anything is downloaded or written. Shards that fail
 don't stop the run: the others go on, and the run exits with 3 at the end.

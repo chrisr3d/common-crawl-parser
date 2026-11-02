@@ -1381,3 +1381,76 @@ only sees a parsed address.
 ..` closure (Rust 1.85) borrowing the connection it is handed. The crawl tests share one store,
 so each takes `STORE_TURN.lock()` first; a test failing while it holds the guard poisons the
 mutex, and `PoisonError::into_inner` takes it anyway, the next test emptying the store first.
+
+---
+
+## Step 28: Image Hashes, Their Indexes, and Images Saved on Request
+
+### What we built
+
+An inline favicon was kept under the SHA-256 of its bytes with Shodan's `mmh3`, and its bytes
+were dropped once hashed: a hash another tool searches by, if not computed during the crawl,
+could only be had by crawling again. Each image now carries the hashes other tools look favicons
+up by, can be found from any of them, and can be written to disk:
+
+- **Two more hashes** (`src/inline_favicon.rs`): `sha1_hex` and `md5_hex`, from the RustCrypto
+  `sha1` and `md-5` crates (the family of `sha2` and `sha3`). `image:<sha256>` now holds `sha1`
+  and `md5` next to `media_type` and `mmh3`. SHA-256 stays the key: `mmh3` has 32 bits (about
+  116 colliding pairs among a million images, and an image can be built to any value), and MD5
+  and SHA-1 collide on purpose. They serve as other ways to look an image up.
+- **Indexes** (`src/store.rs`): `mmh3:<value>`, `sha1:<hex>` and `md5:<hex>`, sets of the
+  SHA-256s having that hash, written with the pair's other writes (`SADD`, so idempotent), before
+  its mark. Two images sharing an `mmh3` both stay in its set.
+- **`--save-images <dir>`**: `save_images` writes each image of a pair to
+  `<dir>/<sha256[0..2]>/<sha256>` (no extension: the media type is in the store), through
+  `<sha256>.<pid>.part` and a rename, as downloads are saved; a file already there is the image,
+  whole, and is left as is. The result loop saves a pair's images before its store writes: a
+  pair marked done has every image on disk, and one image that can't be written leaves the pair
+  undone (exit 3), its path in the message. Without `inline-favicon` requested, the option is
+  accepted and a start-up line says no image will be saved.
+- **Bytes, not base64**: `InlineFavicon` carried its image as base64 (`data`), for the JSON
+  files the store replaced. It now carries the raw `bytes`, moved in from the decoded
+  `InlineImage` rather than copied; base64 is only computed for `mmh3`.
+- **Tests**: the hash helpers against FIPS 180-2 and RFC 1321 vectors; `tests/store.rs` checks an
+  image's four fields and three index entries through `MemoryStore`, and two images under one
+  `mmh3`; `findings_in` checks every index on each read. `tests/saved_images.rs` tests
+  `save_images` on its own (exact bytes, nothing else in the directory, a file already there kept,
+  a regular file in the way failing with its path); `tests/crawl_cli.rs` runs the binary (saved
+  files, a second run writing nothing, the failure leaving `inline-favicon` undone while `onion`
+  is done, the start-up note).
+
+### Rust concepts introduced
+
+**One trait, several hash crates**
+`Sha256::digest`, `Sha1::digest` and `Md5::digest` are one method of the `digest` crate's
+`Digest` trait, implemented by each RustCrypto hash. Their outputs are arrays of different
+lengths; `hex(digest: &[u8])` takes any of them, `&Sha1::digest(..)` turning into a `&[u8]` by
+*deref coercion*: the output type, `hybrid_array::Array` (which `digest` 0.11 uses), implements
+`Deref<Target = [u8]>`. So one helper writes all three in hex.
+
+**A package name that isn't the library's**
+`md-5` is published under that name (`md5` was another crate's on crates.io) and declares its
+library name `md5` in its own `Cargo.toml` (`[lib] name = "md5"`): `Cargo.toml` lists `md-5`,
+the code writes `use md5::Md5`.
+
+**Privacy follows the module tree**
+`TempFile` and `with_suffix` are private items of the crate root, yet `inline_favicon` uses them
+(`use crate::{TempFile, with_suffix}`): a private item is visible in the module that declares it
+and in all its descendants, and every module is a descendant of the root. No `pub(crate)`
+needed.
+
+**Moving into a closure once a borrow ends**
+`self.favicons.entry(sha256_hex(&image.bytes)).or_insert_with(|| InlineFavicon::new(image))`:
+the key borrows `image` only while it is computed, so the closure, an `FnOnce` run at most once,
+may then move `image` into the new entry. `InlineFavicon::new(image: InlineImage)` takes it by
+value and moves `image.bytes` into the struct: the buffer changes owner, no byte is copied.
+
+**`try_exists` rather than `exists`**
+`Path::exists` answers `false` both when there is no file and when it can't tell (a parent that
+is a regular file, a directory it may not read). `Path::try_exists` returns `io::Result<bool>`:
+`Ok(false)` only for "no file", an `Err` otherwise, which `save_images` reports with the path
+instead of trying to write where it can't.
+
+**Struct update syntax in tests**
+`InlineFavicon { sha1: .., md5: .., ..png(..) }` builds a second image from the first, giving
+only the fields that differ; the rest are moved from the value after `..`.
