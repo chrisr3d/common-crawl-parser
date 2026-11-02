@@ -1,9 +1,9 @@
 // Inline favicons — images a page embeds as `data:` URIs
 //
 // The favicon scanner decodes them (`favicon_search::InlineImage`); this
-// module decides how one is saved in `inline_favicons.json`: under the
-// SHA-256 of its bytes, with Shodan's hash of it, its media type and the
-// image itself in base64.
+// module describes one as the crawl keeps it: under the SHA-256 of its
+// bytes, with Shodan's hash of it, its media type and the image itself in
+// base64. The store keeps the hash and the media type, not the image.
 //
 // ## Two hashes, two jobs
 //
@@ -17,7 +17,7 @@
 //
 // `DefaultHasher` is the hash `HashMap` uses, and its documentation leaves
 // the algorithm unspecified on purpose. It is SipHash-1-3 today, but a
-// later Rust release may change it, and a key saved in a file would then
+// later Rust release may change it, and a key saved in the store would then
 // no longer match the one computed for the same image. Its 64 bits also
 // make a collision as likely as not past about five billion distinct
 // images (the birthday bound). A saved identifier needs a hash defined by
@@ -26,19 +26,17 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::artifact::{ArtifactEntry, Sighting};
 use crate::favicon_search::InlineImage;
 
 // ---------------------------------------------------------------------------
-// How an inline favicon is saved
+// How an inline favicon is kept
 // ---------------------------------------------------------------------------
 
-/// One inline favicon, as `inline_favicons.json` saves it under the
-/// SHA-256 of its bytes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One inline favicon, found under the SHA-256 of its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineFavicon {
     /// Shodan's favicon hash of the image, to search Shodan with
     /// (`http.favicon.hash:<mmh3>`).
@@ -77,8 +75,8 @@ impl ArtifactEntry for InlineFavicon {
 // Hashes
 // ---------------------------------------------------------------------------
 
-/// The key an image is saved under in `InlineFavicons`: the SHA-256 of
-/// its bytes, in lower-case hex.
+/// The key an image is kept under in `InlineFavicons` and in the store:
+/// the SHA-256 of its bytes, in lower-case hex.
 ///
 /// ## The `Digest` trait
 ///

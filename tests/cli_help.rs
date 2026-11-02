@@ -40,8 +40,3 @@ fn assert_readme_shows(args: &[&str]) {
 fn readme_shows_the_crawl_help() {
     assert_readme_shows(&["-h"]);
 }
-
-#[test]
-fn readme_shows_the_merge_help() {
-    assert_readme_shows(&["merge", "-h"]);
-}

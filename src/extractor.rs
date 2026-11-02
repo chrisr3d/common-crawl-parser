@@ -206,7 +206,7 @@ impl Extractor for FaviconExtractor {
 // ---------------------------------------------------------------------------
 
 /// Finds the favicon images that HTML pages embed as base64 `data:` URIs,
-/// each one saved under the SHA-256 of its bytes.
+/// each one kept under the SHA-256 of its bytes.
 #[derive(Default)]
 pub struct InlineFaviconExtractor {
     favicons: InlineFavicons,

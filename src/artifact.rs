@@ -8,15 +8,15 @@
 // each image (`InlineFavicons`). `Findings` holds either.
 //
 // The helpers at the bottom are the only place that decides when two
-// Sightings are "the same": extraction, the per-Archive merge in `main` and
-// the `merge` subcommand all go through them.
+// Sightings are "the same" within one Shard: extraction and the merge of a
+// Shard's Archives in `main` go through them. Across Shards the store's sets
+// do the same (`store`).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 
 use crate::format::Format;
 use crate::inline_favicon::InlineFavicons;
@@ -30,8 +30,8 @@ use crate::plan::FormatRequirement;
 /// A category of information that can be extracted from the crawl.
 ///
 /// The behaviour of each kind lives in its `Extractor`; this enum names it
-/// and holds the facts that don't depend on any page: its name and its
-/// output file. It derives `Copy` because it is a plain tag (one byte), and
+/// and holds the facts that don't depend on any page: its name and the
+/// Formats it can be read from. It derives `Copy` because it is a plain tag (one byte), and
 /// `Eq` + `Hash` as the Rust API guidelines recommend for public value
 /// types, so callers can put kinds in sets or use them as map keys. `Ord`
 /// (declaration order) lets a `BTreeMap` keyed by kind list them the same
@@ -42,8 +42,8 @@ use crate::plan::FormatRequirement;
 /// The derive turns each variant into a CLI value, kebab-cased (`Onion` →
 /// `onion`, `InlineFavicon` → `inline-favicon`), so `--extract`
 /// parses kinds without hand-written code. `Display` and `FromStr` below
-/// reuse those names, so the CLI, progress output and `processed.log` all
-/// spell a kind the same way and can't drift apart.
+/// reuse those names, so the CLI, progress output and the store's keys and
+/// done marks all spell a kind the same way and can't drift apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ValueEnum)]
 pub enum ArtifactKind {
     /// .onion addresses
@@ -59,15 +59,6 @@ impl ArtifactKind {
     /// `ValueEnum` derive, so a new variant is listed without editing this.
     pub fn all() -> &'static [ArtifactKind] {
         Self::value_variants()
-    }
-
-    /// Name of the JSON file this kind's Sightings are saved in.
-    pub fn output_filename(self) -> &'static str {
-        match self {
-            ArtifactKind::Onion => "onions.json",
-            ArtifactKind::Favicon => "favicons.json",
-            ArtifactKind::InlineFavicon => "inline_favicons.json",
-        }
     }
 
     /// The Format combinations this kind can be extracted from,
@@ -102,8 +93,7 @@ impl ArtifactKind {
     }
 }
 
-/// `Display` gives the CLI name, used in progress output and
-/// `processed.log`.
+/// `Display` gives the CLI name, used in progress output and in the store.
 impl fmt::Display for ArtifactKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `to_possible_value` returns `None` only for variants marked
@@ -114,7 +104,7 @@ impl fmt::Display for ArtifactKind {
 }
 
 /// Parse a CLI name back into a kind, so `"onion".parse::<ArtifactKind>()`
-/// works outside `clap` too (reading `processed.log`).
+/// works outside `clap` too (reading the store's done marks).
 impl FromStr for ArtifactKind {
     type Err = String;
 
@@ -143,9 +133,8 @@ impl FromStr for ArtifactKind {
 /// a `String` (same size, no overhead), but the compiler treats it as its
 /// own type: an Archive file name can't be passed where a Shard is expected
 /// by mistake, and the only way to build one from a file name is
-/// `from_archive_name`, which strips the Format suffix. `serde` serializes a
-/// newtype as its inner value, so in JSON a Shard is a plain string.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `from_archive_name`, which strips the Format suffix.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Shard(String);
 
 impl Shard {
@@ -175,10 +164,7 @@ impl fmt::Display for Shard {
 
 /// One occurrence of an Artifact: the page it was seen on, when that page
 /// was crawled, and the Shard it came from.
-///
-/// `Serialize` / `Deserialize` define its JSON shape in every kind's output
-/// file: `{"page_url": ..., "date": ..., "shard": ...}`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sighting {
     /// URL of the crawled page (`WARC-Target-URI`).
     pub page_url: String,
@@ -203,20 +189,16 @@ impl Sighting {
 /// the pages it was seen on.
 pub type Sightings = HashMap<String, Vec<Sighting>>;
 
-/// What one Artifact kind found, in the shape of its output file.
+/// What one Artifact kind found in one Shard.
 ///
 /// ## An enum to hold either map
 ///
-/// The pipeline keeps every requested kind's results side by side (a
+/// The pipeline keeps every kind's Findings for a Shard side by side (a
 /// `BTreeMap<ArtifactKind, Findings>` in `main`), so they need one type,
-/// though not every kind's file has the same shape. Each variant carries
-/// one of the maps; `merge`, `len` and saving work on either, and only
-/// `empty` and `from_json` need to know which kind has which.
-///
-/// `#[serde(untagged)]` saves a variant as its map alone, without the
-/// variant's name around it: `onions.json` stays `{artifact: [sightings]}`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
+/// though not every kind describes its Artifacts the same way. Each variant
+/// carries one of the maps; `merge`, `len` and writing to the store work on
+/// either, and only `empty` needs to know which kind has which.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Findings {
     /// `onion`, `favicon`: each Artifact (an address, a URL) mapped to its
     /// Sightings.
@@ -233,18 +215,6 @@ impl Findings {
             ArtifactKind::Onion | ArtifactKind::Favicon => Findings::Sightings(Sightings::new()),
             ArtifactKind::InlineFavicon => Findings::InlineFavicons(InlineFavicons::new()),
         }
-    }
-
-    /// Read `kind`'s Findings from the JSON of its output file.
-    ///
-    /// Untagged variants could be told apart by trying each shape in turn,
-    /// but an empty file (`{}`) fits both: the kind decides instead.
-    pub fn from_json(kind: ArtifactKind, json: &str) -> serde_json::Result<Self> {
-        // `empty` is the one place that says which kind has which shape.
-        Ok(match Findings::empty(kind) {
-            Findings::Sightings(_) => Findings::Sightings(serde_json::from_str(json)?),
-            Findings::InlineFavicons(_) => Findings::InlineFavicons(serde_json::from_str(json)?),
-        })
     }
 
     /// Number of distinct Artifacts.
@@ -381,24 +351,6 @@ mod tests {
             date: "2025-01-01T00:00:00Z".to_string(),
             shard: Shard::from_archive_name(archive_name),
         }
-    }
-
-    #[test]
-    fn sighting_json_has_page_url_date_and_shard() {
-        let json = serde_json::to_value(sighting(
-            "https://example.com/",
-            "CC-MAIN-20250101000000-20250101010101-00000.warc.gz",
-        ))
-        .unwrap();
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "page_url": "https://example.com/",
-                "date": "2025-01-01T00:00:00Z",
-                "shard": "CC-MAIN-20250101000000-20250101010101-00000",
-            })
-        );
     }
 
     #[test]

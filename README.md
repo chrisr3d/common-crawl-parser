@@ -103,14 +103,10 @@ cargo run --release --example baseline -- download/X.warc.gz  # original parser,
 ```text
 Extract artifacts, such as .onion addresses and favicon URLs, from Common Crawl archives
 
-Usage: cc-extract [OPTIONS] [INPUT] [COMMAND]
-
-Commands:
-  merge  Merge partial results from multiple output directories (HPC post-processing)
-  help   Print this message or the help of the given subcommand(s)
+Usage: cc-extract [OPTIONS] <INPUT>
 
 Arguments:
-  [INPUT]  Path to a WARC, WAT or WET paths file (supports .gz) — omit when using `merge`
+  <INPUT>  Path to a WARC, WAT or WET paths file (supports .gz)
 
 Options:
   -l, --limit <LIMIT>                Maximum number of Shards to process (default: all)
@@ -121,27 +117,12 @@ Options:
       --formats <FORMATS>            Formats to download for every Shard, comma-separated (default: the cheapest ones serving every kind) [possible values: warc, wat, wet]
   -t, --transport <TRANSPORT>        How downloaded Archives reach the parser [default: disk] [possible values: disk, memory, mmap]
       --onion-engine <ONION_ENGINE>  Search used to find .onion addresses [default: memchr] [possible values: memchr, regex]
-      --output-dir <OUTPUT_DIR>      Output directory for results and processed log [default: output]
+      --kvrocks <SOCKET|URL>         kvrocks store receiving results and done marks: a Unix socket path, or a redis://host:port URL [default: /tmp/kvrocks.sock]
   -h, --help                         Print help (see more with '--help')
 ```
 
-and `cc-extract merge -h`:
-
-```text
-Merge partial results from multiple output directories (HPC post-processing)
-
-Usage: cc-extract merge [OPTIONS] <INPUT_DIRS>...
-
-Arguments:
-  <INPUT_DIRS>...  Directories containing partial results files to merge
-
-Options:
-  -o, --output-dir <OUTPUT_DIR>  Output directory for the merged results [default: output]
-  -h, --help                     Print help (see more with '--help')
-```
-
 `--help` adds a paragraph to some options, describes each possible value and lists the exit
-statuses. `tests/cli_help.rs` fails when the two blocks above no longer match the binary.
+statuses. `tests/cli_help.rs` fails when the block above no longer matches the binary.
 
 ## Artifact Kinds and Plans
 

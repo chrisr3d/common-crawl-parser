@@ -22,9 +22,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use cc_extract::store::Store;
 use cc_extract::{
-    ArtifactKind, Extractor, FaviconExtractor, Findings, Format, OnionEngine, OnionExtractor,
-    Shard, Sighting, Transport, parse_archive,
+    ArtifactKind, Extractor, FaviconExtractor, Findings, Format, InlineFavicon, OnionEngine,
+    OnionExtractor, Shard, Sighting, Transport, parse_archive,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -501,4 +502,77 @@ fn shorten(value: &impl Debug) -> String {
     } else {
         text.chars().take(MAX_DEBUG_CHARS).collect::<String>() + "..."
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reading results back from a store
+// ---------------------------------------------------------------------------
+
+/// Every Artifact of `kind` in `store`, with its Sightings, read back from
+/// the store's keys:
+///
+/// - `artifacts:<kind>` lists the Artifacts;
+/// - `<kind>:<artifact>` lists the ids of the Pages each was seen on;
+/// - `page:<id>` holds a Page's `page_url`, `date` and `shard`;
+/// - `page:<id>:<kind>` lists the Page's Artifacts, checked to agree;
+/// - `image:<sha256>` describes an inline favicon: `media_type`, `mmh3`.
+///
+/// The layout is written out here rather than taken from the library, so a
+/// change to it fails the tests: consumers of the store read these keys.
+///
+/// Sightings come `normalized`, and inline favicons without their bytes:
+/// the store keeps none.
+pub async fn findings_in(store: &mut impl Store, kind: ArtifactKind) -> Findings {
+    let mut findings = Findings::empty(kind);
+    for artifact in store.members(&format!("artifacts:{kind}")).await.unwrap() {
+        let mut sightings = Vec::new();
+        for id in store.members(&format!("{kind}:{artifact}")).await.unwrap() {
+            let on_page = store.members(&format!("page:{id}:{kind}")).await.unwrap();
+            assert!(
+                on_page.contains(&artifact),
+                "page:{id}:{kind} doesn't list {artifact}"
+            );
+            let page = store.fields(&format!("page:{id}")).await.unwrap();
+            sightings.push(Sighting {
+                page_url: page["page_url"].clone(),
+                date: page["date"].clone(),
+                shard: Shard::from_archive_name(&page["shard"]),
+            });
+        }
+        match &mut findings {
+            Findings::Sightings(map) => {
+                map.insert(artifact, sightings);
+            }
+            Findings::InlineFavicons(map) => {
+                let image = store.fields(&format!("image:{artifact}")).await.unwrap();
+                let favicon = InlineFavicon {
+                    mmh3: image["mmh3"].parse().unwrap(),
+                    media_type: image["media_type"].clone(),
+                    data: String::new(),
+                    sightings,
+                };
+                map.insert(artifact, favicon);
+            }
+        }
+    }
+    normalized(findings)
+}
+
+/// `findings` in the form `findings_in` reads them back: each Artifact's
+/// Sightings sorted by Shard, then page URL (a set has no order), and
+/// inline favicons without their bytes.
+pub fn normalized(mut findings: Findings) -> Findings {
+    let sort = |sightings: &mut Vec<Sighting>| {
+        sightings.sort_by_key(|sighting| (sighting.shard.to_string(), sighting.page_url.clone()));
+    };
+    match &mut findings {
+        Findings::Sightings(map) => map.values_mut().for_each(sort),
+        Findings::InlineFavicons(map) => {
+            for favicon in map.values_mut() {
+                sort(&mut favicon.sightings);
+                favicon.data.clear();
+            }
+        }
+    }
+    findings
 }

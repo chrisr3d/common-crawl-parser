@@ -4,7 +4,7 @@
 //   - Downloading Archives from Common Crawl (async with reqwest)
 //   - `parse_archive`: reading every record of an Archive once and handing
 //     it to each extractor
-//   - Persistent state: processed log and results JSON
+//   - The results store: Sightings and done marks in kvrocks (`store`)
 //
 // ## Three independent choices
 //
@@ -17,8 +17,8 @@
 //   - Artifact kind: what is extracted, one `Extractor` per kind
 //     (`extractor`, `artifact`)
 //
-// `parse_archive` only connects them: a new kind needs its own `Extractor`
-// (and its output file), but the parsing loop stays as it is.
+// `parse_archive` only connects them: a new kind needs its own `Extractor`,
+// but the parsing loop stays as it is.
 //
 // Which Formats are read for a Shard is the planner's choice (`plan`): the
 // cheapest Archives that serve every requested kind (`format` says what
@@ -32,6 +32,7 @@ pub mod inline_favicon;
 pub mod onion_search;
 pub mod page_record;
 pub mod plan;
+pub mod store;
 pub mod warc_parser;
 
 // Re-exports: the types callers need most, importable from the crate root
@@ -44,11 +45,11 @@ pub use format::{ArchivePath, Dataset, Format, FormatSet};
 pub use inline_favicon::{InlineFavicon, InlineFavicons};
 pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
 pub use plan::{FormatRequirement, Plan, PlanError};
+pub use store::{KvrocksStore, StoreAddress};
 
-use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, Cursor, Read, Write};
+use std::io::{self, BufReader, Cursor, Read};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -66,19 +67,12 @@ use tokio::io::AsyncWriteExt;
 /// Base URL for Common Crawl data archives.
 const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 
-/// Default directory for output files.
-pub const DEFAULT_OUTPUT_DIR: &str = "output";
-
-/// Filename for the log of done (Shard, Artifact kind) pairs. Each kind's
-/// results file is named by `ArtifactKind::output_filename`.
-pub const PROCESSED_FILENAME: &str = "processed.log";
-
 // ---------------------------------------------------------------------------
 // Temporary files
 // ---------------------------------------------------------------------------
 
-/// `path` with `suffix` appended to its file name: `onions.json` and
-/// `.tmp` give `onions.json.tmp`, in the same directory.
+/// `path` with `suffix` appended to its file name: `x.warc.gz` and
+/// `.part` give `x.warc.gz.part`, in the same directory.
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut file_name = path.file_name().unwrap_or_default().to_os_string();
     file_name.push(suffix);
@@ -345,8 +339,13 @@ pub async fn download_to(
 /// `local_path` only once the stream ended and, when the server announced
 /// a `Content-Length`, the byte count matches it. A failed download removes
 /// its partial file (`TempFile`); a killed one leaves it, under a name no
-/// run reads. The rename is atomic because both names are in the same
-/// directory, hence on the same filesystem (see `save_sightings_to`).
+/// run reads.
+///
+/// On Unix, `rename` replaces the target in one step: a reader, or a run
+/// started after a kill, sees no file or the whole Archive, never part of
+/// it. That holds only within one filesystem, where a rename just changes
+/// which file the name points to; across filesystems it fails. Hence the
+/// partial file sits in the same directory as the Archive.
 ///
 /// `std::process::id()` makes the partial name unique per process on one
 /// machine: several processes can share one `download/` and, on a re-run,
@@ -825,180 +824,4 @@ fn hand_over(
             found.join(", ")
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// State Management
-// ---------------------------------------------------------------------------
-
-/// Load the (Shard, Artifact kind) pairs already done in `output_dir`.
-///
-/// `processed.log` holds one `<shard> <kind>` line per done pair,
-/// such as `CC-MAIN-20260305070756-20260305100756-00000 onion`. Lines
-/// without a kind name this version knows are ignored: a bare Archive
-/// name, as written before kinds were tracked, doesn't say which kinds were
-/// extracted, so the Shard is simply processed again.
-///
-/// ## `HashSet` of tuples
-///
-/// `HashSet` stores unique values with O(1) average-case lookup via hashing.
-/// A tuple is hashable when each of its fields is, so `(Shard, ArtifactKind)`
-/// works as a key with no extra code, and "is `onion` done for this Shard?"
-/// is one `contains(&(shard, kind))`.
-///
-/// ## HPC / batch mode
-///
-/// When running as a SLURM array job, each task uses its own output directory
-/// (`--output-dir output/42/`) so concurrent jobs never contend on the same
-/// files.
-pub fn load_processed_from(output_dir: &str) -> HashSet<(Shard, ArtifactKind)> {
-    let path = Path::new(output_dir).join(PROCESSED_FILENAME);
-    let content = fs::read_to_string(path).unwrap_or_default();
-    content
-        .lines()
-        // `filter_map` drops the lines for which the closure returns `None`;
-        // `?` inside it returns that `None` early.
-        .filter_map(|line| {
-            let (shard, kind) = line.trim().split_once(' ')?;
-            let kind = kind.parse::<ArtifactKind>().ok()?;
-            // A Shard id has no Format suffix, so it is kept whole.
-            Some((Shard::from_archive_name(shard), kind))
-        })
-        .collect()
-}
-
-/// Append one `<shard> <kind>` line to the processed log.
-fn mark_processed_in(shard: &Shard, kind: ArtifactKind, output_dir: &str) -> io::Result<()> {
-    fs::create_dir_all(output_dir)?;
-    let path = Path::new(output_dir).join(PROCESSED_FILENAME);
-    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
-    writeln!(file, "{} {}", shard, kind)
-}
-
-/// Save `kind`'s Findings, then record `shard` as done for `kind`.
-///
-/// ## Ordering for crash safety
-///
-/// The two writes can't happen at once, so the order decides what a crash
-/// (or a failed write) between them leaves behind:
-///
-/// - save, then mark (this order): the Sightings are saved but the pair is
-///   not marked. The next run processes the Shard again for this kind, and
-///   the Sightings it finds are already in the file; `merge_sightings`
-///   skips them, so the redo costs time but changes nothing.
-/// - mark, then save: the pair is marked but its Sightings are lost, and
-///   no later run would ever look for them again.
-///
-/// `?` returns as soon as the save fails, so the mark is never written
-/// after a failed save.
-pub fn save_then_mark(
-    kind: ArtifactKind,
-    findings: &Findings,
-    shard: &Shard,
-    output_dir: &str,
-) -> Result<(), Box<dyn Error>> {
-    save_sightings_to(kind, findings, output_dir)?;
-    mark_processed_in(shard, kind, output_dir)
-        .map_err(|err| format!("saved, but could not mark {} {}: {}", shard, kind, err))?;
-    Ok(())
-}
-
-/// Load `kind`'s saved Findings from `output_dir`.
-pub fn load_sightings_from(
-    kind: ArtifactKind,
-    output_dir: &str,
-) -> Result<Findings, Box<dyn Error>> {
-    load_sightings(kind, &Path::new(output_dir).join(kind.output_filename()))
-}
-
-/// Load `kind`'s Findings saved in `path`; a missing file means none yet.
-///
-/// ## Why an unreadable file is an error, not an empty map
-///
-/// The crawl merges new Sightings into what this returns and saves the
-/// result over the same file. Returning an empty map for a file it can't
-/// read (corrupt, or written in an older format such as `url` / `archive`
-/// instead of `page_url` / `shard`) would make that save silently replace
-/// the file's contents. Failing here stops the run before anything is
-/// written.
-fn load_sightings(kind: ArtifactKind, path: &Path) -> Result<Findings, Box<dyn Error>> {
-    if !path.exists() {
-        return Ok(Findings::empty(kind));
-    }
-    // `map_err` adds the path to the message: serde's error alone says
-    // "missing field `page_url` at line 4" without naming the file.
-    let content = fs::read_to_string(path)
-        .map_err(|err| format!("cannot read {}: {}", path.display(), err))?;
-    let findings = Findings::from_json(kind, &content)
-        .map_err(|err| format!("cannot load {}: {}", path.display(), err))?;
-    Ok(findings)
-}
-
-/// Save `kind`'s Findings to its file in `output_dir`.
-///
-/// ## Write, then rename
-///
-/// `fs::write` straight to the results file would empty it first and then
-/// write the new JSON: a process killed in between (a time limit, the OOM
-/// killer, Ctrl-C) would leave a cut-off file, which the next run refuses to
-/// load. So the JSON is written in full to `<file>.tmp`, then renamed over
-/// the results file.
-///
-/// On Unix, `fs::rename` replaces the target in one step: any reader, or a
-/// run started after a kill, sees either the old file or the new one, never
-/// a mix. That holds only within one filesystem, where a rename just changes
-/// which file the name points to; across filesystems it fails. Hence the
-/// temporary file sits in the same directory as the results file.
-///
-/// The target is a killed process, not a power cut: no `fsync`, which on a
-/// network filesystem would wait for the server to store hundreds of MB on
-/// every save. A leftover `<file>.tmp` is never loaded, and the next save
-/// replaces it.
-pub fn save_sightings_to(
-    kind: ArtifactKind,
-    findings: &Findings,
-    output_dir: &str,
-) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(output_dir)?;
-    let path = Path::new(output_dir).join(kind.output_filename());
-    let json = serde_json::to_string_pretty(findings)?;
-    let temporary = TempFile::new(with_suffix(&path, ".tmp"));
-    fs::write(temporary.path(), json)
-        .and_then(|()| fs::rename(temporary.path(), &path))
-        .map_err(|err| format!("cannot write {}: {}", path.display(), err))?;
-    temporary.keep();
-    Ok(())
-}
-
-/// Merge `kind`'s Findings saved in several output directories into one
-/// deduplicated map; `None` when no directory has a loadable file for
-/// `kind`.
-///
-/// ## HPC merge step
-///
-/// After a SLURM array job completes, each task has saved its results in a
-/// separate output directory. The `merge` subcommand calls this once per
-/// Artifact kind, deduplicating on `(page_url, shard)` pairs with the same
-/// `merge_sightings` the crawl uses after each Archive. A file that can't
-/// be loaded is reported and skipped, so one bad task doesn't block the
-/// merge of all the others.
-pub fn merge_sightings_from(kind: ArtifactKind, input_dirs: &[PathBuf]) -> Option<Findings> {
-    let mut merged: Option<Findings> = None;
-
-    for dir in input_dirs {
-        let path = dir.join(kind.output_filename());
-        if !path.exists() {
-            continue;
-        }
-        match load_sightings(kind, &path) {
-            // `get_or_insert_with` creates the map the first time a file
-            // is found, which is what turns `None` into `Some`.
-            Ok(partial) => merged
-                .get_or_insert_with(|| Findings::empty(kind))
-                .merge(partial),
-            Err(err) => eprintln!("Warning: {}, skipping it", err),
-        }
-    }
-
-    merged
 }

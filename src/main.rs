@@ -13,22 +13,25 @@
 // bounded concurrency with buffer_unordered, Arc for shared ownership.
 
 use std::collections::BTreeMap;
+use std::env::{self, VarError};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
 
+use cc_extract::store::{
+    DEFAULT_SOCKET, PASSWORD_VARIABLE, Store, StoreResult, artifact_count, load_processed,
+    save_then_mark,
+};
 use cc_extract::{
-    ArchivePath, ArtifactKind, DEFAULT_OUTPUT_DIR, Extractor, FaviconExtractor, Findings, Format,
-    FormatSet, HttpClient, InlineFaviconExtractor, OnionEngine, OnionExtractor, Plan, READ_TIMEOUT,
-    Shard, Transport, download_archive, download_archive_to_memory, download_path,
-    load_processed_from, load_sightings_from, merge_sightings_from, parse_archive,
-    save_sightings_to, save_then_mark,
+    ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
+    HttpClient, InlineFaviconExtractor, KvrocksStore, OnionEngine, OnionExtractor, Plan,
+    READ_TIMEOUT, Shard, StoreAddress, Transport, download_archive, download_archive_to_memory,
+    download_path, parse_archive,
 };
 
 // ---------------------------------------------------------------------------
@@ -209,16 +212,6 @@ fn get_available_memory() -> Option<u64> {
 // We use `//` (not `///`) for these explanatory comments so clap doesn't
 // include them in the `--help` output — only `///` on fields becomes help text.
 //
-// ## Subcommands for HPC / batch mode
-//
-// The CLI uses subcommands to support two modes:
-//   - default (no subcommand): download + parse archives (the original behavior)
-//   - `merge`: combine partial results from parallel SLURM array tasks
-//
-// The top-level struct keeps all the `run` flags directly so existing
-// invocations (`cc-extract warc.paths -l 3`) work without a keyword.
-// Only the `merge` subcommand requires an explicit keyword.
-//
 // `after_long_help` is printed at the end of `--help` only, so `-h` stays
 // short. 2 is `clap`'s own exit status for invalid arguments.
 #[derive(Parser)]
@@ -229,15 +222,15 @@ fn get_available_memory() -> Option<u64> {
 #[command(after_long_help = "\
 Exit status:
   0  Every Shard taken on done for every requested kind (paths file lines it can't use are skipped)
-  1  Stopped early, such as on a missing or unreadable paths or results file: fix the cause, then run again
+  1  Stopped early, such as on a missing or unreadable paths file or an unreachable store: fix the cause, then run again
   2  Invalid option or value
-  3  Some Shards left with kinds undone (failed download, parse or save): run the same command again")]
+  3  Some Shards left with kinds undone (failed download, parse or store write): run the same command again")]
 struct Config {
-    /// Path to a WARC, WAT or WET paths file (supports .gz) — omit when using `merge`
+    /// Path to a WARC, WAT or WET paths file (supports .gz)
     ///
     /// Any of the three locates every Format of each Shard, so the paths
     /// file doesn't decide which Formats are downloaded (see --formats).
-    input: Option<String>,
+    input: String,
 
     /// Maximum number of Shards to process (default: all)
     ///
@@ -269,8 +262,8 @@ struct Config {
 
     /// Artifact kinds to extract, comma-separated
     ///
-    /// A Shard is processed again only for the kinds not yet done for it
-    /// in `processed.log`, so a kind can be added in a later run.
+    /// A Shard is processed again only for the kinds not yet marked done
+    /// for it in the store, so a kind can be added in a later run.
     //
     // ## Comma-delimited lists
     //
@@ -309,34 +302,17 @@ struct Config {
     #[arg(long, value_enum, default_value_t = OnionEngine::Memchr)]
     onion_engine: OnionEngine,
 
-    /// Output directory for results and processed log
+    /// kvrocks store receiving results and done marks: a Unix socket path, or a redis://host:port URL
     ///
-    /// In HPC batch mode, give each process its own directory (e.g.,
-    /// `--output-dir output/3/7/`) so no two write the same file; `merge`
-    /// combines them afterwards.
-    #[arg(long, default_value = DEFAULT_OUTPUT_DIR)]
-    output_dir: String,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(clap::Subcommand)]
-enum Command {
-    /// Merge partial results from multiple output directories (HPC post-processing)
-    ///
-    /// After a SLURM array job completes, each task has written its own
-    /// results files in a separate directory. This subcommand reads them
-    /// all, deduplicates, and writes one combined file per Artifact kind.
-    Merge {
-        /// Directories containing partial results files to merge
-        #[arg(required = true)]
-        input_dirs: Vec<PathBuf>,
-
-        /// Output directory for the merged results
-        #[arg(short, long, default_value = DEFAULT_OUTPUT_DIR)]
-        output_dir: String,
-    },
+    /// If the store needs a password, it is read from the
+    /// CC_EXTRACT_KVROCKS_PASSWORD environment variable, never from an
+    /// option: options show in `ps` and in shell history.
+    //
+    // `StoreAddress` implements `FromStr`, so `clap` parses the value with
+    // it, the default included: a URL it refuses is an invalid value (exit
+    // status 2), reported before anything runs.
+    #[arg(long, value_name = "SOCKET|URL", default_value = DEFAULT_SOCKET)]
+    kvrocks: StoreAddress,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,104 +452,61 @@ fn parse_archives(
 /// lets `main` end normally, so every value still alive is dropped first:
 /// `process::exit` ends the process on the spot and runs no destructors.
 /// None of the early stops, still `process::exit(1)`, leaves a value whose
-/// `Drop` has work to do: the crawl's come before anything is downloaded
-/// or written, `merge`'s after a failed save has removed its temporary file.
+/// `Drop` has work to do: they all come before anything is downloaded or
+/// written.
 #[tokio::main]
 async fn main() -> ExitCode {
     // --- Parse CLI arguments (synchronous — runs before the async work) ---
     // `Config::parse()` is generated by the `clap` derive macro. It reads
     // `std::env::args()`, validates types, and exits with a help message
-    // if required arguments are missing or `--help` is passed.
+    // if required arguments are missing or `--help` is passed: `--help`
+    // never reaches the store.
     let config = Config::parse();
+    run_crawl(config).await
+}
 
-    // --- Dispatch: merge subcommand or default crawl pipeline ---
-    if let Some(Command::Merge {
-        input_dirs,
-        output_dir,
-    }) = config.command
-    {
-        run_merge(&input_dirs, &output_dir);
-        return ExitCode::SUCCESS;
-    }
-
-    // Default mode: require the input paths file
-    let input = match config.input {
-        Some(ref path) => path.clone(),
-        None => {
-            eprintln!("Error: missing required argument <INPUT> (path to a paths file)");
-            eprintln!("Usage: cc-extract <INPUT> [OPTIONS]");
-            eprintln!("       cc-extract merge <INPUT_DIRS>...");
+/// The password to send the store: the value of `PASSWORD_VARIABLE`, if
+/// set. A value that isn't UTF-8 stops the run: sent as it could be read,
+/// it would be another password.
+fn store_password() -> Option<String> {
+    match env::var(PASSWORD_VARIABLE) {
+        Ok(password) => Some(password),
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => {
+            eprintln!("Error: {} is not valid UTF-8", PASSWORD_VARIABLE);
             process::exit(1);
         }
-    };
-
-    run_crawl(input, config).await
-}
-
-/// Merge partial results from multiple SLURM task output directories.
-///
-/// Every Artifact kind is merged whose results file exists in at least one
-/// of the directories, so `merge` needs no option to say which kinds the
-/// tasks extracted.
-fn run_merge(input_dirs: &[PathBuf], output_dir: &str) {
-    eprintln!(
-        "Merging results from {} directories into '{}'",
-        input_dirs.len(),
-        output_dir
-    );
-
-    let mut merged_any = false;
-    for &kind in ArtifactKind::all() {
-        let Some(merged) = merge_sightings_from(kind, input_dirs) else {
-            continue;
-        };
-        merged_any = true;
-        eprintln!("Merged: {}", count_list([(kind, merged.len())]));
-
-        match save_sightings_to(kind, &merged, output_dir) {
-            Ok(()) => {
-                let path = Path::new(output_dir).join(kind.output_filename());
-                eprintln!("{} results saved to {}", kind, path.display());
-            }
-            Err(err) => {
-                eprintln!("Error saving merged {} results: {}", kind, err);
-                process::exit(1);
-            }
-        }
-    }
-
-    if !merged_any {
-        eprintln!("Error: no loadable results file in any of the input directories");
-        process::exit(1);
     }
 }
 
-/// Unwrap loaded results, or stop the run before anything is saved.
+/// Stop the run on a store reached but not read at start-up.
 ///
-/// Every finished Shard saves the results files again, so carrying on
-/// with an empty map would overwrite a file that merely failed to load.
-fn load_or_exit(loaded: Result<Findings, Box<dyn Error>>) -> Findings {
-    loaded.unwrap_or_else(|err| {
-        eprintln!("Error: {}", err);
-        eprintln!(
-            "Stopping so the file is not overwritten. Files written before the \
-             `page_url` / `shard` format are not converted: move the file away or \
-             use another --output-dir."
-        );
-        process::exit(1);
-    })
+/// The return type `!` (*never*) says the function doesn't return:
+/// `process::exit` ends the process. A `!` fits wherever a value is
+/// expected, so `unwrap_or_else(|err| stop_unreadable(..))` type-checks as
+/// giving whatever the `Ok` would have held.
+fn stop_unreadable(address: &StoreAddress, err: Box<dyn Error + Send + Sync>) -> ! {
+    eprintln!("Error: cannot read the store at {}: {}", address, err);
+    process::exit(1);
 }
 
-/// Save every requested kind's results file, reporting each one.
-fn save_all(results: &BTreeMap<ArtifactKind, Findings>, output_dir: &str) {
-    for (&kind, findings) in results {
-        match save_sightings_to(kind, findings, output_dir) {
-            Ok(()) => {
-                let path = Path::new(output_dir).join(kind.output_filename());
-                eprintln!("{} results saved to {}", kind, path.display());
-            }
-            Err(err) => eprintln!("Error saving {} results: {}", kind, err),
-        }
+/// How many Artifacts of each of `kinds` the store holds.
+async fn totals(
+    store: &mut impl Store,
+    kinds: &[ArtifactKind],
+) -> StoreResult<Vec<(ArtifactKind, usize)>> {
+    let mut totals = Vec::with_capacity(kinds.len());
+    for &kind in kinds {
+        totals.push((kind, artifact_count(store, kind).await?));
+    }
+    Ok(totals)
+}
+
+/// The `Total in results` line of the summary, read from the store.
+async fn print_totals(store: &mut impl Store, kinds: &[ArtifactKind]) {
+    match totals(store, kinds).await {
+        Ok(totals) => eprintln!("Total in results: {}", count_list(totals)),
+        Err(err) => eprintln!("Warning: cannot count the results in the store: {}", err),
     }
 }
 
@@ -586,8 +519,9 @@ const EXIT_UNDONE: u8 = 3;
 /// Main crawl pipeline — download and parse each Shard's Archives.
 ///
 /// Returns `EXIT_UNDONE` if a Shard was left with a kind undone, by a
-/// failed download, parse or save.
-async fn run_crawl(input: String, config: Config) -> ExitCode {
+/// failed download, parse or store write.
+async fn run_crawl(config: Config) -> ExitCode {
+    let input = config.input.clone();
     let limit_display = match config.limit {
         Some(n) => format!("{}", n),
         None => "all".to_string(),
@@ -649,8 +583,8 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
     } else {
         String::new()
     };
-    let output_dir_display = if config.output_dir != DEFAULT_OUTPUT_DIR {
-        format!(", output: {}", config.output_dir)
+    let store_display = if config.kvrocks != StoreAddress::Socket(DEFAULT_SOCKET.into()) {
+        format!(", store: {}", config.kvrocks)
     } else {
         String::new()
     };
@@ -666,7 +600,7 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
         config.delete,
         cli_name(&transport_choice),
         cli_name(&onion_engine),
-        output_dir_display
+        store_display
     );
 
     // --- Open and read the paths file ---
@@ -726,30 +660,31 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
         }
     );
 
-    // --- Load persistent state ---
+    // --- Connect to the store, read the done pairs ---
     //
-    // Only the requested kinds' results are loaded, and only those files
-    // are saved again: a run with `-e onion` never touches `favicons.json`.
-    // A `BTreeMap` keeps the kinds in declaration order for the messages.
-    let processed = load_processed_from(&config.output_dir);
-    let mut results: BTreeMap<ArtifactKind, Findings> = kinds
-        .iter()
-        .map(|&kind| {
-            (
-                kind,
-                load_or_exit(load_sightings_from(kind, &config.output_dir)),
-            )
-        })
-        .collect();
+    // After the checks that need no store, before anything is downloaded:
+    // a store that can't be reached stops the run here. Only the done
+    // marks are read; the results stay in the store.
+    let mut store = KvrocksStore::connect(&config.kvrocks, store_password())
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "Error: cannot reach the store at {}: {}",
+                config.kvrocks, err
+            );
+            process::exit(1);
+        });
+    let processed = load_processed(&mut store)
+        .await
+        .unwrap_or_else(|err| stop_unreadable(&config.kvrocks, err));
+    let start_totals = totals(&mut store, &kinds)
+        .await
+        .unwrap_or_else(|err| stop_unreadable(&config.kvrocks, err));
 
     eprintln!(
-        "State: {} (Shard, kind) pair(s) done; {} in results\n",
+        "State: {} (Shard, kind) pair(s) done; {} in the store\n",
         processed.len(),
-        count_list(
-            results
-                .iter()
-                .map(|(&kind, findings)| (kind, findings.len()))
-        )
+        count_list(start_totals)
     );
 
     // --- Schedule: the requested kinds still missing for each Shard ---
@@ -823,20 +758,10 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
         });
     }
 
-    let output_dir = config.output_dir;
-
     if work_items.is_empty() {
         eprintln!("No Shards to process.");
-        save_all(&results, &output_dir);
         eprintln!("\nSummary: 0 processed, {} skipped, 0 failed", skip_count);
-        eprintln!(
-            "Total in results: {}",
-            count_list(
-                results
-                    .iter()
-                    .map(|(&kind, findings)| (kind, findings.len()))
-            )
-        );
+        print_totals(&mut store, &kinds).await;
         return ExitCode::SUCCESS;
     }
 
@@ -1064,11 +989,20 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
     // --- Collect results back on the main task ---
     //
     // `buffer_unordered` yields results as futures complete. We process
-    // them sequentially here: merge Sightings into each kind's map, save
-    // it, mark the (Shard, kind) pairs as done, and optionally delete files.
+    // them sequentially here: write each done kind's Sightings to the
+    // store, mark the (Shard, kind) pair done, and optionally delete files.
     //
-    // This is a key design choice: concurrent *work*, sequential *merging*.
+    // This is a key design choice: concurrent *work*, sequential *writing*.
     // No locks, no race conditions — the simplest correct approach.
+    //
+    // ## Writes pause the downloads
+    //
+    // The Shard futures are not spawned: `buffer_unordered` polls them, and
+    // only when this loop asks for the next result. While a Shard is
+    // written, the downloads in flight are not polled. A download left
+    // unpolled for `READ_TIMEOUT` fails on its next poll, data or not, so a
+    // write must stay well under it: one Shard's writes cost the same
+    // however much the store already holds.
     let mut process_count: usize = 0;
     let mut fail_count: usize = 0;
     let mut new_counts: BTreeMap<ArtifactKind, usize> =
@@ -1082,27 +1016,33 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
     futures::pin_mut!(shard_stream);
 
     while let Some(result) = shard_stream.next().await {
-        // For each done kind: merge, save its file, *then* mark the pair
+        // For each done kind: write its Sightings, *then* mark the pair
         // done. A crash or failed write in between leaves the pair
-        // unmarked, never marked with its Sightings unsaved (see
-        // `save_then_mark`). A kind whose save failed is left undone, like
+        // unmarked, never marked with its Sightings missing (see
+        // `save_then_mark`). A kind whose write failed is left undone, like
         // one whose Archive failed.
         let mut undone = result.undone;
+        let store_start = Instant::now();
+        let wrote_any = !result.found.is_empty();
         for (kind, findings) in result.found {
-            // Extractors only run for requested kinds, and every
-            // requested kind was loaded. Inserting an empty map here
-            // instead would overwrite a results file never loaded.
-            let all = results
-                .get_mut(&kind)
-                .expect("results are loaded for every requested kind");
-            let count_before = all.len();
-            all.merge(findings);
-            *new_counts.entry(kind).or_default() += all.len() - count_before;
-
-            if let Err(err) = save_then_mark(kind, all, &result.shard, &output_dir) {
-                eprintln!("  [{}] Error: {}", result.shard, err);
+            // Counted even when the write fails part-way: what it added
+            // is in the store, and won't be new to the next run.
+            let new_artifacts = new_counts.entry(kind).or_default();
+            let saved = save_then_mark(&mut store, kind, &findings, &result.shard, new_artifacts);
+            if let Err(err) = saved.await {
+                eprintln!(
+                    "  [{}] Error: cannot write {} to the store: {}",
+                    result.shard, kind, err
+                );
                 undone.push(kind);
             }
+        }
+        if wrote_any {
+            eprintln!(
+                "  [{}] Store time: {:.1}s",
+                result.shard,
+                store_start.elapsed().as_secs_f64()
+            );
         }
 
         if undone.is_empty() {
@@ -1110,7 +1050,7 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
             total_download += result.download_time;
             total_parse += result.parse_time;
         } else {
-            // Kinds whose save failed were pushed last: back to declaration
+            // Kinds whose write failed were pushed last: back to declaration
             // order, as in every other kind list.
             undone.sort();
             eprintln!(
@@ -1137,9 +1077,6 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
         eprintln!();
     }
 
-    // --- Final save (safety net) ---
-    save_all(&results, &output_dir);
-
     // --- Summary ---
     eprintln!(
         "\nSummary: {} processed, {} skipped, {} failed, new: {}",
@@ -1148,14 +1085,7 @@ async fn run_crawl(input: String, config: Config) -> ExitCode {
         fail_count,
         count_list(new_counts)
     );
-    eprintln!(
-        "Total in results: {}",
-        count_list(
-            results
-                .iter()
-                .map(|(&kind, findings)| (kind, findings.len()))
-        )
-    );
+    print_totals(&mut store, &kinds).await;
     if process_count > 0 {
         let avg_dl = total_download.as_secs_f64() / process_count as f64;
         let avg_parse = total_parse.as_secs_f64() / process_count as f64;
