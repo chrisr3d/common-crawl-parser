@@ -84,13 +84,24 @@ fn serve_once(respond: impl FnOnce(TcpStream) + Send + 'static) -> String {
     url
 }
 
+/// Announce 1,000 bytes and send 500.
+fn send_half(stream: &mut TcpStream) {
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n");
+    let _ = stream.write_all(&[b'x'; 500]);
+}
+
 /// Announce 1,000 bytes, send 500, then send nothing more, keeping the
 /// connection open until the client closes it.
 fn stall(mut stream: TcpStream) {
-    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n");
-    let _ = stream.write_all(&[b'x'; 500]);
+    send_half(&mut stream);
     // Blocks until the client closes the connection (the read returns 0).
     let _ = stream.read(&mut [0; 1]);
+}
+
+/// Announce 1,000 bytes, send 500, then close the connection: `stream` is
+/// dropped on return.
+fn cut_off(mut stream: TcpStream) {
+    send_half(&mut stream);
 }
 
 /// Answer with `status`, such as `404 Not Found`, and an empty body.
@@ -200,6 +211,22 @@ async fn stalled_download_to_memory_fails() {
         downloaded.unwrap_err().to_string(),
         "no data received for 0.5 s"
     );
+}
+
+/// The connection closed before the body announced: the Archive in memory
+/// would be cut short, so the download fails rather than hand it to the
+/// parser. A later run may receive it whole: the failure doesn't count.
+#[tokio::test]
+async fn download_to_memory_cut_off_fails() {
+    let url = serve_once(cut_off);
+    let client = HttpClient::new(READ_TIMEOUT).unwrap();
+
+    let downloaded = timeout(READ_TIMEOUT + MARGIN, download_to_memory(&client, &url))
+        .await
+        .expect("the cut-off download hung");
+
+    let error = downloaded.unwrap_err();
+    assert!(!download_failure_repeats(&*error), "{error}");
 }
 
 #[tokio::test]

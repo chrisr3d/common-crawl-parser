@@ -17,6 +17,9 @@
 // Two parser implementations:
 //   - `WarcRecordIter<R: BufRead>` — streaming parser for sequential reads
 //   - `WarcSliceIter<'a>` — slice parser for memory-mapped data (zero-copy)
+//
+// Both end where the data ends between two records, and fail with the same
+// error where it ends inside one (`cut_record`), whatever its type.
 
 use std::io::{self, BufRead, Read};
 
@@ -105,7 +108,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
             loop {
                 self.line_buf.clear();
                 match self.reader.read_line(&mut self.line_buf) {
-                    Ok(0) => return None, // EOF
+                    Ok(0) => return None, // EOF between records: the end
                     Ok(_) => {
                         if self.line_buf.starts_with("WARC/") {
                             break; // Found record start
@@ -130,7 +133,14 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
             loop {
                 self.line_buf.clear();
                 match self.reader.read_line(&mut self.line_buf) {
-                    Ok(0) => return None, // Unexpected EOF in headers
+                    // The data ends between `WARC/` and the blank line.
+                    Ok(0) => return Some(Err(cut_record())),
+                    // `read_line` returns a line without its `\n` only at
+                    // the end of the data: it ends inside this line, even a
+                    // blank one cut after its `\r`.
+                    Ok(_) if !self.line_buf.ends_with('\n') => {
+                        return Some(Err(cut_record()));
+                    }
                     Ok(_) => {
                         let trimmed = self.line_buf.trim();
                         if trimmed.is_empty() {
@@ -179,7 +189,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
 
             // Wanted record — read the body into a buffer.
             let mut body = vec![0u8; content_length];
-            if let Err(e) = self.reader.read_exact(&mut body) {
+            if let Err(e) = read_full(&mut self.reader, &mut body) {
                 return Some(Err(e));
             }
 
@@ -225,20 +235,60 @@ fn parse_ascii_usize(s: &str) -> usize {
     result
 }
 
+/// The error of data ending inside a record: in its headers, or before the
+/// end of its body, read or passed over.
+///
+/// ## The end of the data: normal end or error
+///
+/// A reader returning `Ok(0)` only says the data ended, not whether it
+/// could end there. Between records it can: that is the end of the
+/// Archive. Inside one it can't: the gzip stream ended cleanly, but the
+/// last record is cut. Reading that as the end would drop the rest of the
+/// Archive without a word, and mark its pair done.
+///
+/// The kind is `UnexpectedEof`, as `read_exact` gives; the message says
+/// what was cut, where `read_exact`'s says only `failed to fill whole
+/// buffer`. Both parsers return this error, so every Transport fails with
+/// the same message.
+fn cut_record() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "the Archive ends inside a record",
+    )
+}
+
+/// Fill `buf` from `reader`, failing with `cut_record` if the data ends
+/// first.
+///
+/// Like `read_exact`, which retries a read `Interrupted` by a signal. Not
+/// `read_exact` itself: its `UnexpectedEof` can't be told apart from the
+/// gzip decoder's own (a gzip member cut short), which comes out of `read`
+/// as an error and must pass up as it is.
+fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => return Err(cut_record()),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Skip `n` bytes from a reader by reading into a stack buffer and discarding.
 ///
 /// We can't use `seek` because gzip decoders don't support it — the data
 /// must be decompressed sequentially. So we read and discard using a 8 KB
-/// stack buffer to avoid heap allocation for the skip operation.
+/// stack buffer to avoid heap allocation for the skip operation. A body
+/// passed over must be complete too: data ending inside it fails.
 fn skip_bytes<R: Read>(reader: &mut R, mut n: usize) -> io::Result<()> {
     let mut buf = [0u8; 8192];
     while n > 0 {
         let to_read = n.min(buf.len());
-        let read = reader.read(&mut buf[..to_read])?;
-        if read == 0 {
-            break; // EOF — the record may have been truncated
-        }
-        n -= read;
+        read_full(reader, &mut buf[..to_read])?;
+        n -= to_read;
     }
     Ok(())
 }
@@ -267,6 +317,17 @@ pub struct WarcSlice<'a> {
 /// 16–32 bytes per CPU cycle.
 ///
 /// Body references are zero-copy `&[u8]` slices into the original data.
+///
+/// ## An iterator whose items can fail
+///
+/// The data can end inside a record, and that is an error, not the end of
+/// the records. `Option<WarcSlice>` can only say "here is one" or "there
+/// are no more", so each item is an `io::Result`, as `WarcRecordIter`'s:
+/// `None` still means the records ended where they may, `Some(Err(..))`
+/// that they didn't. A caller collecting into `Result<Vec<_>, _>` stops at
+/// the first error; one using `?` in a `for` loop returns it. The iterator
+/// itself returns `None` after its error, so a caller that ignores it
+/// doesn't loop forever.
 pub struct WarcSliceIter<'a> {
     data: &'a [u8],
     pos: usize,
@@ -287,14 +348,22 @@ impl<'a> WarcSliceIter<'a> {
             header_end_finder: memmem::Finder::new(b"\r\n\r\n"),
         }
     }
+
+    /// The data ends inside a record: return `cut_record`, and end the
+    /// iteration there, so the next call returns `None`.
+    fn end_inside_record(&mut self) -> Option<io::Result<WarcSlice<'a>>> {
+        self.pos = self.data.len();
+        Some(Err(cut_record()))
+    }
 }
 
 impl<'a> Iterator for WarcSliceIter<'a> {
-    type Item = WarcSlice<'a>;
+    type Item = io::Result<WarcSlice<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Find the next "WARC/" magic in the remaining data.
+            // Find the next "WARC/" magic in the remaining data. None left:
+            // the records ended between two of them, the normal end.
             let remaining = &self.data[self.pos..];
             let warc_finder = memmem::Finder::new(b"WARC/");
             let warc_start = warc_finder.find(remaining)?;
@@ -302,7 +371,9 @@ impl<'a> Iterator for WarcSliceIter<'a> {
 
             // Find the end of the header section (\r\n\r\n).
             let after_magic = &self.data[record_start..];
-            let header_end_offset = self.header_end_finder.find(after_magic)?;
+            let Some(header_end_offset) = self.header_end_finder.find(after_magic) else {
+                return self.end_inside_record(); // The data ends inside the headers.
+            };
             let body_start = record_start + header_end_offset + 4; // skip \r\n\r\n
 
             // Parse headers from the header section.
@@ -332,6 +403,13 @@ impl<'a> Iterator for WarcSliceIter<'a> {
                 }
             }
 
+            // The data ends inside the body, whether it is read or passed
+            // over. Compared as a length left, as `body_start +
+            // content_length` could overflow on a malformed Content-Length.
+            if content_length > self.data.len() - body_start {
+                return self.end_inside_record();
+            }
+
             // Advance past this record's body.
             let body_end = body_start + content_length;
             // Records are terminated by \r\n\r\n after the body.
@@ -342,16 +420,12 @@ impl<'a> Iterator for WarcSliceIter<'a> {
                 continue; // Skip records of other types
             }
 
-            if body_end > self.data.len() {
-                return None; // Truncated record at end of file
-            }
-
             // Zero-copy: the body and metadata are slices into the original mmap.
-            return Some(WarcSlice {
+            return Some(Ok(WarcSlice {
                 body: &self.data[body_start..body_end],
                 target_uri,
                 date,
-            });
+            }));
         }
     }
 }
@@ -504,7 +578,9 @@ mod tests {
     #[test]
     fn slice_parser_only_returns_response_records() {
         let data = make_warc_stream();
-        let records: Vec<_> = WarcSliceIter::new(&data, "response").collect();
+        let records: Vec<_> = WarcSliceIter::new(&data, "response")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(
             records.len(),
@@ -520,7 +596,9 @@ mod tests {
     #[test]
     fn slice_parser_extracts_metadata() {
         let data = make_warc_stream();
-        let records: Vec<_> = WarcSliceIter::new(&data, "response").collect();
+        let records: Vec<_> = WarcSliceIter::new(&data, "response")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(records[0].target_uri, b"https://example.com/page1");
         assert_eq!(records[0].date, b"2025-10-01T12:00:00Z");
@@ -538,7 +616,7 @@ mod tests {
                 .collect();
 
         let sliced: Vec<&[u8]> = WarcSliceIter::new(&data, "response")
-            .map(|s| s.body)
+            .map(|s| s.unwrap().body)
             .collect();
 
         assert_eq!(streaming.len(), sliced.len(), "Same number of records");
@@ -599,7 +677,9 @@ mod tests {
         assert_eq!(records[0].body, b"hello");
 
         // Slice parser
-        let records: Vec<_> = WarcSliceIter::new(&record, "response").collect();
+        let records: Vec<_> = WarcSliceIter::new(&record, "response")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body, b"hello");
     }

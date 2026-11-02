@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process;
 
 use cc_extract::{Format, ParseError, Shard, Transport, parse_archive};
-use common::{WarcBuilder, http_response, write_archive};
+use common::{WarcBuilder, gzip_member, http_response, write_archive};
 
 const ARCHIVE_NAME: &str = "CC-MAIN-20250101000000-20250101010101-00000.warc.gz";
 
@@ -67,7 +67,133 @@ fn corrupt_bytes_fail_in_a_way_that_repeats() {
         for (transport_name, transport) in on_every_transport(&test_name, &bytes) {
             let error = parse_error(transport);
             assert!(error.repeats(), "{case} on {transport_name}: {error}");
+            // Where in the Archive: some byte of its size.
+            let message = error.to_string();
+            let (_, size) = position(&message);
+            assert_eq!(
+                size,
+                bytes.len() as u64,
+                "{case} on {transport_name}: {message}"
+            );
         }
+    }
+}
+
+/// The gzip stream may end cleanly with the last record unfinished: its
+/// last member holds only the start of it. However the record is cut, and
+/// whether its body is read or passed over, that is the Archive's bytes
+/// failing, with the same message on every Transport: the record parsers
+/// must not read it as the end of the records.
+#[test]
+fn a_record_cut_short_fails_in_a_way_that_repeats() {
+    let cases: [(&str, &[u8]); 4] = [
+        (
+            "in_its_headers",
+            b"WARC/1.0\r\nWARC-Type: response\r\nContent-Len",
+        ),
+        // Inside the blank line ending the headers: the record is cut even
+        // with no body to come.
+        (
+            "in_its_blank_line",
+            b"WARC/1.0\r\nWARC-Type: warcinfo\r\nContent-Length: 0\r\n\r",
+        ),
+        // A record of a type the parsers skip, its body passed over unread.
+        (
+            "in_a_passed_over_body",
+            b"WARC/1.0\r\nWARC-Type: request\r\nContent-Length: 100\r\n\r\nGET / HTTP/1.1\r\n",
+        ),
+        (
+            "in_a_read_body",
+            b"WARC/1.0\r\nWARC-Type: response\r\nContent-Length: 100\r\n\r\nHTTP/1.1 200 OK\r\n",
+        ),
+    ];
+
+    for (case, cut_record) in cases {
+        let mut bytes = archive();
+        bytes.extend(gzip_member(cut_record));
+        let test_name = format!("a_record_cut_short_{case}");
+        for (transport_name, transport) in on_every_transport(&test_name, &bytes) {
+            let error = parse_error(transport);
+            assert!(error.repeats(), "{case} on {transport_name}: {error}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the Archive ends inside a record (at byte {0} of {0})",
+                    bytes.len()
+                ),
+                "{case} on {transport_name}"
+            );
+        }
+    }
+}
+
+/// `len` bytes that gzip can't compress, different for each `seed`: an
+/// xorshift generator's output.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+/// The position a `Corrupt` error's message ends with, `(at byte X of Y)`,
+/// as `(X, Y)`. Panics if it has none.
+fn position(message: &str) -> (u64, u64) {
+    let start = message.rfind("(at byte ").expect(message);
+    let numbers = message[start + "(at byte ".len()..]
+        .strip_suffix(')')
+        .expect(message);
+    let (at, size) = numbers.split_once(" of ").expect(message);
+    (at.parse().expect(message), size.parse().expect(message))
+}
+
+/// A gzip member damaged in the middle of the Archive fails where it is, not
+/// at the end: the position the error gives lies past the damage, by at most
+/// the rest of its member (whose checksum is checked at its end) and one
+/// read of the gzip decoder, 32 KiB. So the Archive is a few times that, in
+/// records gzip can't shrink.
+#[test]
+fn a_member_damaged_in_the_middle_fails_where_it_is() {
+    const PAGE_SIZE: usize = 64 * 1024;
+    let members: Vec<Vec<u8>> = (1..=3)
+        .map(|n| {
+            let page_url = format!("https://example.com/{n}");
+            WarcBuilder::new()
+                .response(&page_url, "2025-01-01T00:00:01Z", &noise(n, PAGE_SIZE))
+                .finish()
+        })
+        .collect();
+    let middle_of_second = members[0].len() + members[1].len() / 2;
+    let end_of_second = members[0].len() + members[1].len();
+    let mut bytes = members.concat();
+    for byte in &mut bytes[middle_of_second..middle_of_second + 16] {
+        *byte = !*byte;
+    }
+
+    let messages: Vec<(&str, String)> = on_every_transport("a_member_damaged", &bytes)
+        .into_iter()
+        .map(|(transport_name, transport)| {
+            let error = parse_error(transport);
+            assert!(error.repeats(), "on {transport_name}: {error}");
+            (transport_name, error.to_string())
+        })
+        .collect();
+
+    let (_, disk) = &messages[0];
+    let (at, size) = position(disk);
+    assert_eq!(size, bytes.len() as u64, "{disk}");
+    let latest = (end_of_second + 32 * 1024) as u64;
+    assert!(
+        middle_of_second as u64 <= at && at <= latest && latest < size,
+        "{disk}"
+    );
+    for (transport_name, message) in &messages[1..] {
+        assert_eq!(message, disk, "{transport_name} differs from disk");
     }
 }
 
@@ -96,6 +222,8 @@ fn local_file_failures_do_not_repeat() {
     for (case, transport) in cases {
         let error = parse_error(transport);
         assert!(!error.repeats(), "{case}: {error}");
+        // The Archive's bytes are not to blame: no position in them.
+        assert!(!error.to_string().contains("at byte"), "{case}: {error}");
     }
 }
 
@@ -115,4 +243,5 @@ fn an_mmap_copy_that_cannot_be_created_does_not_repeat() {
     let error = parse_error(Transport::Mmap(path));
 
     assert!(!error.repeats(), "{error}");
+    assert!(!error.to_string().contains("at byte"), "{error}");
 }

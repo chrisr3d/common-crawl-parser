@@ -101,9 +101,7 @@ impl WarcBuilder {
         record.extend_from_slice(block);
         record.extend_from_slice(b"\r\n\r\n");
 
-        let mut member = GzEncoder::new(Vec::new(), Compression::default());
-        member.write_all(&record).unwrap();
-        self.archive.extend(member.finish().unwrap());
+        self.archive.extend(gzip_member(&record));
         self
     }
 
@@ -180,6 +178,14 @@ impl WarcBuilder {
     pub fn finish(self) -> Vec<u8> {
         self.archive
     }
+}
+
+/// `bytes` compressed as one gzip member: an Archive is a run of them, one
+/// per record. A test builds a broken record with it, such as one cut short.
+pub fn gzip_member(bytes: &[u8]) -> Vec<u8> {
+    let mut member = GzEncoder::new(Vec::new(), Compression::default());
+    member.write_all(bytes).unwrap();
+    member.finish().unwrap()
 }
 
 /// Build an HTTP `200 OK` response: status line, `headers`, blank line, `body`.

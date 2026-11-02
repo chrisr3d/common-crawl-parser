@@ -47,6 +47,7 @@ pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
 pub use plan::{FormatRequirement, Plan, PlanError};
 pub use store::{KvrocksStore, StoreAddress};
 
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -608,9 +609,24 @@ const PROGRESS_EVERY: u64 = 10_000;
 /// Why an Archive couldn't be parsed.
 #[derive(Debug)]
 pub enum ParseError {
-    /// Its bytes can't be read as an Archive: not gzip, cut short, a
-    /// malformed record. Parsing them again fails the same way.
-    Corrupt(io::Error),
+    /// Its bytes can't be read as an Archive: not gzip, a gzip member
+    /// damaged or cut short, data ending inside a record. Parsing them
+    /// again fails the same way.
+    ///
+    /// The message says where it broke, `(at byte <at> of <size>)`: whether
+    /// damaged Archives break at their start, or further in, with records
+    /// before and after the fault that reading on could keep.
+    Corrupt {
+        error: io::Error,
+        /// How many compressed bytes were read when the error came: past
+        /// the fault, as the gzip decoder reads 32 KiB at a time and checks
+        /// a member's checksum only at its end, by up to the rest of the
+        /// member and one read. A record cut short at the end of the data
+        /// is found once all of them were read: then `at` is `size`.
+        at: u64,
+        /// The size of the compressed Archive.
+        size: u64,
+    },
     /// A local file couldn't be opened, read or written: the Archive in
     /// `download/` missing or unreadable, the mmap copy that can't be
     /// created, a disk full while writing it. Nothing says the Archive is
@@ -622,31 +638,19 @@ impl ParseError {
     /// Whether parsing the same bytes would fail again: such a failure
     /// counts toward giving the Archive up.
     pub fn repeats(&self) -> bool {
-        matches!(self, ParseError::Corrupt(_))
-    }
-
-    /// An error met while decoding an Archive: `Local` if a local file
-    /// failed (`LocalFile` marked it), `Corrupt` otherwise.
-    ///
-    /// `io::Error::get_ref` returns the error an `io::Error` was made from
-    /// with `io::Error::new`, if any; `is::<T>()` says whether it is a `T`.
-    fn from_decoding(err: io::Error) -> Self {
-        if err
-            .get_ref()
-            .is_some_and(|inner| inner.is::<LocalFileError>())
-        {
-            ParseError::Local(err)
-        } else {
-            ParseError::Corrupt(err)
-        }
+        matches!(self, ParseError::Corrupt { .. })
     }
 }
 
-/// The underlying error's message: what failed, whichever the kind.
+/// The underlying error's message: what failed, whichever the kind, and
+/// for the Archive's bytes, where.
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ParseError::Corrupt(err) | ParseError::Local(err) => err.fmt(f),
+            ParseError::Corrupt { error, at, size } => {
+                write!(f, "{error} (at byte {at} of {size})")
+            }
+            ParseError::Local(error) => error.fmt(f),
         }
     }
 }
@@ -665,7 +669,7 @@ impl Error for ParseError {}
 /// it: `io::Error::new(kind, error)` builds an `io::Error` carrying any
 /// error inside, here a `LocalFileError`, and the readers above pass it up
 /// as it is. Its kind is kept, so a reader retrying on `Interrupted` still
-/// does. `ParseError::from_decoding` then looks for the mark.
+/// does. `Position::error` then looks for the mark.
 struct LocalFile<T>(T);
 
 impl<R: Read> Read for LocalFile<R> {
@@ -704,6 +708,80 @@ impl fmt::Display for LocalFileError {
 
 impl Error for LocalFileError {}
 
+/// How far reading a compressed Archive got: the bytes read so far, of its
+/// size. A `Counted` reader under the gzip decoder adds to it; an error met
+/// reading the records takes its position from it (`error`).
+///
+/// ## `Cell`: a count both sides can reach
+///
+/// The decoder takes ownership of the reader it reads, and keeps it until
+/// parsing ends; the count is wanted while it still holds it, when an
+/// error comes. A `&mut u64` in the reader would forbid any other access
+/// to the count for as long as the decoder lives. A `Cell<u64>` can be
+/// changed through a shared reference (`set`) and read through one
+/// (`get`): the reader holds one `&Position`, the caller another, and the
+/// borrow checker accepts both. `Cell` only hands out copies of its value,
+/// never a reference into it, which is what makes this safe; it is also not
+/// `Sync`, so the compiler keeps both sides on one thread.
+struct Position {
+    bytes_read: Cell<u64>,
+    size: u64,
+}
+
+impl Position {
+    /// The start of an Archive of `size` compressed bytes.
+    fn new(size: u64) -> Self {
+        Position {
+            bytes_read: Cell::new(0),
+            size,
+        }
+    }
+
+    /// `compressed`, its reads counted here.
+    fn count<R: Read>(&self, compressed: R) -> Counted<'_, R> {
+        Counted {
+            inner: compressed,
+            position: self,
+        }
+    }
+
+    /// `error`, met reading the Archive's records (decoding them, or
+    /// finding one cut short): `Local` if a local file failed (`LocalFile`
+    /// marked it), `Corrupt` at this position otherwise.
+    ///
+    /// `io::Error::get_ref` returns the error an `io::Error` was made from
+    /// with `io::Error::new`, if any; `is::<T>()` says whether it is a `T`.
+    fn error(&self, error: io::Error) -> ParseError {
+        if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<LocalFileError>())
+        {
+            ParseError::Local(error)
+        } else {
+            ParseError::Corrupt {
+                error,
+                at: self.bytes_read.get(),
+                size: self.size,
+            }
+        }
+    }
+}
+
+/// A reader adding the bytes read through it to a `Position`.
+struct Counted<'a, R> {
+    inner: R,
+    position: &'a Position,
+}
+
+impl<R: Read> Read for Counted<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let bytes_read = &self.position.bytes_read;
+        bytes_read.set(bytes_read.get() + n as u64);
+        Ok(n)
+    }
+}
+
 /// Read every page record of one `format` Archive once and hand it to
 /// every extractor.
 ///
@@ -738,11 +816,13 @@ pub fn parse_archive(
         // error then comes from the bytes.
         Transport::Disk(path) => {
             let file = fs::File::open(path).map_err(ParseError::Local)?;
-            parse_stream(LocalFile(file), format, shard, extractors)
-                .map_err(ParseError::from_decoding)?
+            let size = file.metadata().map_err(ParseError::Local)?.len();
+            parse_stream(LocalFile(file), size, format, shard, extractors)?
         }
-        Transport::Memory(data) => parse_stream(Cursor::new(data), format, shard, extractors)
-            .map_err(ParseError::from_decoding)?,
+        Transport::Memory(data) => {
+            let size = data.len() as u64;
+            parse_stream(Cursor::new(data), size, format, shard, extractors)?
+        }
         Transport::Mmap(path) => parse_mmap(&path, format, shard, extractors)?,
     };
 
@@ -763,18 +843,24 @@ pub fn parse_archive(
 ///
 /// `MultiGzDecoder` (not `GzDecoder`) because Common Crawl gzips every
 /// record as its own gzip member; `GzDecoder` would stop after the first.
+///
+/// `size` is the length of `compressed`, for the position an error gives.
 fn parse_stream<R: Read>(
     compressed: R,
+    size: u64,
     format: Format,
     shard: &Shard,
     extractors: &mut [Box<dyn Extractor>],
-) -> io::Result<u64> {
-    let decoder = MultiGzDecoder::new(compressed);
+) -> Result<u64, ParseError> {
+    // Declared before the readers borrowing it: locals are dropped in
+    // reverse order, so it outlives them.
+    let position = Position::new(size);
+    let decoder = MultiGzDecoder::new(position.count(compressed));
     let records = warc_parser::WarcRecordIter::new(BufReader::new(decoder), format.record_type());
     let mut records_scanned = 0;
 
     for record in records {
-        let record = record?;
+        let record = record.map_err(|err| position.error(err))?;
         // The `PageRecord` borrows the record's own buffers: nothing is
         // copied, and it is dropped before the next record is read.
         if let Some(page) = to_page_record(format, &record.target_uri, &record.date, &record.body) {
@@ -840,8 +926,10 @@ fn parse_stream<R: Read>(
 /// the function returns (`TempFile`), and a killed process leaves it
 /// behind.
 ///
-/// Only decompressing reads the Archive's bytes: every other step fails on
-/// a local file (`ParseError::Local`), and so does writing the copy.
+/// Decompressing and reading the records fail on the Archive's bytes
+/// (`ParseError::Corrupt`): a record cut short shows only in the copy, once
+/// every compressed byte was read. Every other step fails on a local file
+/// (`ParseError::Local`), and so does writing the copy.
 fn parse_mmap(
     path: &Path,
     format: Format,
@@ -874,11 +962,13 @@ fn parse_mmap(
         _copy_name = TempFile::new(copy_path);
     }
     let archive = fs::File::open(path).map_err(ParseError::Local)?;
+    let size = archive.metadata().map_err(ParseError::Local)?.len();
+    let position = Position::new(size);
     io::copy(
-        &mut MultiGzDecoder::new(LocalFile(archive)),
+        &mut MultiGzDecoder::new(position.count(LocalFile(archive))),
         &mut LocalFile(&mut copy),
     )
-    .map_err(ParseError::from_decoding)?;
+    .map_err(|err| position.error(err))?;
     let copy_size = copy.metadata().map_err(ParseError::Local)?.len();
     eprintln!(
         "  [{}] Decompressed: {:.1} MB",
@@ -892,6 +982,8 @@ fn parse_mmap(
     let mut records_scanned = 0;
 
     for record in warc_parser::WarcSliceIter::new(&mmap, format.record_type()) {
+        // A record cut short, found once all the compressed bytes were read.
+        let record = record.map_err(|err| position.error(err))?;
         // The slice parser returns raw header bytes; extractors want `&str`.
         // `from_utf8_lossy` returns a `Cow`: it borrows when the bytes are
         // valid UTF-8 (the usual case) and allocates only to replace
