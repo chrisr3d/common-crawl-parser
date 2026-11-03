@@ -2,6 +2,8 @@
 //
 // This module ties the pieces together:
 //   - Downloading Archives from Common Crawl (async with reqwest)
+//   - `spawn_each`: running each Shard in a task of its own, so downloads
+//     go on while finished Shards are written
 //   - `parse_archive`: reading every record of an Archive once and handing
 //     it to each extractor
 //   - The results store: Sightings and done marks in kvrocks (`store`)
@@ -53,13 +55,14 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read};
 use std::iter;
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process;
 use std::time::Duration;
 
 use flate2::read::MultiGzDecoder;
-use futures::stream::{self, Stream, TryStreamExt};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 // ---------------------------------------------------------------------------
@@ -576,6 +579,61 @@ pub async fn download_to_memory(
     );
 
     Ok(buffer)
+}
+
+// ---------------------------------------------------------------------------
+// Running Shards concurrently
+// ---------------------------------------------------------------------------
+
+/// Run each of `futures` in a task of its own, at most `jobs` at once, and
+/// yield their outputs as they finish, in any order.
+///
+/// ## Why tasks
+///
+/// `buffer_unordered(jobs)` alone runs the futures inside the stream: they
+/// make progress only while the stream is polled, that is while its
+/// consumer waits for the next output. The crawl's consumer writes each
+/// finished Shard to the store in between; a download left unpolled for
+/// the client's read timeout fails on its next poll, data or not. So a
+/// store write lasting longer than that would fail every download in
+/// flight.
+///
+/// `tokio::spawn` hands a future to the runtime, which runs it on its own
+/// whatever the stream's consumer is doing; the stream then only waits for
+/// each task's `JoinHandle`. A future is spawned when `buffer_unordered`
+/// starts it, so no more than `jobs` run or wait to be taken at once, and
+/// a slow consumer holds the next ones back instead of failing them.
+///
+/// ## `Send + 'static`
+///
+/// The runtime may run a task on any of its threads (`Send`) and for as
+/// long as it takes, past the function that spawned it (`'static`): a
+/// spawned future owns everything it uses, borrowing nothing from its
+/// caller. Its output comes back across threads too.
+///
+/// ## A panicking task
+///
+/// A panic inside a task ends that task, not the process: the
+/// `JoinHandle` returns it as a `JoinError`. It is resumed here, in the
+/// consumer, as it would have gone on without the task: a bug, not a Shard
+/// to skip quietly. (A `JoinError` can also mean the task was cancelled,
+/// which none of these ever is: `into_panic` itself panics then.)
+pub fn spawn_each<F>(
+    futures: impl IntoIterator<Item = F>,
+    jobs: usize,
+) -> impl Stream<Item = F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    stream::iter(futures)
+        .map(|future| async move {
+            match tokio::spawn(future).await {
+                Ok(output) => output,
+                Err(err) => panic::resume_unwind(err.into_panic()),
+            }
+        })
+        .buffer_unordered(jobs)
 }
 
 // ---------------------------------------------------------------------------

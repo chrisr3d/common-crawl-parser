@@ -10,7 +10,8 @@
 // real threads — `spawn_blocking` bridges the two worlds.
 //
 // New concepts: async/await, Tokio runtime, reqwest streaming, spawn_blocking,
-// bounded concurrency with buffer_unordered, Arc for shared ownership.
+// bounded concurrency with buffer_unordered over spawned tasks, Arc for
+// shared ownership.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env::{self, VarError};
@@ -22,7 +23,7 @@ use std::process::{self, ExitCode};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 
 use cc_extract::inline_favicon::save_images;
 use cc_extract::store::{
@@ -33,7 +34,7 @@ use cc_extract::{
     ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
     HttpClient, InlineFaviconExtractor, KvrocksStore, OnionEngine, OnionExtractor, Plan,
     READ_TIMEOUT, Shard, StoreAddress, Transport, download_archive, download_archive_to_memory,
-    download_failure_repeats, download_path, parse_archive,
+    download_failure_repeats, download_path, parse_archive, spawn_each,
 };
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +1081,7 @@ async fn run_crawl(config: Config) -> ExitCode {
     // of it and `--max-memory` by the largest estimated Plan among the
     // scheduled Shards: the worst case of what one job can hold. Several
     // processes on one machine each see all of its available RAM;
-    // `--max-memory` is one process's share. `buffer_unordered` then
+    // `--max-memory` is one process's share. `spawn_each` then
     // provides natural backpressure: when a job finishes and frees its
     // buffers, the next one starts and allocates new ones.
     let effective_jobs = if transport_choice == TransportChoice::Memory {
@@ -1141,190 +1142,187 @@ async fn run_crawl(config: Config) -> ExitCode {
 
     let delete = config.delete;
 
-    // --- Concurrent pipeline with `buffer_unordered` ---
+    // --- Concurrent pipeline with `spawn_each` ---
     //
     // ## How the pipeline works
     //
-    // `stream::iter(work_items)` creates a stream of scheduled Shards.
-    // `.map(|item| async { ... })` transforms each into a future that
-    // downloads + parses one Shard's Archives.
+    // `work_items.into_iter().map(|item| async move { ... })` transforms
+    // each scheduled Shard into a future that downloads + parses its
+    // Archives.
     //
-    // `.buffer_unordered(jobs)` is the concurrency controller:
-    // - It polls up to `jobs` futures simultaneously
+    // `spawn_each(futures, jobs)` is the concurrency controller:
+    // - It runs up to `jobs` futures at once, each in a Tokio task of its own
     // - Results are yielded as soon as any future completes (not in order)
-    // - When one completes, the next pending future starts
+    // - When one is taken, the next pending future starts
     //
     // This gives us bounded concurrency without manual semaphore management.
     // "Unordered" means faster Shards finish first — we don't block
-    // waiting for a slow download just because it started earlier.
-    let shard_stream = stream::iter(work_items)
-        .map(
-            |ScheduledShard {
-                 index: idx,
-                 shard,
-                 plan,
-                 archives,
-                 partly_given_up,
-             }| {
-                // Clone the shared client for this task. The `reqwest::Client`
-                // in `HttpClient` is an `Arc` inside, so the clone is cheap
-                // (just increments a reference count) and shares the
-                // connection pool.
-                let client = client.clone();
+    // waiting for a slow download just because it started earlier. A
+    // spawned future must own everything it uses: `async move` moves the
+    // Shard's values and a clone of the client into it.
+    let shard_futures = work_items.into_iter().map(
+        |ScheduledShard {
+             index: idx,
+             shard,
+             plan,
+             archives,
+             partly_given_up,
+         }| {
+            // Clone the shared client for this task. The `reqwest::Client`
+            // in `HttpClient` is an `Arc` inside, so the clone is cheap
+            // (just increments a reference count) and shares the
+            // connection pool.
+            let client = client.clone();
 
-                async move {
-                    let kinds = plan.kinds();
-                    eprintln!(
-                        "[{}] {}: extracting {} from {}",
-                        idx,
-                        shard,
-                        kind_list(&kinds),
-                        plan.formats()
-                    );
+            async move {
+                let kinds = plan.kinds();
+                eprintln!(
+                    "[{}] {}: extracting {} from {}",
+                    idx,
+                    shard,
+                    kind_list(&kinds),
+                    plan.formats()
+                );
 
-                    // --- Download phase ---
-                    //
-                    // Every Archive of the Plan, one after the other (Shards
-                    // already download concurrently). A failed download is
-                    // reported and the Shard carries on: the kinds that don't
-                    // read that Archive can still finish.
-                    let download_start = Instant::now();
-                    let mut downloaded: Vec<(ArchivePath, Transport)> = Vec::new();
-                    let mut failures: Vec<Failure> = Vec::new();
-                    for archive in archives {
-                        match fetch(&client, &archive, transport_choice).await {
-                            Ok(transport) => downloaded.push((archive, transport)),
-                            Err(err) => {
-                                let message = format!("Download error: {}", err);
-                                eprintln!("  [{}] {}", archive.file_name(), message);
-                                // `&*err`: `*` reaches the error inside the
-                                // `Box`, `&` borrows it, as the
-                                // `&dyn Error` the function reads.
-                                failures.push(Failure {
-                                    counted: download_failure_repeats(&*err),
-                                    archive,
-                                    message,
-                                });
-                            }
+                // --- Download phase ---
+                //
+                // Every Archive of the Plan, one after the other (Shards
+                // already download concurrently). A failed download is
+                // reported and the Shard carries on: the kinds that don't
+                // read that Archive can still finish.
+                let download_start = Instant::now();
+                let mut downloaded: Vec<(ArchivePath, Transport)> = Vec::new();
+                let mut failures: Vec<Failure> = Vec::new();
+                for archive in archives {
+                    match fetch(&client, &archive, transport_choice).await {
+                        Ok(transport) => downloaded.push((archive, transport)),
+                        Err(err) => {
+                            let message = format!("Download error: {}", err);
+                            eprintln!("  [{}] {}", archive.file_name(), message);
+                            // `&*err`: `*` reaches the error inside the
+                            // `Box`, `&` borrows it, as the
+                            // `&dyn Error` the function reads.
+                            failures.push(Failure {
+                                counted: download_failure_repeats(&*err),
+                                archive,
+                                message,
+                            });
                         }
                     }
-                    let download_time = download_start.elapsed();
-                    eprintln!(
-                        "  [{}] Download time: {:.1}s",
-                        shard,
-                        download_time.as_secs_f64()
-                    );
+                }
+                let download_time = download_start.elapsed();
+                eprintln!(
+                    "  [{}] Download time: {:.1}s",
+                    shard,
+                    download_time.as_secs_f64()
+                );
 
-                    if downloaded.is_empty() {
-                        return ShardResult {
-                            shard,
-                            plan,
-                            partly_given_up,
-                            found: Vec::new(),
-                            undone: kinds,
-                            parsed: Vec::new(),
-                            failures,
-                            download_time,
-                            parse_time: Duration::ZERO,
-                        };
-                    }
-
-                    // --- Parse on the blocking thread pool ---
-                    //
-                    // ## `spawn_blocking` — bridging sync and async
-                    //
-                    // `parse_archive` is CPU-bound (gzip decompression + search).
-                    // Running it directly on an async task would block the Tokio
-                    // worker thread, starving other async tasks (downloads).
-                    //
-                    // `spawn_blocking` moves the work to Tokio's dedicated
-                    // blocking thread pool, which has many more threads and
-                    // expects blocking work. The `.await` here suspends the
-                    // async task until the blocking work finishes, freeing the
-                    // worker thread for other downloads.
-                    //
-                    // With the memory Transport, the `Vec<u8>` inside each
-                    // `Transport::Memory` is *moved* into the blocking closure —
-                    // a zero-cost ownership transfer (no data copying). After the
-                    // move, the async task no longer owns the buffers, and the
-                    // compiler prevents use-after-move.
-                    //
-                    // The closure takes ownership of what it captures; the
-                    // clones keep a `shard` and a `plan` here for the result.
-                    let parse_shard = shard.clone();
-                    let parse_plan = plan.clone();
-
-                    let parse_start = Instant::now();
-                    let parse_result = tokio::task::spawn_blocking(move || {
-                        parse_archives(
-                            downloaded,
-                            &parse_shard,
-                            &parse_plan,
-                            onion_engine,
-                            transport_choice,
-                        )
-                    })
-                    .await;
-                    let parse_time = parse_start.elapsed();
-
-                    // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
-                    // the task panicked: then no Archive counts as parsed, and
-                    // no failure is counted against any (a bug, not a sign of
-                    // a bad Archive).
-                    let (mut by_kind, parsed, parse_failures) =
-                        parse_result.unwrap_or_else(|err| {
-                            eprintln!("  [{}] Task panic: {}", shard, err);
-                            (BTreeMap::new(), Vec::new(), Vec::new())
-                        });
-                    failures.extend(parse_failures);
-                    eprintln!(
-                        "  [{}] Parsing time: {:.1}s",
-                        shard,
-                        parse_time.as_secs_f64()
-                    );
-
-                    // A kind is done only if every Archive it reads parsed; the
-                    // others' partial Sightings are dropped.
-                    let parsed_formats: FormatSet =
-                        parsed.iter().map(ArchivePath::format).collect();
-                    let (done, undone) = plan.split_done(parsed_formats);
-                    let found: Vec<(ArtifactKind, Findings)> = done
-                        .into_iter()
-                        .map(|kind| {
-                            let findings = by_kind.remove(&kind);
-                            (kind, findings.unwrap_or_else(|| Findings::empty(kind)))
-                        })
-                        .collect();
-
-                    if !found.is_empty() {
-                        eprintln!(
-                            "  [{}] Found {}",
-                            shard,
-                            count_list(
-                                found.iter().map(|(kind, findings)| (*kind, findings.len()))
-                            )
-                        );
-                    }
-
-                    ShardResult {
+                if downloaded.is_empty() {
+                    return ShardResult {
                         shard,
                         plan,
                         partly_given_up,
-                        found,
-                        undone,
-                        parsed,
+                        found: Vec::new(),
+                        undone: kinds,
+                        parsed: Vec::new(),
                         failures,
                         download_time,
-                        parse_time,
-                    }
+                        parse_time: Duration::ZERO,
+                    };
                 }
-            },
-        )
-        .buffer_unordered(effective_jobs);
+
+                // --- Parse on the blocking thread pool ---
+                //
+                // ## `spawn_blocking` — bridging sync and async
+                //
+                // `parse_archive` is CPU-bound (gzip decompression + search).
+                // Running it directly on an async task would block the Tokio
+                // worker thread, starving other async tasks (downloads).
+                //
+                // `spawn_blocking` moves the work to Tokio's dedicated
+                // blocking thread pool, which has many more threads and
+                // expects blocking work. The `.await` here suspends the
+                // async task until the blocking work finishes, freeing the
+                // worker thread for other downloads.
+                //
+                // With the memory Transport, the `Vec<u8>` inside each
+                // `Transport::Memory` is *moved* into the blocking closure —
+                // a zero-cost ownership transfer (no data copying). After the
+                // move, the async task no longer owns the buffers, and the
+                // compiler prevents use-after-move.
+                //
+                // The closure takes ownership of what it captures; the
+                // clones keep a `shard` and a `plan` here for the result.
+                let parse_shard = shard.clone();
+                let parse_plan = plan.clone();
+
+                let parse_start = Instant::now();
+                let parse_result = tokio::task::spawn_blocking(move || {
+                    parse_archives(
+                        downloaded,
+                        &parse_shard,
+                        &parse_plan,
+                        onion_engine,
+                        transport_choice,
+                    )
+                })
+                .await;
+                let parse_time = parse_start.elapsed();
+
+                // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
+                // the task panicked: then no Archive counts as parsed, and
+                // no failure is counted against any (a bug, not a sign of
+                // a bad Archive).
+                let (mut by_kind, parsed, parse_failures) = parse_result.unwrap_or_else(|err| {
+                    eprintln!("  [{}] Task panic: {}", shard, err);
+                    (BTreeMap::new(), Vec::new(), Vec::new())
+                });
+                failures.extend(parse_failures);
+                eprintln!(
+                    "  [{}] Parsing time: {:.1}s",
+                    shard,
+                    parse_time.as_secs_f64()
+                );
+
+                // A kind is done only if every Archive it reads parsed; the
+                // others' partial Sightings are dropped.
+                let parsed_formats: FormatSet = parsed.iter().map(ArchivePath::format).collect();
+                let (done, undone) = plan.split_done(parsed_formats);
+                let found: Vec<(ArtifactKind, Findings)> = done
+                    .into_iter()
+                    .map(|kind| {
+                        let findings = by_kind.remove(&kind);
+                        (kind, findings.unwrap_or_else(|| Findings::empty(kind)))
+                    })
+                    .collect();
+
+                if !found.is_empty() {
+                    eprintln!(
+                        "  [{}] Found {}",
+                        shard,
+                        count_list(found.iter().map(|(kind, findings)| (*kind, findings.len())))
+                    );
+                }
+
+                ShardResult {
+                    shard,
+                    plan,
+                    partly_given_up,
+                    found,
+                    undone,
+                    parsed,
+                    failures,
+                    download_time,
+                    parse_time,
+                }
+            }
+        },
+    );
+    let shard_stream = spawn_each(shard_futures, effective_jobs);
 
     // --- Collect results back on the main task ---
     //
-    // `buffer_unordered` yields results as futures complete. We process
+    // `spawn_each` yields results as futures complete. We process
     // them sequentially here: record the failures that count, save each
     // done kind's images (with `--save-images`), write its Sightings to the
     // store, mark the (Shard, kind) pair done, and optionally delete files.
@@ -1332,16 +1330,15 @@ async fn run_crawl(config: Config) -> ExitCode {
     // This is a key design choice: concurrent *work*, sequential *writing*.
     // No locks, no race conditions — the simplest correct approach.
     //
-    // ## Writes pause the downloads
+    // ## A slow store doesn't fail the downloads
     //
-    // The Shard futures are not spawned: `buffer_unordered` polls them, and
-    // only when this loop asks for the next result. While a Shard is
-    // written, the downloads in flight are not polled. A download left
-    // unpolled for `READ_TIMEOUT` fails on its next poll, data or not, so a
-    // write must stay well under it: one Shard's writes cost the same
-    // however much the store already holds.
+    // While a Shard is written, the Shards in flight go on downloading and
+    // parsing in their tasks; no new one starts until this loop asks for
+    // the next result. A store slowed by many writers holds the finished
+    // Shards back, at most `jobs` of them, instead of failing the downloads
+    // on `READ_TIMEOUT`.
     // `pin_mut!` pins the stream to the stack so we can poll it.
-    // This is needed because `buffer_unordered` returns a stream that
+    // This is needed because `spawn_each` returns a stream that
     // must be pinned to be polled (a Rust async trait requirement).
     futures::pin_mut!(shard_stream);
 
@@ -1400,10 +1397,10 @@ async fn run_crawl(config: Config) -> ExitCode {
             // image saved. One that can't be saved leaves the pair undone,
             // with nothing written to the store for it.
             //
-            // `save_images` blocks this task on file writes, as the store
-            // writes hold it. Inline favicons are few (100 Shards of CC-MAIN
-            // held 1.6 MB of them as base64, Sightings included): a Shard's
-            // are written well under the downloads' `READ_TIMEOUT`.
+            // `save_images` writes the files synchronously, holding this
+            // loop as the store writes do; the Shards in flight go on in
+            // their tasks meanwhile. Inline favicons are few (100 Shards of
+            // CC-MAIN held 1.6 MB of them as base64, Sightings included).
             if let Some(dir) = &config.save_images
                 && let Findings::InlineFavicons(favicons) = &findings
             {

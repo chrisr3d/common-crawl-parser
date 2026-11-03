@@ -252,8 +252,19 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// one connection, a task on the tokio runtime matching each reply to its
 /// command. The crawl writes from one loop, so one is enough; cloning it
 /// would not open another.
+///
+/// ## Opened again when lost
+///
+/// A `MultiplexedConnection` the server has dropped (a network fault, the
+/// store restarted) fails every command sent on it from then on. A call
+/// failing that way forgets it (`None`), and the next call opens a new
+/// one, from the `Client`, which keeps the address and the password: one
+/// lost connection fails the call that finds it gone, not the rest of the
+/// run. A store that stays down costs each call one attempt to connect,
+/// within `CONNECT_TIMEOUT`.
 pub struct KvrocksStore {
-    connection: MultiplexedConnection,
+    client: redis::Client,
+    connection: Option<MultiplexedConnection>,
 }
 
 impl KvrocksStore {
@@ -261,17 +272,49 @@ impl KvrocksStore {
     /// if given, and check that it answers (`PING`).
     pub async fn connect(address: &StoreAddress, password: Option<String>) -> StoreResult<Self> {
         let client = address.client(password)?;
-        let config = AsyncConnectionConfig::new()
-            .set_connection_timeout(Some(CONNECT_TIMEOUT))
-            .set_response_timeout(Some(RESPONSE_TIMEOUT));
-        let mut connection = client
-            .get_multiplexed_async_connection_with_config(&config)
-            .await?;
+        let mut connection = open_connection(&client).await?;
         redis::cmd("PING")
             .query_async::<()>(&mut connection)
             .await?;
-        Ok(KvrocksStore { connection })
+        Ok(KvrocksStore {
+            client,
+            connection: Some(connection),
+        })
     }
+
+    /// The connection, a new one if the last was lost.
+    ///
+    /// `take` moves the connection out of the `Option`, leaving `None`;
+    /// `insert` puts one back and returns a reference to it.
+    async fn connection(&mut self) -> redis::RedisResult<&mut MultiplexedConnection> {
+        let connection = match self.connection.take() {
+            Some(connection) => connection,
+            None => open_connection(&self.client).await?,
+        };
+        Ok(self.connection.insert(connection))
+    }
+
+    /// `result`, the connection forgotten if the error says it is lost:
+    /// the next call opens a new one. A timeout, or a command the store
+    /// refuses, keeps it.
+    fn forget_if_lost<T>(&mut self, result: redis::RedisResult<T>) -> StoreResult<T> {
+        if let Err(err) = &result
+            && err.is_unrecoverable_error()
+        {
+            self.connection = None;
+        }
+        Ok(result?)
+    }
+}
+
+/// A new connection from `client`, with the store's timeouts.
+async fn open_connection(client: &redis::Client) -> redis::RedisResult<MultiplexedConnection> {
+    let config = AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(CONNECT_TIMEOUT))
+        .set_response_timeout(Some(RESPONSE_TIMEOUT));
+    client
+        .get_multiplexed_async_connection_with_config(&config)
+        .await
 }
 
 impl Store for KvrocksStore {
@@ -290,7 +333,8 @@ impl Store for KvrocksStore {
         }
         // Both commands reply 1 when they changed something, 0 otherwise;
         // `redis` reads such an integer as a `bool`.
-        Ok(pipe.query_async(&mut self.connection).await?)
+        let result = pipe.query_async(self.connection().await?).await;
+        self.forget_if_lost(result)
     }
 
     async fn members(&mut self, key: &str) -> StoreResult<Vec<String>> {
@@ -318,7 +362,8 @@ impl Store for KvrocksStore {
         for key in keys {
             pipe.cmd("HGETALL").arg(key);
         }
-        Ok(pipe.query_async(&mut self.connection).await?)
+        let result = pipe.query_async(self.connection().await?).await;
+        self.forget_if_lost(result)
     }
 }
 
@@ -329,11 +374,11 @@ impl KvrocksStore {
     /// be read as: the caller's return type picks the conversion, a list of
     /// strings for `SMEMBERS`, a map for `HGETALL`, a number for `SCARD`.
     async fn read<T: FromRedisValue>(&mut self, command: &str, key: &str) -> StoreResult<T> {
-        let reply = redis::cmd(command)
+        let result = redis::cmd(command)
             .arg(key)
-            .query_async(&mut self.connection)
-            .await?;
-        Ok(reply)
+            .query_async(self.connection().await?)
+            .await;
+        self.forget_if_lost(result)
     }
 }
 

@@ -23,6 +23,10 @@
 //
 // The tests that stop at start-up pass a socket nothing listens on instead:
 // they never reach a store.
+//
+// One test here doesn't run the binary: the store's reconnection after the
+// server drops its connection, which a crawl can't time. It needs the same
+// throwaway kvrocks, and takes its turn like the others.
 
 // Each test crate compiles its own copy of `common` and uses only part of
 // it; `allow` silences the dead-code warnings for the rest.
@@ -34,11 +38,11 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use cc_extract::inline_favicon::sha256_hex;
-use cc_extract::store::{PASSWORD_VARIABLE, Store};
+use cc_extract::store::{PASSWORD_VARIABLE, Store, StoreResult, Write as StoreWrite};
 use cc_extract::{
     ArtifactKind, Findings, InlineFavicon, KvrocksStore, Shard, Sighting, StoreAddress,
 };
@@ -262,26 +266,67 @@ impl TestStore {
     /// past the crawl's own writes.
     fn command(&self, command: &[&str]) {
         self.runtime.block_on(async {
-            let client = self
-                .address
-                .client(env::var(PASSWORD_VARIABLE).ok())
-                .unwrap();
-            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            let mut connection = self.connection().await;
             let mut cmd = redis::cmd(command[0]);
             cmd.arg(&command[1..]);
             cmd.query_async::<()>(&mut connection).await.unwrap();
         });
     }
 
-    /// What `read` gives on a connection to the store.
-    fn read<T>(&self, read: impl AsyncFnOnce(&mut KvrocksStore) -> T) -> T {
+    /// The id of a new connection to the store, and the ids of every
+    /// connection the store has open, that one included (`CLIENT ID`,
+    /// `CLIENT LIST`).
+    fn client_ids(&self) -> (String, BTreeSet<String>) {
         self.runtime.block_on(async {
-            let password = env::var(PASSWORD_VARIABLE).ok();
-            let mut store = KvrocksStore::connect(&self.address, password)
+            let mut connection = self.connection().await;
+            let own: i64 = redis::cmd("CLIENT")
+                .arg("ID")
+                .query_async(&mut connection)
                 .await
                 .unwrap();
-            read(&mut store).await
+            // One line per connection: `id=3 addr=… cmd=…`.
+            let list: String = redis::cmd("CLIENT")
+                .arg("LIST")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let all = list
+                .lines()
+                .filter_map(|line| line.split(' ').find_map(|field| field.strip_prefix("id=")))
+                .map(str::to_string)
+                .collect();
+            (own.to_string(), all)
         })
+    }
+
+    /// A plain connection to the store, past `KvrocksStore`.
+    async fn connection(&self) -> redis::aio::MultiplexedConnection {
+        let password = env::var(PASSWORD_VARIABLE).ok();
+        let client = self.address.client(password).unwrap();
+        client.get_multiplexed_async_connection().await.unwrap()
+    }
+
+    /// The store, as the crawl connects to it.
+    fn connect(&self) -> KvrocksStore {
+        let password = env::var(PASSWORD_VARIABLE).ok();
+        self.runtime
+            .block_on(KvrocksStore::connect(&self.address, password))
+            .unwrap()
+    }
+
+    /// What `read` gives on a connection to the store.
+    fn read<T>(&self, read: impl AsyncFnOnce(&mut KvrocksStore) -> T) -> T {
+        let mut store = self.connect();
+        self.runtime.block_on(read(&mut store))
+    }
+
+    /// Write `member` to the set `reconnected` through `store`.
+    fn add_through(&self, store: &mut KvrocksStore, member: &str) -> StoreResult<Vec<bool>> {
+        let write = StoreWrite::SetAdd {
+            key: "reconnected".to_string(),
+            member: member.to_string(),
+        };
+        self.runtime.block_on(store.write(&[write]))
     }
 
     /// The members of the set at `key`, sorted.
@@ -576,6 +621,35 @@ fn an_unreachable_store_stops_the_run() {
         "the message should name the socket:\n{stderr}"
     );
     assert_eq!(fs::read_dir(dir.join("download")).unwrap().count(), 0);
+}
+
+/// A store connection the server drops is opened again: the write that
+/// finds it gone may fail, the next one goes through. Without that, one
+/// dropped connection (a network fault, the store restarted) would fail
+/// every write of the rest of a run. Not a run of the binary: the test
+/// drops the connection between two writes, which a crawl can't time.
+#[test]
+fn the_store_reconnects_after_its_connection_is_dropped() {
+    let Some(test_store) = TestStore::take("the_store_reconnects_after_its_connection_is_dropped")
+    else {
+        return;
+    };
+    let (_, before) = test_store.client_ids();
+    let mut store = test_store.connect();
+    test_store.add_through(&mut store, "before").unwrap();
+
+    // The store's connection is the one opened since `before`, other than
+    // the one asking. No other test is connected: this one holds the turn.
+    let (own, after) = test_store.client_ids();
+    let opened: Vec<&String> = after.difference(&before).filter(|id| **id != own).collect();
+    assert_eq!(opened.len(), 1, "the store should hold one connection");
+    test_store.command(&["CLIENT", "KILL", "ID", opened[0]]);
+
+    let _ = test_store.add_through(&mut store, "lost");
+    test_store
+        .add_through(&mut store, "after")
+        .expect("the write after the lost one should reconnect");
+    assert!(test_store.members("reconnected").contains("after"));
 }
 
 /// `--formats` that can't serve a requested kind stop the run at startup,
@@ -920,6 +994,64 @@ fn four_shards_second_corrupt(test_name: &str) -> (PathBuf, String) {
     let paths: Vec<String> = shards.iter().map(|(_, _, uri)| uri.clone()).collect();
     let dir = workspace_listing(test_name, &archives, &paths);
     (dir, shards[1].1.clone())
+}
+
+/// Processes on disjoint Slices of one paths file, run at the same time and
+/// writing to one store, leave both Slices done in it: a SLURM array over
+/// several nodes does the same, each node one more client of the store.
+#[test]
+fn processes_on_disjoint_slices_fill_one_store_together() {
+    let test_name = "processes_on_disjoint_slices_fill_one_store_together";
+    let Some(store) = TestStore::take(test_name) else {
+        return;
+    };
+    let shards: Vec<(String, String, String)> = (0..4).map(nth_shard).collect();
+    let archives: Vec<(&str, Vec<u8>)> = shards
+        .iter()
+        .map(|(_, warc_name, _)| (warc_name.as_str(), warc_archive()))
+        .collect();
+    let paths: Vec<String> = shards.iter().map(|(_, _, uri)| uri.clone()).collect();
+    let dir = workspace_listing(test_name, &archives, &paths);
+
+    // Both started before either is waited for.
+    let processes: Vec<_> = ["0", "2"]
+        .into_iter()
+        .map(|offset| {
+            cc_extract_into(&store, &dir)
+                .args(["-o", offset, "-l", "2"])
+                .args(["-e", "favicon", "--formats", "warc"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for process in processes {
+        let output = process.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "cc-extract failed:\n{stderr}");
+    }
+
+    let done: BTreeSet<String> = shards
+        .iter()
+        .map(|(shard, _, _)| format!("{shard} favicon"))
+        .collect();
+    assert_eq!(store.members("processed"), done);
+    let sightings = shards
+        .iter()
+        .map(|(shard, _, _)| Sighting {
+            page_url: PAGE.to_string(),
+            date: DATE.to_string(),
+            shard: Shard::from_archive_name(shard),
+        })
+        .collect();
+    assert_eq!(
+        store.read(async |kvrocks| findings_in(kvrocks, ArtifactKind::Favicon).await),
+        normalized(Findings::Sightings(HashMap::from([(
+            "https://example.com/icon.png".to_string(),
+            sightings,
+        )])))
+    );
 }
 
 /// Running the same command again after exit 3 retries the undone pairs of

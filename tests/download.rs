@@ -10,7 +10,9 @@
 // the client's read timeout, while a slow one that keeps receiving data is
 // never cut. A failed download says whether its failure would happen again
 // (a 404), and so counts toward giving the Archive up. Those tests download
-// from a server of their own on 127.0.0.1.
+// from a server of their own on 127.0.0.1. So does the one checking that a
+// download in flight goes on while the crawl writes a finished Shard
+// (`spawn_each`).
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -20,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cc_extract::{
-    HttpClient, download_failure_repeats, download_to, download_to_memory, save_archive,
+    HttpClient, download_failure_repeats, download_to, download_to_memory, save_archive, spawn_each,
 };
 use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
@@ -265,6 +267,43 @@ async fn slow_download_to_memory_still_receiving_data_completes() {
 
     // Longer than the read timeout in all, yet not cut.
     assert!(started.elapsed() > READ_TIMEOUT);
+    assert_eq!(downloaded, slow_chunks().concat());
+}
+
+/// The crawl takes each finished Shard in turn and writes it to the store,
+/// while the other Shards download. A write lasting longer than the read
+/// timeout (a store slowed by many writers) must not fail the downloads in
+/// flight meanwhile: they go on in tasks of their own.
+#[tokio::test]
+async fn a_download_in_flight_goes_on_while_the_finished_are_taken_slowly() {
+    let url = serve_once(trickle);
+    let client = HttpClient::new(READ_TIMEOUT).unwrap();
+    // `None` finishes at once, `Some(url)` downloads from the slow server.
+    let job = |url: Option<String>| {
+        let client = client.clone();
+        async move {
+            match url {
+                Some(url) => Some(download_to_memory(&client, &url).await),
+                None => None,
+            }
+        }
+    };
+    let mut finished = spawn_each([Some(url), None].map(job), 2);
+
+    let first = timeout(MARGIN, finished.next()).await.unwrap().unwrap();
+    assert!(
+        first.is_none(),
+        "the job with nothing to download comes first"
+    );
+    // As long as the whole download, longer than the read timeout.
+    tokio::time::sleep(SLOW_GAP * SLOW_CHUNKS).await;
+    let downloaded = timeout(MARGIN, finished.next())
+        .await
+        .expect("the download hung")
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
     assert_eq!(downloaded, slow_chunks().concat());
 }
 
