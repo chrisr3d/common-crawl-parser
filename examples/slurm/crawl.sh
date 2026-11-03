@@ -2,11 +2,17 @@
 #
 # crawl.sh — SLURM array job running cc-extract over a Crawl
 #
-# NOT WORKING WITH THE KVROCKS STORE YET. Every process writes its results to
-# the store named by --kvrocks, and runs across several nodes are not
-# supported: nothing yet decides whether the nodes write to one store over
-# the network or each to its own, copied together afterwards. Kept as a
-# starting point until then.
+# Every process, on every node, writes to one kvrocks store over TCP
+# (KVROCKS below). Start the store before submitting, on a host every
+# compute node can connect to, and keep it running: it outlives the job, as
+# re-runs resume from it and the results are read from it. The traffic,
+# password included, is not encrypted: keep the store on a trusted network.
+# If the store needs a password, export it as CC_EXTRACT_KVROCKS_PASSWORD
+# before sbatch, which passes its environment on to the job by default.
+#
+# One store's write rate bounds the whole Crawl: each process logs its
+# "Store time" per Shard. A slow store slows the crawl down; the downloads
+# in flight go on meanwhile.
 #
 # An example to adapt: replace every <...> placeholder for your cluster and
 # check the values under "Configuration" before submitting.
@@ -68,10 +74,10 @@ BINARY="<path to common-crawl-parser>/target/release/cc-extract"
 # EXTRACT (see --formats in `cc-extract --help` to force them).
 PATHS_FILE="<path to wat.paths.gz>"
 
-# The store every process writes to: a Unix socket path, or a
-# redis://host:port URL. Its password, if it needs one, goes in the
-# CC_EXTRACT_KVROCKS_PASSWORD environment variable.
-KVROCKS="<socket path or redis://host:port of the kvrocks store>"
+# The store every process writes to, as a redis://host:port URL. A Unix
+# socket path works only with one array task, on the store's own machine.
+# Its password, if it needs one: see the top of this file.
+KVROCKS="<redis://host:port of the kvrocks store>"
 
 # Artifact kinds to extract. The default, onion,favicon, reads WAT + WET on
 # CC-MAIN (~240 MB per Shard); adding inline-favicon makes every kind read
@@ -106,6 +112,21 @@ MAX_MEMORY_PER_PROCESS=$(awk -v processes="${PROCESSES_PER_NODE}" \
 
 # Base offset for this array task
 TASK_OFFSET=$((SLURM_ARRAY_TASK_ID * PATHS_PER_TASK))
+
+# A Unix socket is reached only from the machine it is on: with several
+# array tasks, the nodes but one couldn't write to it. Stop before launching
+# anything.
+if [ "${SLURM_ARRAY_TASK_COUNT:-1}" -gt 1 ]; then
+    case "${KVROCKS}" in
+        redis://*) ;;
+        *)
+            echo "Error: with ${SLURM_ARRAY_TASK_COUNT} array tasks, KVROCKS must be a" \
+                "redis://host:port URL, not ${KVROCKS}: a Unix socket is reached only" \
+                "from its own machine" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 echo "=== Array task ${SLURM_ARRAY_TASK_ID} ==="
 echo "Node: $(hostname), CPUs: ${CPUS}"
