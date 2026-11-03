@@ -1619,3 +1619,59 @@ so it outlives them.
 `content_length > data.len() - body_start` asks the same as `body_start + content_length >
 data.len()`, but can't overflow: `body_start` is never past the end, while a malformed
 `Content-Length` can be near `usize::MAX`.
+
+## Step 31: Runs Across Several Nodes, One Store over TCP
+
+### What we built
+
+A Crawl split across several machines now ends in one store: every process, on every node,
+writes to one kvrocks server over TCP (`--kvrocks redis://host:port`), run outside the job.
+Nothing in the store's data needed changing (Slices don't overlap, every write only adds, and
+runs are told apart by their start time and process id); what did was how the crawl copes with a
+store that is far away and shared.
+
+- **Shards in tasks** (`src/lib.rs`, `src/main.rs`): the Shard futures used to run inside
+  `buffer_unordered`, progressing only while the result loop polled it. While the loop wrote a
+  Shard to the store, the downloads in flight were not polled, and one left unpolled for the
+  60 s read timeout failed on its next poll, data or not. A server shared by many writers makes
+  such long writes likely. `spawn_each(futures, jobs)` runs each future in a task of its own
+  (`tokio::spawn`), at most `jobs` at once: the downloads go on while the loop writes, and a
+  slow store only holds finished Shards back.
+- **Reconnecting** (`src/store.rs`): `KvrocksStore` kept one `MultiplexedConnection`, which
+  fails every command once the server has dropped it, so one network fault failed every write
+  of the rest of the run; now only the call that finds it gone fails. It now keeps its `Client` and an `Option` of the connection: a call
+  failing with an error the `redis` crate calls unrecoverable forgets the connection, and the
+  next call opens a new one (one attempt, 10 s connect timeout). Timeouts and refused commands
+  keep it. Start-up is unchanged: one attempt, then exit 1. The crate's `ConnectionManager`
+  does the same with retries and backoff, but needs two more crates.
+- **`crawl.sh`** no longer says it doesn't work: it takes the store's `redis://` URL, says the
+  password goes in the environment before `sbatch`, and refuses a socket path when the array
+  has more than one task.
+- **Tests**: `tests/download.rs` (a download from a server trickling data goes on while the
+  consumer of `spawn_each` takes longer than the read timeout to come back; without the
+  tasks it fails with `no data received for 0.5 s`), `tests/crawl_cli.rs` (gated on the test
+  kvrocks: two processes started together on disjoint Slices of one paths file leave both
+  Slices' done marks and Sightings in the store; after `CLIENT KILL` drops the store's
+  connection, the write that finds it gone may fail, and the one after it goes through).
+
+### Rust concepts introduced
+
+**`tokio::spawn` and its `Send + 'static` bound**
+A spawned future is handed to the runtime, which polls it on any of its worker threads and
+for as long as it takes, whether or not anyone is waiting for it. So it must be `Send` (it
+may move between threads) and `'static` (it may outlive the function that spawned it): it
+owns everything it uses. The Shard futures already did, being `async move` blocks over the
+Shard's own values and a clone of the HTTP client, so they compiled spawned without a change.
+
+**`JoinHandle` and `JoinError`**
+`tokio::spawn` returns a `JoinHandle`, itself a future, giving the task's output once it has
+finished. A panic inside the task doesn't unwind into the caller: it ends the task, and the
+handle returns `Err(JoinError)`. `std::panic::resume_unwind(err.into_panic())` takes the panic
+up again where the output was awaited, so a bug still stops the process as it did when the
+future ran in place.
+
+**`Option::take` and `Option::insert`**
+`take` moves the value out of an `Option`, leaving `None`; `insert` puts one back and returns
+`&mut` to it. Together they give "the value, or a new one": `match self.connection.take() {
+Some(c) => c, None => open().await? }`, then `Ok(self.connection.insert(c))`. Matching on
+`&mut self.connection` and assigning to it in the `None` arm would borrow it twice.

@@ -459,13 +459,15 @@ pairs already done (see section 9, resuming).
 
 ## 8. Concurrency and resource guards
 
-Shards are processed through `buffer_unordered(jobs)`: up to `jobs` Shards are
-in flight, and results are consumed as soon as any one finishes. Downloads are
-async; parsing runs under `spawn_blocking` so it doesn't stall downloads.
-Results are written to the store one Shard at a time on the main task, so no
-locks are needed. The downloads in flight wait while a Shard is written: one
-Shard's writes take the same time however much the store holds, well under
-the 60 s a download may go without data.
+Each Shard is processed in a Tokio task of its own, up to `jobs` at once, and
+results are consumed as soon as any one finishes. Downloads are async; parsing
+runs under `spawn_blocking` so it doesn't stall downloads. Results are written
+to the store one Shard at a time on the main task, so no locks are needed.
+While a Shard is written, the Shards in flight go on downloading and parsing;
+the next one starts once the main task takes a result. A slow store (one
+server shared by many writers) holds finished Shards back, at most `jobs` of
+them, and slows the crawl down: it doesn't fail the downloads in flight,
+however long a write takes.
 
 The number of jobs (default: one per logical CPU core) is capped in two steps:
 
@@ -504,7 +506,10 @@ there; its published port can. If the store needs a password, it comes from
 chooses the namespace); a URL holding one is refused, since options show in
 `ps` and in shell history. The store is reached and checked after the
 arguments and the paths file are read, before anything is downloaded: a store
-that can't be reached stops the run with exit status 1, naming it.
+that can't be reached stops the run with exit status 1, naming it. A
+connection lost during the run (a network fault, the store restarted) is
+opened again: the write that finds it gone fails, leaving its pair undone
+(exit 3, section 11), and the next one connects anew.
 
 **Keys.** Kinds are named as on the command line:
 
@@ -639,14 +644,29 @@ end (exit 0, or 4 with given-up pairs left). With `--transport memory`, each
 process caps its jobs at its own share of the machine's RAM with
 `--max-memory`.
 
-Runs across several nodes are not supported with the store yet: every process
-must reach the same store, and nothing decides yet whether the nodes write to
-one store over the network or each to its own, copied together afterwards.
-`examples/slurm/crawl.sh` (an array of 10 tasks, each one a whole node, each
+Several processes share one store: each writes its own Shards, and the
+writes only add. On one machine they reach it over its socket; across several
+nodes, over TCP (`--kvrocks redis://host:port`), the store running outside
+the job on a host every compute node can connect to. It outlives the job:
+re-runs resume from it, and the results are read from it. A node is one more
+client: Slices don't overlap, and runs are told apart by their start time and
+process id, so several machines writing at once leave the same store as one
+would. The traffic, password included, is not encrypted: keep the store on a
+trusted network.
+
+One server's write rate bounds the whole Crawl. With one writer (kvrocks in
+Docker, over TCP), a Shard's favicons (about 51,000 Sightings) took about
+1.5 s to write: about 150,000 s, 42 hours of writing, over 100,000 Shards.
+Writers in parallel go faster only as far as the server keeps up. Each Shard
+logs its `Store time`; a slow store slows the crawl without failing downloads
+(section 8), and a dropped connection fails only the write that finds it
+gone (section 9).
+
+`examples/slurm/crawl.sh` is an array of 10 tasks, each one a whole node, each
 running 20 processes over 500 paths with `--transport memory`, each given the
-node's RAM divided by 20 with `--max-memory`) is kept as a starting point,
-marked as not working with the store. Several processes on one machine can
-share one store: each writes its own Shards, and the writes only add.
+node's RAM divided by 20 with `--max-memory`, all writing to one store over
+TCP. With more than one array task it refuses a socket path, which only its
+own machine can reach.
 
 ## 11. CLI reference
 
@@ -719,10 +739,9 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
     tag before.
 
   Details in `RESEARCH-warc-wat-wet.md`, section 4.7.
-- **The store must be reachable from the machine running the crawl.** Over a
-  Unix socket it is on that machine. Over TCP the traffic, password included,
-  is not encrypted: keep the store on the same machine or a trusted network.
-  Runs across several nodes are not supported yet (section 10).
+- **TCP to the store is not encrypted.** A Unix socket reaches a store on the
+  same machine; over TCP (several nodes, section 10) the traffic, password
+  included, goes in the clear: keep the store on a trusted network.
 - **Onion Sightings keep no context.** The store records which page mentioned
   the address, not where on the page or in what role (link, header, plain
   text).

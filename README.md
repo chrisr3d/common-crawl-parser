@@ -33,7 +33,7 @@ The project was built incrementally and now features the following:
 11. **Resource guards** — Layered concurrency caps (CPU cores, available RAM, a process's share of it with `--max-memory`) prevent oversubscription and OOM
 12. **Incremental extraction** — Pick Artifact kinds with `-e`; a later run adds kinds without redoing the ones already done
 13. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them): on CC-MAIN, `onion` and `favicon` read WAT + WET (~240 MB) instead of WARC (~1 GB), `favicon` alone WAT only
-14. **HPC batch mode** — Split a Crawl across processes with `--offset` and `--limit`, each covering its own Slice of the paths file, all writing to one store; running the same command again retries only what its Slice left undone, and an Archive failing the same way on 3 runs is given up instead of retried forever. Runs across several nodes are not supported with the store yet (the SLURM example in [`examples/slurm/`](examples/slurm/) is kept as a starting point)
+14. **HPC batch mode** — Split a Crawl across processes with `--offset` and `--limit`, each covering its own Slice of the paths file, all writing to one store; running the same command again retries only what its Slice left undone, and an Archive failing the same way on 3 runs is given up instead of retried forever. Across several nodes, every node writes to one store over TCP (the SLURM example in [`examples/slurm/`](examples/slurm/))
 
 Additional features:
 
@@ -254,9 +254,9 @@ again covers the same paths, so a process re-run after exit 3 retries only its o
 pairs. Several processes on one machine can write to the same store: each writes its own
 Shards, and writes only add; with `--transport memory`, give each one its share of the RAM
 with `--max-memory`.
-Runs across several nodes are not supported with the store yet: every process must reach
-the same store, and nothing yet decides whether the nodes write to one store over the
-network or each to its own, copied together afterwards.
-[`examples/slurm/crawl.sh`](examples/slurm/crawl.sh), a SLURM array job running several
-processes per node, is kept as a starting point; it does not work with the store until
-then.
+Across several nodes, every process writes to one store over TCP (`--kvrocks
+redis://host:port`): run it outside the job, on a host every compute node can connect to, on
+a trusted network (the traffic is not encrypted). Re-runs on any node resume from it. One
+server's write rate bounds the whole Crawl (about 1.5 s per Shard for one writer; see
+FEATURES, section 10). [`examples/slurm/crawl.sh`](examples/slurm/crawl.sh) is a SLURM
+array job running several processes per node this way.
