@@ -211,14 +211,35 @@ removes it once it is closed, after a kill too (only a crash of the node leaves
 one); Lustre and GPFS keep such files on their servers. Windows can't remove an open file: there the copy keeps its
 name until the parse ends, and a killed process leaves it behind.
 
+Both record parsers, streaming (`disk`, `memory`) and slice (`mmap`), follow
+the same rules, so every Transport reads an Archive alike, one written
+otherwise than Common Crawl writes them too:
+
+- Lines are read as bytes, each ended by `\n`. A record starts at the first
+  line beginning `WARC/` after the end of the previous body: the lines before
+  it are passed over, and a `WARC/` inside a line starts nothing. Its headers
+  end at the first line of only whitespace, `\r\n` or a bare `\n`.
+- Header names are compared ignoring case, and a header given twice keeps its
+  last value. `WARC-Target-URI` and `WARC-Date` are read as UTF-8, any byte
+  that isn't replaced by `�`: a header in another encoding never fails the
+  record.
+- A record's `Content-Length` must be ASCII digits, whitespace around them
+  allowed, few enough for the machine's word size. A record without one, or
+  with any other value (`12a3`, `-5`, empty, 2^64 or more), fails the
+  Archive whatever its type, as its body can't be told from the records after
+  it: `a record has no Content-Length`, `a record's Content-Length is not a
+  byte count: "12a3"`.
+
 The data may end only between two records. The gzip stream can end cleanly
 with the last record unfinished: data ending inside a record, in its headers or
 before the end of its body (read or passed over, whatever the record's type),
 fails the Archive on every Transport, with the same message, `the Archive ends
 inside a record`. Otherwise the rest of the Archive would be dropped without a
-word and its pair marked done. A record missing its `Content-Length` is still
-read as one with an empty body, and a body running into the next record is not
-detected.
+word and its pair marked done. A body is read as far as the data goes, never
+reserved at the length its header declares (8 MiB at most up front, above
+any real record): a `Content-Length` larger than any memory fails that way
+too, rather than taking the process down. A body running into the next record
+is not detected.
 
 ## 5. Onion extraction
 
@@ -576,9 +597,13 @@ against the Archive, at most once per run.
 - Counted: a download answered with an HTTP 4xx status other than 408 and 429
   (a 404 on a derived WAT or WET path), and a parse error from the Archive's
   bytes (not gzip, a gzip member damaged or cut short, data ending inside a
-  record), on any Transport. An Archive corrupt in `download/` counts too: it
-  is parsed again, not downloaded again. Its message ends with where in the
-  compressed Archive it broke, `(at byte X of Y)` (see Known limitations).
+  record, a `Content-Length` missing or malformed), on any Transport. An
+  Archive corrupt in `download/` counts too: it is parsed again, not
+  downloaded again. Its message ends with where in the compressed Archive it
+  broke, `(at byte X of Y)` (see Known limitations). A panic while parsing an
+  Archive, a bug its bytes trigger, counts too, as `the parser panicked:
+  <message>`: it fails that Archive alone, the Shard's other Archives parsed
+  as usual.
 - Not counted: timeouts (the 60 s without data included), connection errors,
   5xx, 408 and 429, a body cut short of its `Content-Length` (a download
   error), local I/O errors (a file in `download/` that can't be opened, a disk
@@ -766,7 +791,8 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   compressed bytes read when it came, Y the compressed size. X runs past the
   fault by up to the rest of its gzip member (whose checksum is checked at
   its end) and 32 KiB (the decoder reads ahead); a record cut at the end of
-  the data gives X = Y. The log line, `failures:<archive>` and the summary's
+  the data gives X = Y. So does, on `mmap` alone, a malformed record further
+  in: the copy is decompressed whole before any record is read. The log line, `failures:<archive>` and the summary's
   given-up list show it, so a run tells whether damaged Archives break at
   their start or further in, where reading on from the next gzip member
   would keep the records on either side of the fault.

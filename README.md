@@ -234,7 +234,7 @@ anything is downloaded. If the store needs a password, it is read from
 `CC_EXTRACT_KVROCKS_PASSWORD`, never from an option.
 
 A failure that comes back on every run (a download answered 404, an Archive whose bytes don't
-decode) is counted against its Archive, once per run. After 3 runs the Archive is given up: the
+decode or make the parser panic) is counted against its Archive, once per run. After 3 runs the Archive is given up: the
 kinds reading it are not scheduled again, the summary lists it with its last error, and a run
 with nothing else left to retry exits with 4. `--formats` can plan around it (a given-up WET:
 `--formats warc`). To retry it, delete its record (and an Archive corrupt in `download/`, so it

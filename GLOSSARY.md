@@ -65,5 +65,5 @@ A contiguous range of a paths file's lines, given to one run; running the same c
 _Avoid_: range, chunk, partition (and slice for a Shard)
 
 **Given-up Archive**:
-An Archive that failed to download or parse, for a reason that repeats (such as a 404 or bytes corrupt at the source), on enough runs that no Plan reading it is scheduled again.
+An Archive that failed to download or parse, for a reason that repeats (such as a 404, bytes corrupt at the source, or a bug its bytes trigger), on enough runs that no Plan reading it is scheduled again.
 _Avoid_: hopeless Shard, dead Archive, failed Archive

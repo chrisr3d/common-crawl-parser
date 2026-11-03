@@ -1439,3 +1439,87 @@ future ran in place.
 `&mut` to it. Together they give "the value, or a new one": `match self.connection.take() {
 Some(c) => c, None => open().await? }`, then `Ok(self.connection.insert(c))`. Matching on
 `&mut self.connection` and assigning to it in the `None` arm would borrow it twice.
+
+## Step 32: Malformed Record Headers, Read the Same on Every Transport
+
+### What we built
+
+The two record parsers read a record's headers by rules of their own, and trusted its
+`Content-Length`. A huge one took the process down on `disk` and `memory`: past `isize::MAX`,
+allocating the body panicked, failing the whole Shard on every run without counting anything;
+smaller but more than the machine holds, the allocation aborted the process, every job with it.
+A value with other bytes (`12a3` read as 123, `-5` as 5) or a missing one (read as an empty
+body) went unnoticed. And Archives Common Crawl didn't write read differently on `mmap`: headers ended by a
+bare `\n\n` ran on to the next `\r\n\r\n` there, a `WARC/` inside a line started a record, and a
+record right after the previous body was missed, 4 bytes skipped there; a header line that wasn't UTF-8
+failed `disk` and `memory`, and one of multi-byte characters made them panic.
+
+- **One set of rules** (`src/warc_parser.rs`): both parsers read lines as bytes, each ended by
+  `\n` (the streaming one with `read_until`, the slice one with `memchr`); a record starts at the
+  first line beginning `WARC/` after the previous body (`is_record_start`); its headers end at
+  the first line of only ASCII whitespace (`is_blank`); every header line goes to
+  `RecordHeaders::read`, names compared as bytes ignoring ASCII case, the last of a repeated
+  header winning. `WarcRecord`'s `target_uri` and `date` became bytes like `WarcSlice`'s, and
+  `parse_archive` reads both as UTF-8 with replacements, on every Transport.
+- **`Content-Length`** (`parse_content_length`): ASCII digits, whitespace around them trimmed,
+  no overflow; anything else, or no `Content-Length` at all, fails the Archive as
+  `ParseError::Corrupt`, whatever the record's type.
+- **Bodies grow with the data**: the streaming parser reserves `min(Content-Length, 8 MiB)`
+  (`MAX_BODY_RESERVE`, above any real record), then reads through `take(content_length)` with
+  `read_to_end`; fewer bytes than declared is `the Archive ends inside a record`, as on `mmap`.
+- **A panic counts** (`src/main.rs`): `parse_archives` runs each Archive's `parse_archive` under
+  `catch_unwind`; a panic becomes `ParseError::Panicked`, which `repeats()`, so 3 runs give the
+  Archive up (exit 4) instead of exit 3 forever. `Task panic` stays for a panic outside it.
+- **Tests**: `tests/parse_failures.rs` (malformed or missing `Content-Length` in a read and a
+  passed-over record; a body declared `usize::MAX` long; a panic's payload as a counted error),
+  the new `tests/unusual_records.rs` (bare `\n` lines, `WARC/` inside a line, no blank lines
+  after a body, a header value not in UTF-8, a header of multi-byte characters: the same pages on
+  every Transport), and unit tests of the `Content-Length` values both iterators accept, the last
+  of two winning. On a real 1 GB CC-NEWS Archive, all six Transport and engine combinations still
+  agree, in the same time as before.
+
+### Rust concepts introduced
+
+**`read_until` instead of `read_line`**
+`BufRead::read_line` appends to a `String`, so it fails (`InvalidData`) on a line that isn't
+UTF-8. `read_until(b'\n', &mut Vec<u8>)` appends the bytes as they are, up to and including the
+delimiter: the parser decides what is text, and where.
+
+**Slicing bytes, not `str`**
+`&line[..n]` on a `str` panics when byte `n` falls inside a multi-byte character. On `[u8]`,
+`split_at_checked(n)` cuts anywhere and returns `None` only if the slice is shorter; then
+`eq_ignore_ascii_case` compares the name, and `trim_ascii` drops the whitespace around the
+value.
+
+**Overflow-checked parsing with `try_fold`**
+`checked_mul` and `checked_add` return `None` where plain arithmetic would panic (debug) or wrap
+(release). `try_fold` folds like `fold` but stops at the first `None` the closure returns, and
+`?` on an `Option` inside the closure returns it: `digits.iter().try_fold(0usize, |n, &b| ...)`.
+
+**Reading at most n bytes: `by_ref`, `take`, `read_to_end`**
+`reader.by_ref()` lends the reader instead of moving it; `.take(n)` reads at most `n` bytes from
+it, then reports the end; `read_to_end` appends to a `Vec` until that end, growing it as bytes
+arrive and retrying a read `Interrupted` by a signal. With `Vec::with_capacity(n.min(cap))`, the
+memory follows the data, where `vec![0u8; n]` allocates whatever the header says: past
+`isize::MAX` that panics ("capacity overflow"), and an allocation the system refuses calls
+`handle_alloc_error`, which aborts the process.
+
+**One struct for borrowed and owned values**
+`RecordHeaders<V>` keeps a header value as `V`: `Vec<u8>` for the streaming parser, whose line
+buffer is reused, `&'a [u8]` for the slice parser. `read<'a>(&mut self, line: &'a [u8])` with the
+bound `where V: From<&'a [u8]>` on the method builds it with `V::from(value)`: `Vec::from` copies,
+and `impl<T> From<T> for T` returns the slice as it is. `#[derive(Default)]` on the generic struct
+writes `impl<V: Default> Default`: the struct itself asks nothing of `V`.
+
+**`catch_unwind`, `AssertUnwindSafe` and a panic's payload**
+`std::panic::catch_unwind(f)` runs `f` and stops a panic's unwinding there, returning
+`Err(payload)`, a `Box<dyn Any + Send>`. `downcast_ref::<&str>()` and `downcast_ref::<String>()`
+recover the message (`panic!("literal")` carries the first, `panic!("{x}")` the second). The
+closure must be `UnwindSafe`; one capturing a `&mut` isn't, as a panic may leave the borrowed
+value half-changed. `AssertUnwindSafe(|| ...)` vouches for it: here the extractors are fresh for
+each Archive and dropped when it fails. It only catches unwinding panics: an abort
+(`handle_alloc_error`, `panic = "abort"`) still ends the process.
+
+**`escape_ascii` for bytes in a message**
+`<[u8]>::escape_ascii()` displays bytes as text, printable ASCII as is and the rest escaped
+(`\xff`, `\"`), so an error can quote a malformed value without assuming it is UTF-8.
