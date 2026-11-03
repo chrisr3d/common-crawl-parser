@@ -298,6 +298,21 @@ pub fn write_archive(test_name: &str, file_name: &str, bytes: &[u8]) -> PathBuf 
     write_archives(test_name, &[(file_name, bytes)]).remove(0)
 }
 
+/// `bytes` on each Transport, by name, as `archive_name`: in a file of
+/// `test_name`'s own for disk and mmap (`write_archive`).
+pub fn on_every_transport(
+    test_name: &str,
+    archive_name: &str,
+    bytes: &[u8],
+) -> [(&'static str, Transport); 3] {
+    let path = write_archive(test_name, archive_name, bytes);
+    [
+        ("disk", Transport::Disk(path.clone())),
+        ("memory", Transport::Memory(bytes.to_vec())),
+        ("mmap", Transport::Mmap(path)),
+    ]
+}
+
 /// Write several Archives, such as one Shard's in each Format, to
 /// `<tmp>/<test_name>/` and return their paths, in the same order.
 ///

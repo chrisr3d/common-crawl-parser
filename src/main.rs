@@ -18,6 +18,7 @@ use std::env::{self, VarError};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::{self, ExitCode};
 use std::time::{Duration, Instant};
@@ -32,9 +33,9 @@ use cc_extract::store::{
 };
 use cc_extract::{
     ArchivePath, ArtifactKind, Extractor, FaviconExtractor, Findings, Format, FormatSet,
-    HttpClient, InlineFaviconExtractor, KvrocksStore, OnionEngine, OnionExtractor, Plan,
-    READ_TIMEOUT, Shard, StoreAddress, Transport, download_archive, download_archive_to_memory,
-    download_failure_repeats, download_path, parse_archive, spawn_each,
+    HttpClient, InlineFaviconExtractor, KvrocksStore, OnionEngine, OnionExtractor, ParseError,
+    Plan, READ_TIMEOUT, Shard, StoreAddress, Transport, download_archive,
+    download_archive_to_memory, download_failure_repeats, download_path, parse_archive, spawn_each,
 };
 
 // ---------------------------------------------------------------------------
@@ -495,6 +496,24 @@ async fn fetch(
 /// Archives are unioned (`Findings::merge`), never joined record by record.
 /// An Archive that fails to parse contributes nothing: its extractors, and
 /// what they found before the error, are dropped.
+///
+/// ## A panic fails its Archive, not the Shard
+///
+/// A panic while parsing one Archive is a bug its bytes trigger, and
+/// would trigger again on every run. Left to unwind, it would end the
+/// whole task: no Archive of the Shard parsed, and no failure counted
+/// against any, so the Shard would fail on every run, never given up.
+/// `catch_unwind` stops the unwinding at the end of the closure it runs,
+/// and returns the panic's payload as an `Err`: the Archive fails as
+/// `ParseError::Panicked`, which counts toward giving it up. (The default
+/// panic hook has printed the message and where it happened already.)
+///
+/// `catch_unwind` asks for a closure that is `UnwindSafe`: one whose
+/// captured values can't be seen half-changed after a panic. The closure
+/// borrows the extractors mutably (`&mut` is never `UnwindSafe`), and a
+/// panic may leave one mid-change. `AssertUnwindSafe` tells the compiler
+/// that this is fine here: those extractors are made for this Archive
+/// alone, and dropped unread when it fails.
 fn parse_archives(
     downloaded: Vec<(ArchivePath, Transport)>,
     shard: &Shard,
@@ -524,7 +543,11 @@ fn parse_archives(
             kind_list(&kinds)
         );
 
-        match parse_archive(transport, archive.format(), shard, &mut extractors) {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            parse_archive(transport, archive.format(), shard, &mut extractors)
+        }))
+        .unwrap_or_else(|payload| Err(ParseError::from_panic(payload)));
+        match result {
             Ok(()) => {
                 for extractor in extractors {
                     let kind = extractor.kind();
@@ -1270,7 +1293,9 @@ async fn run_crawl(config: Config) -> ExitCode {
                 let parse_time = parse_start.elapsed();
 
                 // `spawn_blocking` returns a `JoinHandle`, whose `Err` means
-                // the task panicked: then no Archive counts as parsed, and
+                // the task panicked outside the parse of any one Archive
+                // (`parse_archives` turns a panic inside one into that
+                // Archive's failure): then no Archive counts as parsed, and
                 // no failure is counted against any (a bug, not a sign of
                 // a bad Archive).
                 let (mut by_kind, parsed, parse_failures) = parse_result.unwrap_or_else(|err| {

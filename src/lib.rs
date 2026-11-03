@@ -49,6 +49,7 @@ pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
 pub use plan::{FormatRequirement, Plan, PlanError};
 pub use store::{KvrocksStore, StoreAddress};
 
+use std::any::Any;
 use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
@@ -668,8 +669,9 @@ const PROGRESS_EVERY: u64 = 10_000;
 #[derive(Debug)]
 pub enum ParseError {
     /// Its bytes can't be read as an Archive: not gzip, a gzip member
-    /// damaged or cut short, data ending inside a record. Parsing them
-    /// again fails the same way.
+    /// damaged or cut short, data ending inside a record, a record whose
+    /// `Content-Length` is missing or malformed. Parsing them again fails
+    /// the same way.
     ///
     /// The message says where it broke, `(at byte <at> of <size>)`: whether
     /// damaged Archives break at their start, or further in, with records
@@ -690,13 +692,40 @@ pub enum ParseError {
     /// created, a disk full while writing it. Nothing says the Archive is
     /// bad.
     Local(io::Error),
+    /// Parsing panicked, with this message: a bug in this program, that the
+    /// Archive's bytes trigger. Parsing them again panics again, so it
+    /// counts as `Corrupt` does, and the Archive is given up in the end
+    /// instead of failing its Shard on every run.
+    Panicked(String),
 }
 
 impl ParseError {
     /// Whether parsing the same bytes would fail again: such a failure
     /// counts toward giving the Archive up.
     pub fn repeats(&self) -> bool {
-        matches!(self, ParseError::Corrupt { .. })
+        matches!(self, ParseError::Corrupt { .. } | ParseError::Panicked(_))
+    }
+
+    /// The error of a parse that panicked, from the `payload` the panic
+    /// carried, as `std::panic::catch_unwind` returns it.
+    ///
+    /// ## A panic's payload: `Box<dyn Any + Send>`
+    ///
+    /// `panic!` can carry any value, so `catch_unwind` hands it back as a
+    /// `dyn Any`, a value whose type is only known at run time.
+    /// `downcast_ref::<T>()` returns it as a `&T` if it is a `T`. A
+    /// `panic!` with a plain literal carries a `&'static str`, one with
+    /// values to format a `String`; any other value (`panic_any`) is named
+    /// `Box<dyn Any>`, as the default panic hook prints it.
+    pub fn from_panic(payload: Box<dyn Any + Send>) -> Self {
+        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+            message.to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+        ParseError::Panicked(message)
     }
 }
 
@@ -709,6 +738,7 @@ impl fmt::Display for ParseError {
                 write!(f, "{error} (at byte {at} of {size})")
             }
             ParseError::Local(error) => error.fmt(f),
+            ParseError::Panicked(message) => write!(f, "the parser panicked: {message}"),
         }
     }
 }
@@ -919,9 +949,13 @@ fn parse_stream<R: Read>(
 
     for record in records {
         let record = record.map_err(|err| position.error(err))?;
-        // The `PageRecord` borrows the record's own buffers: nothing is
-        // copied, and it is dropped before the next record is read.
-        if let Some(page) = to_page_record(format, &record.target_uri, &record.date, &record.body) {
+        // Header bytes read as text, as in `parse_mmap`. The `PageRecord`
+        // borrows the record's own buffers: nothing is copied (unless a
+        // header isn't UTF-8), and it is dropped before the next record is
+        // read.
+        let page_url = String::from_utf8_lossy(&record.target_uri);
+        let date = String::from_utf8_lossy(&record.date);
+        if let Some(page) = to_page_record(format, &page_url, &date, &record.body) {
             hand_over(&page, shard, extractors, &mut records_scanned);
         }
     }

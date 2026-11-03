@@ -1,10 +1,11 @@
 // How an Archive that can't be parsed fails.
 //
-// A failure coming from the Archive's own bytes (not gzip, cut short) comes
-// back on every run: it counts toward giving the Archive up. One coming from
-// a local file (missing, unreadable, the mmap copy that can't be created)
-// says nothing about the Archive, and doesn't count. Every Transport must
-// tell the two apart.
+// A failure coming from the Archive's own bytes (not gzip, cut short, a
+// malformed record) comes back on every run: it counts toward giving the
+// Archive up, and so does a panic its bytes trigger. One coming from a local
+// file (missing, unreadable, the mmap copy that can't be created) says
+// nothing about the Archive, and doesn't count. Every Transport must tell
+// the two apart.
 
 // Each test crate compiles its own copy of `common` and uses only part of
 // it; `allow` silences the dead-code warnings for the rest.
@@ -12,11 +13,12 @@
 mod common;
 
 use std::fs;
+use std::panic;
 use std::path::PathBuf;
 use std::process;
 
 use cc_extract::{Format, ParseError, Shard, Transport, parse_archive};
-use common::{WarcBuilder, gzip_member, http_response, write_archive};
+use common::{WarcBuilder, gzip_member, http_response, on_every_transport, write_archive};
 
 const ARCHIVE_NAME: &str = "CC-MAIN-20250101000000-20250101010101-00000.warc.gz";
 
@@ -37,17 +39,6 @@ fn parse_error(transport: Transport) -> ParseError {
     parse_archive(transport, Format::Warc, &shard, &mut []).expect_err("the parse should fail")
 }
 
-/// `bytes` on each Transport, by name: in a file of `test_name`'s own for
-/// disk and mmap.
-fn on_every_transport(test_name: &str, bytes: &[u8]) -> [(&'static str, Transport); 3] {
-    let path = write_archive(test_name, ARCHIVE_NAME, bytes);
-    [
-        ("disk", Transport::Disk(path.clone())),
-        ("memory", Transport::Memory(bytes.to_vec())),
-        ("mmap", Transport::Mmap(path)),
-    ]
-}
-
 #[test]
 fn corrupt_bytes_fail_in_a_way_that_repeats() {
     let mut cut_short = archive();
@@ -64,7 +55,7 @@ fn corrupt_bytes_fail_in_a_way_that_repeats() {
 
     for (case, bytes) in cases {
         let test_name = format!("corrupt_bytes_{case}");
-        for (transport_name, transport) in on_every_transport(&test_name, &bytes) {
+        for (transport_name, transport) in on_every_transport(&test_name, ARCHIVE_NAME, &bytes) {
             let error = parse_error(transport);
             assert!(error.repeats(), "{case} on {transport_name}: {error}");
             // Where in the Archive: some byte of its size.
@@ -84,9 +75,17 @@ fn corrupt_bytes_fail_in_a_way_that_repeats() {
 /// whether its body is read or passed over, that is the Archive's bytes
 /// failing, with the same message on every Transport: the record parsers
 /// must not read it as the end of the records.
+///
+/// A body declared larger than any memory is read as far as the data
+/// goes, never reserved at the length it declares: the data ends inside
+/// it too.
 #[test]
 fn a_record_cut_short_fails_in_a_way_that_repeats() {
-    let cases: [(&str, &[u8]); 4] = [
+    let larger_than_memory = format!(
+        "WARC/1.0\r\nWARC-Type: response\r\nContent-Length: {}\r\n\r\nHTTP/1.1 200 OK\r\n",
+        usize::MAX
+    );
+    let cases: [(&str, &[u8]); 5] = [
         (
             "in_its_headers",
             b"WARC/1.0\r\nWARC-Type: response\r\nContent-Len",
@@ -106,13 +105,17 @@ fn a_record_cut_short_fails_in_a_way_that_repeats() {
             "in_a_read_body",
             b"WARC/1.0\r\nWARC-Type: response\r\nContent-Length: 100\r\n\r\nHTTP/1.1 200 OK\r\n",
         ),
+        (
+            "in_a_body_larger_than_memory",
+            larger_than_memory.as_bytes(),
+        ),
     ];
 
     for (case, cut_record) in cases {
         let mut bytes = archive();
         bytes.extend(gzip_member(cut_record));
         let test_name = format!("a_record_cut_short_{case}");
-        for (transport_name, transport) in on_every_transport(&test_name, &bytes) {
+        for (transport_name, transport) in on_every_transport(&test_name, ARCHIVE_NAME, &bytes) {
             let error = parse_error(transport);
             assert!(error.repeats(), "{case} on {transport_name}: {error}");
             assert_eq!(
@@ -124,6 +127,88 @@ fn a_record_cut_short_fails_in_a_way_that_repeats() {
                 "{case} on {transport_name}"
             );
         }
+    }
+}
+
+/// A record's `Content-Length` must be a number of bytes: ASCII digits,
+/// with only whitespace around them, few enough to count. One that isn't,
+/// or none at all, leaves no way to tell where the body ends: that fails
+/// the Archive whatever the record's type, with the same message on every
+/// Transport.
+#[test]
+fn a_malformed_content_length_fails_in_a_way_that_repeats() {
+    let cases = [
+        (
+            "not_digits",
+            "Content-Length: 12a3\r\n",
+            r#"a record's Content-Length is not a byte count: "12a3""#,
+        ),
+        (
+            "negative",
+            "Content-Length: -5\r\n",
+            r#"a record's Content-Length is not a byte count: "-5""#,
+        ),
+        (
+            "empty",
+            "Content-Length:\r\n",
+            r#"a record's Content-Length is not a byte count: """#,
+        ),
+        // More than any `usize` can hold.
+        (
+            "overflowing",
+            "Content-Length: 99999999999999999999999\r\n",
+            r#"a record's Content-Length is not a byte count: "99999999999999999999999""#,
+        ),
+        ("missing", "", "a record has no Content-Length"),
+    ];
+
+    for (case, content_length, expected) in cases {
+        // A record the parsers read, and one whose body they pass over.
+        for warc_type in ["response", "request"] {
+            let record =
+                format!("WARC/1.0\r\nWARC-Type: {warc_type}\r\n{content_length}\r\nhello\r\n\r\n");
+            let mut bytes = archive();
+            bytes.extend(gzip_member(record.as_bytes()));
+            let test_name = format!("a_malformed_content_length_{case}_{warc_type}");
+            for (transport_name, transport) in on_every_transport(&test_name, ARCHIVE_NAME, &bytes)
+            {
+                let error = parse_error(transport);
+                assert!(
+                    error.repeats(),
+                    "{case} in a {warc_type} on {transport_name}: {error}"
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!("{expected} (at byte {0} of {0})", bytes.len()),
+                    "{case} in a {warc_type} on {transport_name}"
+                );
+            }
+        }
+    }
+}
+
+/// A panic while parsing an Archive is a bug its bytes trigger: parsing
+/// them again panics again, so it counts toward giving the Archive up,
+/// and its message says what happened, whatever the panic carries.
+#[test]
+fn a_panic_while_parsing_repeats() {
+    let cases: [(&str, fn()); 3] = [
+        ("a literal", || panic!("capacity overflow")),
+        ("a formatted message", || panic!("index {} out of range", 9)),
+        // Neither a `&str` nor a `String`.
+        ("another value", || panic::panic_any(42)),
+    ];
+    let expected = [
+        "the parser panicked: capacity overflow",
+        "the parser panicked: index 9 out of range",
+        "the parser panicked: Box<dyn Any>",
+    ];
+
+    for ((case, parse), expected) in cases.into_iter().zip(expected) {
+        let payload = panic::catch_unwind(parse).expect_err(case);
+        let error = ParseError::from_panic(payload);
+        assert!(error.repeats(), "{case}: {error}");
+        assert_eq!(error.to_string(), expected, "{case}");
     }
 }
 
@@ -175,14 +260,15 @@ fn a_member_damaged_in_the_middle_fails_where_it_is() {
         *byte = !*byte;
     }
 
-    let messages: Vec<(&str, String)> = on_every_transport("a_member_damaged", &bytes)
-        .into_iter()
-        .map(|(transport_name, transport)| {
-            let error = parse_error(transport);
-            assert!(error.repeats(), "on {transport_name}: {error}");
-            (transport_name, error.to_string())
-        })
-        .collect();
+    let messages: Vec<(&str, String)> =
+        on_every_transport("a_member_damaged", ARCHIVE_NAME, &bytes)
+            .into_iter()
+            .map(|(transport_name, transport)| {
+                let error = parse_error(transport);
+                assert!(error.repeats(), "on {transport_name}: {error}");
+                (transport_name, error.to_string())
+            })
+            .collect();
 
     let (_, disk) = &messages[0];
     let (at, size) = position(disk);
