@@ -1,8 +1,9 @@
 # Progress Journal
 
-What each step changed, and the Rust concepts it introduced. A feature that a later step
+What each step changed, and the Rust concepts it introduced. Successive rounds on one feature
+share one entry, titled with their steps and placed at the first. A feature that a later step
 replaced is described in a line or two, naming what replaced it; its concepts stay, as they
-still hold. Fixes get a short paragraph each.
+still hold. Fixes get a short paragraph each; tests and measurements a sentence.
 
 ## Steps 1–2: Reading the Paths File, Downloading Archives
 
@@ -564,15 +565,14 @@ crate became `cc-extract` 2.0.0 (it was `onion-crawler`), as the CLI changed.
   `--limit` counts scheduled Shards.
 - **Save, then mark** (`save_then_mark`): each kind's file is saved, then its line appended. The
   old code marked first, so a crash in between lost the results.
-- **Only the requested kinds are loaded and saved**, by one set of functions taking the kind
-  (`load_sightings_from`, `save_sightings_to`, `merge_sightings_from`); `merge` covers every
-  kind with a file.
 - **CLI**: `-s/--strategy` and `-m/--stream` became three independent options: `-e/--extract`
   (kinds, default `onion,favicon`), `-t/--transport` (`disk`, `memory`, `mmap`) and
   `--onion-engine` (`memchr`, `regex`).
 
 `tests/crawl_cli.rs` runs `-e onion`, then `-e onion,favicon` on the same Shards: the second run
-extracts `favicon` only, and the output equals that of one `-e onion,favicon` run.
+extracts `favicon` only, and the output equals that of one `-e onion,favicon` run. Since
+replaced: `processed.log` and the JSON files by the store (Step 27), `--limit` counting
+scheduled Shards by Slices (Steps 29–31); the pairs and their order of writes stay.
 
 ### Rust concepts introduced
 
@@ -621,29 +621,46 @@ already holds the fixture, so no network is needed, and compares loaded results,
 
 ---
 
-## Step 14: The Planner: Formats, Datasets, Multi-Archive Shards
+## Steps 14–16: Formats: the Planner, WET and WAT Archives
 
 ### What we built
 
 Each Shard is planned before download: the cheapest Formats serving every requested kind, one
-Archive per Format, each handed to the kinds that read it. Only WARC could be read yet, so every
-Plan was WARC; Steps 15 and 16 add WET and WAT.
+Archive per Format, each handed to the kinds that read it. On CC-MAIN, the default
+`-e onion,favicon` downloads WAT + WET (~240 MB per Shard) instead of WARC (~1 GB), `onion`
+reading both and `favicon` WAT only.
 
-- **`src/format.rs`**: `Format { Warc, Wat, Wet }` (suffix, directory, estimated size: 1 GB,
-  170 MB, 70 MB), `FormatSet`, and `Dataset { CcMain, CcNews }`, read from the path prefix, with
-  the Formats each publishes.
-- **`ArchivePath`**: a Shard's three Archives differ only in the last directory and the suffix,
-  so any one locates the others, and the input can be a WARC, WAT or WET paths file.
-- **`src/plan.rs`**: `cheapest_fit` (a kind's cheapest accepted combination within some
-  Formats) and `cheapest_plan` (the cheapest subset of the Dataset's Formats that every kind
-  fits in).
-- **`--formats`** forces the Plan. It is rejected at startup if it can't serve a kind
-  (`Error: cannot extract favicon from wet: it needs warc`), and for a Shard whose Dataset lacks
-  one of its Formats.
+- **Formats and Datasets** (`src/format.rs`): `Format { Warc, Wat, Wet }` (suffix, directory,
+  estimated size: 1 GB, 170 MB, 70 MB), `FormatSet`, and `Dataset { CcMain, CcNews }`, read from
+  the path prefix, with the Formats each publishes. A Shard's three Archives differ only in the
+  last directory and the suffix, so any one locates the others (`ArchivePath`), and the input can
+  be a WARC, WAT or WET paths file.
+- **The planner** (`src/plan.rs`): `cheapest_fit` (a kind's cheapest accepted combination within
+  some Formats) and `cheapest_plan` (the cheapest subset of the Dataset's Formats that every kind
+  fits in). `onion` accepts WARC or WAT + WET, `favicon` WARC or WAT. `--formats` forces the
+  Plan; it is rejected at startup if it can't serve a kind (`Error: cannot extract favicon from
+  wet: it needs warc`), and for a Shard whose Dataset lacks one of its Formats.
 - **Per Shard**: every Archive of the Plan is downloaded, each parsed with the extractors of the
   kinds reading it, and their Sightings unioned. A kind is saved and marked only if every Archive
   it reads parsed (`Plan::split_done`), so a failed download no longer stops kinds that don't
   need it. With `-t memory`, the available RAM is divided by the largest Plan.
+- **Record types**: `Format::record_type()` names the records holding the pages (`response`,
+  `metadata`, `conversion`); both parsers take it and skip every other record. `parse_archive`
+  takes the Format as a parameter, as a `Memory` Transport has no file name to tell it.
+- **WET** (Step 15): one `conversion` record per HTML page, holding its visible text, searched for
+  onions (`PageRecord::Wet`); favicons have nothing to find there. WET alone finds about a third
+  of the onions, most sitting in HTTP headers and attributes, hence its pairing with WAT.
+- **WAT** (Step 16): one JSON `metadata` record per WARC record, three per page, written by
+  ia-web-commons: the WARC and HTTP headers and, for HTML, the `<link>` and `<meta>` tags of the
+  `<head>` and every link. A SIMD search for `"WARC-Type":"response"` drops, unparsed, the two
+  records in three not made from a `response`; the rest are parsed once, into structs declaring
+  only the path down to `Head` (`PageRecord::Wat`). The crawl date is inside the JSON, so a
+  record whose JSON can't be read is skipped. Onions are searched in the raw JSON, which keeps
+  addresses as WARC does with three exceptions: onions only in the plain text are gone (WET has
+  them), one right after an escape such as `\n` is missed, and one in the page URL is found.
+  Favicons come from `Head`; `data:` URLs are skipped, as ia-web-commons cuts them short.
+- **Tests**: `tests/wet_archive.rs` and `tests/wat_archive.rs` write the same pages as WARC, WAT
+  and WET; WAT + WET find what WARC finds.
 
 ### Rust concepts introduced
 
@@ -689,23 +706,6 @@ if let Some(forced) = forced
 {
 ```
 
----
-
-## Step 15: Reading WET Archives
-
-### What we built
-
-A WET Archive is a WARC file of `conversion` records, one per HTML page, holding its visible
-text. `Format::record_type()` names the record type holding the pages (`response`, `metadata`,
-`conversion`); both parsers take it and skip every other record. `parse_archive` takes the
-Format as a parameter, as a `Memory` Transport has no file name to tell it. The new
-`PageRecord::Wet(WetConversion { page_url, date, text })` is searched for onions; favicons have
-nothing to find there. WET alone finds about a third of the onions, most sitting in HTTP headers
-and attributes, so no Plan used it until Step 16 paired it with WAT. `tests/wet_archive.rs`
-builds a WET fixture.
-
-### Rust concepts introduced
-
 **`&'static str` fields**
 `WarcRecordIter` keeps its record type as a `&'static str`: a string literal lives for the whole
 program, so the struct needs no lifetime parameter, where `&'a str` would have tied every
@@ -719,34 +719,6 @@ naming the arm, not `_`, keeps the `match` exhaustive.
 **`BTreeMap::from([...])` and const generics in `std`**
 `BTreeMap::from([(k1, v1), (k2, v2)])` builds a map in one expression: the standard library
 implements `From<[(K, V); N]>` once for every length `N`, through a *const generic* parameter.
-
----
-
-## Step 16: Reading WAT Archives; WAT + WET Plans
-
-### What we built
-
-With WAT readable, the cheaper Plans apply: on CC-MAIN, the default `-e onion,favicon` downloads
-WAT + WET (~240 MB per Shard) instead of WARC (~1 GB), `onion` reading both and `favicon` WAT
-only. A WAT Archive holds one JSON `metadata` record per WARC record, three per page, written by
-ia-web-commons: the WARC and HTTP headers and, for HTML, the `<link>` and `<meta>` tags of the
-`<head>` and every link.
-
-- **`PageRecord::Wat(WatMetadata)`**: a SIMD search for `"WARC-Type":"response"` drops, without
-  parsing them, the two records in three not made from a `response`; the rest are parsed once,
-  into structs declaring only the path down to `Head`. The crawl date is inside the JSON, so a
-  record whose JSON can't be read is skipped.
-- **Onions** are searched in the raw JSON, which keeps addresses as WARC does with three
-  exceptions: onions only in the plain text are gone (WET has them), one right after an escape
-  such as `\n` is missed, and one in the page URL is found.
-- **Favicons** come from `Head`, resolved against `<base href>`; `data:` URLs are skipped, as
-  ia-web-commons cuts them short. The `rel` and `name` checks are shared with the HTML scanner.
-- **Requirements**: `onion` accepts WARC or WAT + WET, `favicon` WARC or WAT. The planner needed
-  no change.
-- **Tests**: `tests/wat_archive.rs` writes the same pages as WARC, WAT and WET; WAT + WET find
-  what WARC finds.
-
-### Rust concepts introduced
 
 **Partial deserialization**
 The `Deserialize` structs declare only the fields read. serde skips every other key, checking
@@ -798,42 +770,53 @@ take their constants from the real table
 
 ---
 
-## Step 17: WARC Favicons Honour `<base href>`
+## Steps 17 and 25: WARC Favicon Tags Read as a Browser Reads Them
 
 ### What we built
 
-The HTML scanner resolves relative favicon URLs as a browser does: against the first `<base>`
-with an `href` (itself resolved against the page URL), else against the page URL. WARC and WAT
-now agree: on `https://example.net/docs/page.html` with `<base href="/static/">`,
-`icons/fav.png` becomes `https://example.net/static/icons/fav.png` in both. The scan for
-`<base>` runs only once a favicon URL needs resolving, so pages without favicons pay nothing;
-`document_base_url` is the one rule both Formats call. `tests/wat_archive.rs` pins a page with a
-relative `<base>`. Step 25 replaced the separate scan and `DocumentBase`: its single pass finds
-the first `<base href>` along the way, and the `url` crate resolves it.
+Step 17 resolved relative favicon URLs as a browser does: against the first `<base>` with an
+`href` (itself resolved against the page URL), else against the page URL, so WARC and WAT agree.
+Compared with WAT over 99 Shards, the scanner still missed tags a browser reads (`<Link`, `<link`
+then a newline, `rel="icon"href=…`, a bare `href=/i.png`, every tag after one that didn't close
+within 4 KB or after a stray quote), kept wrong URLs (`&#038;` left in, `href=https://cdn…` cut
+to `https:`), and read tags a browser ignores (in comments and scripts). Step 25 rewrote it:
+
+- **One forward pass** (`scan_page`): `memchr` jumps to each `<`, where six SIMD scans had looked
+  for fixed literals (`<link `, `<LINK `, ...). `<link>`, `<meta>` and `<base>` start tags are
+  read attribute by attribute (`Attributes`, following the HTML tokenizer's states: a quote opens
+  a value only after `=`, a bare value runs to whitespace or `>`, a name may follow a closing
+  quote directly). Comments are skipped to their `-->` (or `--!>`), bogus ones (`<?php`,
+  `<![CDATA[`) to the first `>`, the contents of raw-text elements (`script`, `style`, `title`,
+  `textarea`, ...) to their end tag. No length cap: a tag ends at its first `>` outside quotes.
+  The first `<base href>` is found on the way, where Step 17 scanned for it separately.
+- **Entities decoded** (`decode_entities`): numeric references, decimal or hex, `;` optional, and
+  `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`. Any other `&` stays.
+- **`rel` as a token list**, in WARC and WAT: a favicon when any token is `icon`,
+  `apple-touch-icon`, `apple-touch-icon-precomposed` or `mask-icon`, ignoring case (`shortcut
+  icon` matches through `icon`; `fluid-icon` doesn't).
+- **The `url` crate** resolves every URL in both Formats, replacing the hand-written resolver:
+  `..` and `.` removed, `?v=2` against the whole path, `HTTPS://` absolute, `\` read as `/`, the
+  host lowercased. A value that is no URL is dropped.
+- **No HTML crate**: `html5ever` needs UTF-8 and allocates per token on every page, `lol_html` is
+  a large dependency.
+
+Over the same 99 Shards, WARC and WAT now share 99.9 % of WARC's favicon Sightings, against
+97.6 %; most pages still differing are ones WARC doesn't scan as HTML (no HTML `Content-Type`,
+UTF-16) or comments WAT's parser misreads (`--->`). Parse time is unchanged or slightly lower.
+The done marks don't record which rules extracted a pair, so new rules apply to the Shards
+extracted from then on.
 
 ### Rust concepts introduced
 
 **`OnceCell`: computed on first use, through `&self`**
-The scanners hold a `&DocumentBase`, and the base URL is computed the first time one asks.
-Storing it through a shared reference is *interior mutability*, which the `std::cell` types
-allow under rules: a `OnceCell` is set once, then only read, so every `&str` it hands out stays
-valid.
-
-```rust
-struct DocumentBase<'a> {
-    body: &'a [u8],
-    page_url: &'a str,
-    url: OnceCell<Cow<'a, str>>,
-}
-
-fn url(&self) -> &str {
-    self.url.get_or_init(|| { /* scan for <base>, resolve it */ })
-}
-```
+Step 17's scanners held a shared `&DocumentBase`, and the base URL was computed the first time
+one asked. Storing it through a shared reference is *interior mutability*, which the `std::cell`
+types allow under rules: a `OnceCell` is set once (`get_or_init`), then only read, so every
+`&str` it hands out stays valid.
 
 **`OnceCell`, `LazyCell`, `LazyLock`**
 A `LazyCell` holds its closure, but a closure's type has no name, so every scanner taking one
-would need a generic parameter; the struct holds what the closure would capture instead.
+would need a generic parameter; the struct held what the closure would capture instead.
 `LazyLock` is the thread-safe one, for `static`s; one page is scanned on one thread.
 
 **`Option` as an iterator**
@@ -842,49 +825,91 @@ may be missing is `[lower, upper].into_iter().flatten().min_by_key(|&(start, _)|
 no four-case `match`.
 
 **`?` on `Option`**
-`first_base_href_found_by` returns `None` at `finder.find(...)?` when no tag is left, and at
-`find_tag_end(...)?` when one is cut short.
+In a function returning `Option`, `finder.find(...)?` returns `None` when no tag is left, as `?`
+on a `Result` returns its error.
+
+**An iterator with a result at the end**
+`Attributes` yields `(name, value)` pairs, and its `end` field says, once it is done, where the
+tag ended, or `None` if the page ended first. `for (name, value) in &mut attributes` iterates
+through a mutable borrow (`&mut I` is itself an `Iterator` when `I` is one), so the iterator is
+still there after the loop to read `attributes.end`.
+
+**Array patterns over a const generic**
+`read_attributes(page, from, [b"rel", b"href"])` takes the names as `[&[u8]; N]` and returns a
+`StartTag<'a, N>` whose `values` is `[Option<Cow<'a, [u8]>>; N]`. The caller destructures it
+with an array pattern, `let StartTag { values: [rel, href], end } = ...?;`, checked at compile
+time to have `N` elements. `[None; N]` needs a `Copy` element, which `Option<&[u8]>` is and
+`Option<Cow<[u8]>>` isn't: the values are collected as slices, then decoded at once with
+`values.map(|value| value.map(decode_entities))` (`[T; N]::map`).
+
+**`Cow<[u8]>`: decoded only when needed**
+`decode_entities` returns `Cow::Borrowed(value)` when the value holds no `&` (a `memchr`), and
+a new `Vec` (`Cow::Owned`) only otherwise. `PageTags` keeps either, borrowed from the page.
+
+**`char` from a number**
+`char::from_u32(code)` is `None` for a surrogate or a number past U+10FFFF, which HTML reads as
+`char::REPLACEMENT_CHARACTER`; `character.encode_utf8(&mut [0; 4])` writes its UTF-8 bytes into
+a buffer on the stack. `saturating_mul` and `saturating_add` keep a long run of digits from
+overflowing: stuck at `u32::MAX`, it is past Unicode as well.
+
+**`url::Url` and `ParseOptions`**
+`Url::options().base_url(base).parse(value)` is `base.join(value)` with an `Option<&Url>` base:
+with `None`, only an absolute value parses. `String::from(url)` takes the serialization without
+copying it.
+
+**Clippy's `type_complexity`**
+`Option<([Option<Cow<'a, [u8]>>; N], usize)>` drew the lint; a named struct with documented
+fields (`StartTag`) reads better than the tuple it replaced.
 
 ---
 
-## Step 18: The `inline-favicon` Artifact Kind
+## Steps 18 and 28: The `inline-favicon` Artifact Kind
 
 ### What we built
 
-Base64 `data:` favicons, decoded since the first scanner and then thrown away, are a kind of
-their own, saved in `inline_favicons.json`:
-
-```json
-{
-  "49e1dad481e94dfab7c9573a9a81d56aa2ca629fe15a3f7a910aa4f47601c00d": {
-    "mmh3": 1932519735,
-    "media_type": "image/png",
-    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ...",
-    "sightings": [{ "page_url": "...", "date": "...", "shard": "..." }]
-  }
-}
-```
+Base64 `data:` favicons, decoded since the first scanner and then thrown away, became a kind of
+their own (Step 18), saved in `inline_favicons.json` until the store replaced the files
+(Step 27). Step 28 added the hashes other tools look favicons up by, as a hash not computed
+during the crawl could only be had by crawling again, and wrote the images on request.
 
 - **Key**: the SHA-256 of the image (`sha2` crate), so one image is one entry, on however many
   pages, with whatever line breaks.
-- **`mmh3`**: Shodan's favicon hash (its `http.favicon.hash:` filter): MurmurHash3 x86_32,
-  seed 0, of the base64 as Python's `codecs.encode` writes it (a newline every 76 characters and
-  at the end), as a signed `i32`. Hand-written, as is the base64 encoder.
-- **`media_type`**: from the `data:` header, lowercase, without parameters; only `;base64` URIs
-  are decoded.
+- **Hashes**: `mmh3`, Shodan's favicon hash (its `http.favicon.hash:` filter): MurmurHash3
+  x86_32, seed 0, of the base64 as Python's `codecs.encode` writes it (a newline every 76
+  characters and at the end), as a signed `i32`, hand-written as is the base64 encoder; `sha1`
+  and `md5` from the RustCrypto `sha1` and `md-5` crates. SHA-256 stays the key: `mmh3` has 32
+  bits (about 116 colliding pairs among a million images, and an image can be built to any
+  value), and MD5 and SHA-1 collide on purpose.
+- **In the store**: `image:<sha256>` holds `media_type` (from the `data:` header, lowercase,
+  without parameters; only `;base64` URIs are decoded) and the three hashes; `mmh3:<value>`,
+  `sha1:<hex>` and `md5:<hex>` are sets of the SHA-256s having that hash, so an image is found
+  from any of them. The store never holds the bytes.
+- **`--save-images <dir>`**: each image to `<dir>/<sha256[0..2]>/<sha256>` (no extension: the
+  media type is in the store), through `<sha256>.<pid>.part` and a rename, as downloads are
+  saved; a file already there is left as is. A pair's images are saved before its store writes,
+  so a pair marked done has every image on disk, and one image that can't be written leaves the
+  pair undone, its path in the message.
 - **Plan**: WARC only (WAT cuts `data:` URLs, WET has no markup); not in the default `-e`.
 - **`Findings`**: one type for every kind's results, `Sightings` or `InlineFavicons`, passed
   through the pipeline; deduplication stays in `merge_sightings`, now generic.
-- **Tests**: published vectors for base64, MurmurHash3 and SHA-256; end to end, one PNG on two
-  pages is saved once, with two Sightings and its hashes pinned from Python.
+- **Tests**: published vectors for base64, MurmurHash3, SHA-256, SHA-1 and MD5; end to end, one
+  PNG on two pages is stored once, with two Sightings and its hashes pinned from Python.
 
 ### Rust concepts introduced
 
-**`sha2` and the `Digest` trait**
+**RustCrypto and the `Digest` trait**
 RustCrypto publishes a crate per hash family, all implementing `digest::Digest`:
-`Sha256::digest(bytes)`. A cryptographic hash is worth a dependency, as a subtly wrong one shows
-only when keys fail to match someone else's; MurmurHash3, a few dozen lines with published
-vectors, is written by hand as teaching material.
+`Sha256::digest(bytes)`, `Sha1::digest`, `Md5::digest`. A cryptographic hash is worth a
+dependency, as a subtly wrong one shows only when keys fail to match someone else's; MurmurHash3,
+a few dozen lines with published vectors, is written by hand as teaching material. The outputs
+are arrays of different lengths; `hex(digest: &[u8])` takes any of them, `&Sha1::digest(..)`
+turning into a `&[u8]` by *deref coercion*, as the output type (`hybrid_array::Array`) implements
+`Deref<Target = [u8]>`.
+
+**A package name that isn't the library's**
+`md-5` is published under that name (`md5` was another crate's on crates.io) and declares its
+library name `md5` in its own `Cargo.toml` (`[lib] name = "md5"`): `Cargo.toml` lists `md-5`,
+the code writes `use md5::Md5`.
 
 **Why `DefaultHasher` is no identifier**
 `HashMap`'s hash is left unspecified on purpose and may change in a later Rust release, breaking
@@ -893,18 +918,9 @@ birthday bound). Keys that are saved or shared need a standard hash: SHA-256 is 
 Python and `sha256sum`.
 
 **`#[serde(untagged)]`**
-`untagged` writes a variant as its content alone, so `onions.json` keeps its shape. Reading back
-can't be untagged (`{}` fits both variants), so the kind chooses, through `Findings::empty(kind)`,
-the one `match` saying which kind has which shape.
-
-```rust
-#[derive(Serialize)]
-#[serde(untagged)]
-pub enum Findings {
-    Sightings(Sightings),
-    InlineFavicons(InlineFavicons),
-}
-```
+`untagged` writes a variant as its content alone, so the JSON files kept their shape once
+`Findings` wrapped them. Reading back can't be untagged (`{}` fits both variants), so the kind
+chooses, through `Findings::empty(kind)`, the one `match` saying which kind has which shape.
 
 **Generics over a trait; provided methods; the orphan rule**
 `merge_sightings<E: ArtifactEntry>(into: &mut HashMap<String, E>, from: HashMap<String, E>)`
@@ -917,6 +933,12 @@ which the orphan rule allows because the trait is ours.
 Moves a value out from behind a `&mut`, leaving its `Default` (an empty `Vec`) in its place:
 no clone.
 
+**Moving into a closure once a borrow ends**
+`self.favicons.entry(sha256_hex(&image.bytes)).or_insert_with(|| InlineFavicon::new(image))`:
+the key borrows `image` only while it is computed, so the closure, an `FnOnce` run at most once,
+may then move `image` into the new entry, and `image.bytes` with it: the buffer changes owner,
+no byte is copied.
+
 **Wrapping arithmetic, `rotate_left`, `chunks_exact`, `cast_signed`**
 MurmurHash3 computes modulo 2³², and `*` and `+` panic on overflow in debug builds, so it says
 `wrapping_mul` and `wrapping_add`; `rotate_left` is C's `(x << r) | (x >> (32 - r))`.
@@ -926,6 +948,23 @@ bits as an `i32`, where `as i32` could be any conversion.
 
 **`let ... else`**
 `let PageRecord::Warc(response) = record else { return; };` binds the pattern, or leaves.
+
+**Privacy follows the module tree**
+`TempFile` and `with_suffix` are private items of the crate root, yet `inline_favicon` uses them
+(`use crate::{TempFile, with_suffix}`): a private item is visible in the module that declares it
+and in all its descendants, and every module is a descendant of the root. No `pub(crate)`
+needed.
+
+**`try_exists` rather than `exists`**
+`Path::exists` answers `false` both when there is no file and when it can't tell (a parent that
+is a regular file, a directory it may not read). `Path::try_exists` returns `io::Result<bool>`:
+`Ok(false)` only for "no file", an `Err` otherwise, which `save_images` reports with the path
+instead of trying to write where it can't.
+
+**Struct update syntax**
+`InlineFavicon { sha1: .., md5: .., ..png(..) }` builds a test's second image from the first,
+giving only the fields that differ; the rest are moved from the value after `..`. With
+`#[derive(Default)]`, `Tally { new_artifacts: .., ..Tally::default() }` takes the rest, all zero.
 
 ---
 
@@ -952,7 +991,7 @@ on the kind, which the compiler lists as none has a `_` arm. The documents caugh
 `FEATURES.md` rewritten for 2.0.0; the README shows `-h` verbatim, checked by
 `tests/cli_help.rs`; `--jobs` no longer shows the core count of the machine printing the help as
 its default; and `examples/slurm/crawl.sh` runs several processes per node, each with its own
-`--offset`, `--limit` and `--output-dir`, which `merge.sh` then merges.
+`--offset` and `--limit` (their results merged by `merge.sh` until the store, Steps 27 and 29–31).
 
 ### Rust concepts introduced
 
@@ -979,18 +1018,18 @@ scripts are no target.
 
 ---
 
-## Steps 20–23: Fixes
+## Steps 20–23 and 26: Fixes
 
 ### Step 20: Crash-Safe Writes
 
 A kill (a SLURM time limit, `scancel`, the OOM killer, Ctrl-C) could leave a file cut short
 under its final name: a truncated `onions.json`, which the next run refuses to load, or a partial
 Archive in `download/`, parsed as if whole on every later run. Each file is now written under a
-temporary name, then renamed once complete: results to `<file>.tmp`, downloads to
-`<file name>.<process id>.part`, renamed only if the byte count matches `Content-Length` when
-the server sent one. A `TempFile` guard removes the temporary file on error paths. No `fsync`: a
-killed process's writes still reach the disk, and syncing hundreds of MB over a network
-filesystem at every save would help only against a machine crash.
+temporary name, then renamed once complete: results to `<file>.tmp` (until the store, Step 27),
+downloads to `<file name>.<process id>.part`, renamed only if the byte count matches
+`Content-Length` when the server sent one. A `TempFile` guard removes the temporary file on
+error paths. No `fsync`: a killed process's writes still reach the disk, and syncing hundreds of
+MB over a network filesystem at every save would help only against a machine crash.
 
 - **`fs::rename`** replaces a file in one atomic step, but only within one filesystem (`EXDEV`
   otherwise), so temporary files sit next to their target, not in `/tmp`.
@@ -1048,19 +1087,11 @@ the parse.
 ### Step 23: An Exit Status for Shards Left Undone
 
 A run exited 0 even when Shards failed and were left for the next run, so `sacct` showed every
-task COMPLETED. Now:
-
-| Code | Meaning | Run again? |
-|---|---|---|
-| 0 | Every Shard taken on done for every requested kind | No need |
-| 1 | Stopped early (paths or results file missing or unreadable, `--offset` past the end, ...) | Once the cause is fixed |
-| 2 | Invalid option or value (`clap`) | Once the command is fixed |
-| 3 | Ran to the end with some Shards left with kinds undone | Yes, the same command |
-
-3, not 2: `clap` exits with 2 on misuse, and a wrapper retrying on 2 would retry a typo forever.
-A failed save or `processed.log` append now leaves the kind undone too. `--help` lists the codes
-(`after_long_help`), and `examples/slurm/crawl.sh` reports, per process, Shards to retry and
-early stops.
+task COMPLETED. It now exits 3 when it ran to the end with some Shard left with a kind undone
+(a failed download, parse or save included): the same command can be run again. 1 stays for
+early stops, 2 is `clap`'s for invalid options, and Step 29 adds 4. 3, not 2: a wrapper retrying
+on 2 would retry a typo forever. `--help` lists the codes (`after_long_help`), and
+`examples/slurm/crawl.sh` reports, per process, Shards to retry and early stops.
 
 - **`ExitCode` and `Termination`**: `main` may return any `Termination` type: `()` reports 0,
   `Result::Err` 1, an `ExitCode` its own value (`ExitCode::from(3u8)`: only the low 8 bits reach
@@ -1069,6 +1100,32 @@ early stops.
   dropped: buffered writes are lost, `TempFile`s stay, the runtime isn't shut down. The early
   stops keep it, as they come before anything is written.
 - **`after_help` / `after_long_help`**: text printed after both helps, or after `--help` only.
+
+### Step 26: A Stalled Download Fails
+
+During a 100-Shard run, 15 downloads stopped receiving data at once, and the run waited 38
+minutes without an error. The shared client had a connect timeout only: once connected,
+`reqwest` waits for data forever, and TCP keepalive fails a connection whose peer is gone, not
+one whose peer answers the probes but sends nothing. The client now has a 60 s read timeout
+(`READ_TIMEOUT`), its wait starting over with each chunk: a stalled download fails like any
+other (partial file removed, Shard left undone, exit 3) with `no data received for 60 s`, while a
+slow one still receiving data is never cut, as a timeout on the whole request would cut a slow
+but healthy 1 GB Archive. The library builds the client, `HttpClient::new(read_timeout)`, so the
+message can state the bound, and the downloads take a URL (`download_to`, `download_to_memory`),
+so `tests/download.rs` downloads from a server of its own on 127.0.0.1.
+
+- **`ClientBuilder::read_timeout` vs `timeout`**: the first bounds each read, its timer reset
+  by every chunk received; the second bounds the whole request, body included.
+- **`downcast_ref` on a `Box<dyn Error>`**: `Some(&T)` if the boxed error is a `T`. `?` boxes
+  a `reqwest::Error` as it is, so it can still be found after passing through `save_archive`.
+- **`Error::source` and `iter::successors`**: an error may wrap another, its cause;
+  `successors(first, |&cause| cause.source())` walks that chain as an iterator. `is_timeout`
+  holds for any timeout in the chain, so the system's own (`io::ErrorKind::TimedOut`) and the
+  connect timeout are told apart from the read timeout.
+- **`tokio::time::timeout` in tests**: a future that fails with `Elapsed` once its bound
+  passes, so a download that hangs fails its test rather than `cargo test`.
+- **`TcpListener::bind("127.0.0.1:0")`**: port 0 asks the system for a free port, read back
+  with `local_addr`, so tests running in parallel never collide.
 
 ---
 
@@ -1091,8 +1148,8 @@ uppercase or ending in `.Onion` was missed, and any 56 base32 characters passed 
 - **v2 kept unchecked**: 16-character addresses carry no checksum; Tor dropped them in 2021.
 - **One check**: both engines and `examples/baseline.rs` keep only what `checked_address`
   returns, so they still count the same onions.
-- **No rules version**: `processed.log` doesn't record which rules extracted a pair, so the new
-  rules apply from now on; a fresh `--output-dir` keeps results under one set of rules.
+- **No rules version**: the done marks don't record which rules extracted a pair, so the new
+  rules apply to the Shards extracted from now on.
 - **Tests**: uppercase, mixed case, `.Onion`, a wrong checksum, a version 4 address, page order.
   The old test address encoded version `0xD7`; its replacement is built from a made-up key: the
   first 51 base32 characters are free, the last five computed with Python's `hashlib`.
@@ -1111,19 +1168,11 @@ spellings. Bare scans over 1 GB of a decompressed WARC Archive:
 The engine scans for `.o` and `.O` (`SuffixFinder`) and compares the rest ignoring case. Each
 full `memmem` scan costs ~22 ms per GB, so doing better would take hand-written SIMD.
 
-**Timings** (`-e onion --formats warc`, parse time, release builds):
-
-| Archive | memchr, before → after | regex, before → after |
-|---|---|---|
-| CC-NEWS 1 GB, disk, 3 rounds | 6.0–6.1 → 6.1–6.2 s | 6.1 → 6.4 s |
-| CC-NEWS 1 GB, memory | 6.0 → 6.1 s | 6.0 → 6.3 s |
-| CC-MAIN 0.9 GB, disk | 4.7 → 4.7 s | 4.7 → 4.9 s |
-
-memchr costs ~2 % more, regex ~5 %. The regex's cost can't be written away: every form tried
-(classes, `(?i:onion)`, an ASCII-only `(?i)`) scans at 93 ms per GB, as `regex` searches the 32
-spellings at once. With `-t memory`, the download (11 to 29 s) dwarfs either. On the CC-MAIN
-Archive, old and new binaries wrote identical `onions.json` files with either engine, and
-`baseline` counted the same 25 onions; on the CC-NEWS one, all found the same single onion.
+On 1 GB Archives parsed in 5 to 6 s (`-e onion --formats warc`, release builds), memchr costs
+~2 % more, regex ~5 %; with `-t memory`, the download (11 to 29 s) dwarfs either. The regex's
+cost can't be written away: every form tried (classes, `(?i:onion)`, an ASCII-only `(?i)`) scans
+at 93 ms per GB, as `regex` searches the 32 spellings at once. Old and new binaries, with either
+engine, and `baseline` found the same onions on a CC-MAIN and a CC-NEWS Archive.
 
 ### Rust concepts introduced
 
@@ -1164,182 +1213,39 @@ it, when `false`; `filter_map` then keeps the `Some`s.
 
 ---
 
-## Step 25: Favicon Tags Read as a Browser Reads Them
-
-### What we built
-
-The WARC favicon scanner searched for six literals (`<link `, `<LINK `, `<meta `, ...) with SIMD,
-one pass each, and read each match loosely. Compared with WAT over 99 Shards, it missed tags a
-browser reads (`<Link`, `<link` then a newline, `rel="icon"href=…`, a bare `href=/i.png`, every
-tag after one that didn't close within 4 KB or after a stray quote), kept wrong URLs (`&#038;`
-left in, `href=https://cdn…` cut to `https:`), and read tags a browser ignores (in comments and
-scripts). Now:
-
-- **One forward pass** (`scan_page`): `memchr` jumps to each `<`. `<link>`, `<meta>` and `<base>`
-  start tags are read attribute by attribute (`Attributes`, following the HTML tokenizer's
-  states: a quote opens a value only after `=`, a bare value runs to whitespace or `>`, a name may
-  follow a closing quote directly). Comments are skipped to their `-->` (or `--!>`), bogus ones
-  (`<?php`, `<![CDATA[`, `</` without a letter) to the first `>`, the contents of `script`,
-  `style`, `xmp`, `iframe`, `noembed`, `noframes`, `title` and `textarea` to their end tag; any
-  other tag is passed over at its `<`. No length cap: a tag ends at its first `>` outside quotes,
-  and one still open at the end of the page is dropped. The pass finds the first `<base href>`
-  on the way, so the lazy `<base>` scan of Step 17 went.
-- **Entities decoded** in the values read (`decode_entities`): numeric references, decimal or
-  hex, `;` optional, and `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`. Any other `&` stays.
-- **`rel` as a token list**, in WARC and WAT: a favicon when any token is `icon`,
-  `apple-touch-icon`, `apple-touch-icon-precomposed` or `mask-icon`, ignoring case. `shortcut
-  icon` and `alternate icon` match through `icon`; `fluid-icon` is no favicon.
-- **The `url` crate** resolves every URL, in WARC and WAT, replacing the hand-written
-  `resolve_url`: `..` and `.` removed, `?v=2` against the whole path, `HTTPS://` absolute, `\`
-  read as `/`, the host lowercased. A value that is no URL is dropped. `url` was already built
-  for `reqwest`; it is now a direct dependency.
-- **No HTML crate**: `html5ever` needs UTF-8 and allocates per token on every page, `lol_html` is a
-  large dependency. Where the scanner still reads differently from a browser (a `<link>` inside
-  another tag's quoted attribute, which it reads), the WARC-versus-WAT comparison shows it.
-- **Tests** at two seams: WARC and WAT on the same page (`<Link`, `<link` + newline, `rel`
-  tokens, `../`, `HTTPS://`, `?v=2`, a 5 KB `data:` tag before a normal one), WARC against WAT's
-  decoded form (entities, bare values, no whitespace between attributes, comments, scripts, a
-  stray quote), and WARC alone (`&#38` without `;`, `&copy;` kept, `<textarea>`, `<title>`,
-  `<style>`, `<noscript>`, a 100 KB inline favicon, a tag open at the end of the page).
-
-As with Step 24, `processed.log` doesn't record the rules, so they apply to the Shards extracted
-from now on. Favicon keys are now URLs as `url` writes them, so a file merged across the change
-can hold one favicon under two keys.
-
-**Measured** over the 99 Shards of the earlier WARC-versus-WAT comparison, extracted again in
-both Formats: they now share 99.9 % of WARC's favicon Sightings, against 97.6 %; 3,880 are found
-only in WARC (117,222 before), 1,109 only in WAT (154,942). No URL keeps an entity WAT decoded,
-none ends in `/https:`. Of 38 differing pages read back, nearly all are pages WARC doesn't scan as
-HTML (no HTML `Content-Type`, UTF-16) or comments WAT's parser misreads (`--->`, runs of dashes).
-That sample also found the bogus-comment rule missing: an icon `<link>` after `<?php` is inside a
-comment to a browser.
-
-**Timings** (`-e favicon,inline-favicon --formats warc`, parse time, release builds, before and
-after in alternation):
-
-| Archive | Before | After |
-|---|---|---|
-| CC-MAIN 0.9 GB, memory | 6.0, 5.9 s | 5.9, 5.7 s |
-| CC-MAIN 0.9 GB, disk, 3 rounds | 5.9–6.0 s | 5.8–6.0 s |
-| CC-NEWS 1 GB, disk, 3 rounds | 7.7 s | 7.2–7.3 s |
-
-One `memchr` jump per `<` costs no more than the six SIMD scans for fixed literals it replaces.
-The CC-MAIN Archive gives 45,848 favicon URLs instead of 44,057 and 24 inline favicons instead of
-18; the CC-NEWS one 5,588 URLs instead of 4,884.
-
-### Rust concepts introduced
-
-**An iterator with a result at the end**
-`Attributes` yields `(name, value)` pairs, and its `end` field says, once it is done, where the
-tag ended, or `None` if the page ended first. `for (name, value) in &mut attributes` iterates
-through a mutable borrow (`&mut I` is itself an `Iterator` when `I` is one), so the iterator is
-still there after the loop to read `attributes.end`.
-
-**Const generics and array patterns**
-`read_attributes(page, from, [b"rel", b"href"])` takes the names as `[&[u8]; N]` and returns a
-`StartTag<'a, N>` whose `values` is `[Option<Cow<'a, [u8]>>; N]`. The caller destructures it
-with an array pattern, `let StartTag { values: [rel, href], end } = ...?;`, checked at compile
-time to have `N` elements. `[None; N]` needs a `Copy` element, which `Option<&[u8]>` is and
-`Option<Cow<[u8]>>` isn't: the values are collected as slices, then decoded at once with
-`values.map(|value| value.map(decode_entities))` (`[T; N]::map`).
-
-**`Cow<[u8]>`: decoded only when needed**
-`decode_entities` returns `Cow::Borrowed(value)` when the value holds no `&` (a `memchr`), and
-a new `Vec` (`Cow::Owned`) only otherwise. `PageTags` keeps either, borrowed from the page.
-
-**`char` from a number**
-`char::from_u32(code)` is `None` for a surrogate or a number past U+10FFFF, which HTML reads as
-`char::REPLACEMENT_CHARACTER`; `character.encode_utf8(&mut [0; 4])` writes its UTF-8 bytes into
-a buffer on the stack. `saturating_mul` and `saturating_add` keep a long run of digits from
-overflowing: stuck at `u32::MAX`, it is past Unicode as well.
-
-**`url::Url` and `ParseOptions`**
-`Url::options().base_url(base).parse(value)` is `base.join(value)` with an `Option<&Url>` base:
-with `None`, only an absolute value parses. `String::from(url)` takes the serialization without
-copying it.
-
-**Clippy's `type_complexity`**
-`Option<([Option<Cow<'a, [u8]>>; N], usize)>` drew the lint; a named struct with documented
-fields (`StartTag`) reads better than the tuple it replaced.
-
----
-
-## Step 26: A Stalled Download Fails
-
-During a 100-Shard run, 15 downloads stopped receiving data at once, and the run waited for 38
-minutes without an error until it was stopped by hand. The shared client had a connect timeout
-only: once connected, `reqwest` waits for data forever. TCP keepalive, which `reqwest` enables,
-fails a connection whose peer is gone, not one whose peer answers the probes but sends nothing.
-The client now has a 60 s read timeout (`READ_TIMEOUT`): when the response headers haven't
-arrived that long after the request, or the next chunk of the body that long after the one
-before, the download fails like any other
-download error (partial file removed, Shard left undone, exit 3, downloaded again on the next
-run), with `no data received for 60 s` instead of `reqwest`'s `error decoding response body`.
-The wait starts over with each chunk, so a slow download still receiving data is never cut;
-a timeout on the whole request would cut a slow but healthy 1 GB Archive.
-
-The library now builds the client: `HttpClient::new(read_timeout)` holds the `reqwest::Client`
-and its bound, so the message can state it. The downloads gained inner forms taking the URL
-(and on disk the local path), `download_to` and `download_to_memory`, so
-`tests/download.rs` downloads from a server of its own on 127.0.0.1: one that sends half the
-body and goes silent, one that sends it all in small chunks, slowly. `download_archive` and
-`download_archive_to_memory` build the Common Crawl URL and the `download/` path, then call
-them.
-
-- **`ClientBuilder::read_timeout` vs `timeout`**: the first bounds each read, its timer reset
-  by every chunk received; the second bounds the whole request, body included.
-- **`downcast_ref` on a `Box<dyn Error>`**: `Some(&T)` if the boxed error is a `T`. `?` boxes
-  a `reqwest::Error` as it is, so it can still be found after passing through `save_archive`.
-- **`Error::source` and `iter::successors`**: an error may wrap another, its cause;
-  `successors(first, |&cause| cause.source())` walks that chain as an iterator. `is_timeout`
-  holds for any timeout in the chain, so the system's own (`io::ErrorKind::TimedOut`) and the
-  connect timeout are told apart from the read timeout.
-- **`tokio::time::timeout` in tests**: a future that fails with `Elapsed` once its bound
-  passes, so a download that hangs fails its test rather than `cargo test`.
-- **`TcpListener::bind("127.0.0.1:0")`**: port 0 asks the system for a free port, read back
-  with `local_addr`, so tests running in parallel never collide.
-
----
-
 ## Step 27: Results and Done Marks in a kvrocks Store
 
 ### What we built
 
 After every Shard, each done kind's whole results map was serialised into its JSON file. At
-1.38 GB of favicons (100 Shards of CC-MAIN-2026-34) one save took 2.2–2.4 s, on the loop that
-also polls every download; a full Crawl would be about 1.4 TB of JSON, which no save, `merge`
-or reader can hold in RAM. Results and done marks now go to a kvrocks store (the Redis
-protocol, kept on disk by RocksDB), written per Shard:
+1.38 GB of favicons (100 Shards) one save took 2.2–2.4 s, on the loop that also polls every
+download, and a full Crawl would be about 1.4 TB of JSON, which no save, `merge` or reader can
+hold in RAM. Results and done marks now go to a kvrocks store (the Redis protocol, kept on disk
+by RocksDB), written per Shard:
 
 - **Keys** (`src/store.rs`): `page:<id>` (a hash: `page_url`, `date`, `shard`), `<kind>:<artifact>`
   (the Pages an Artifact was seen on), `page:<id>:<kind>` (a Page's Artifacts), `artifacts:<kind>`,
-  `image:<sha256>` (`media_type`, `mmh3`) and `processed` (`<shard> <kind>`). A Page's id is the
-  first 16 bytes of the SHA-256 of `"<shard> <page_url>"`: the same Page always gets the same id.
+  `image:<sha256>` and `processed` (`<shard> <kind>`). A Page's id is the first 16 bytes of the
+  SHA-256 of `"<shard> <page_url>"`: the same Page always gets the same id.
 - **Only adding**: every write is `SADD` or `HSETNX` (set a field only if absent), so writing a
   Shard again changes nothing, and the first `date` or `media_type` written is kept.
 - **Mark after writes**: a pair joins `processed` only once every write of its Sightings was
   acknowledged. A kill in between leaves the pair undone, and redoing it writes the same
   members. Not `MULTI`/`EXEC`: kvrocks runs `EXEC` under a lock stopping every other client.
 - **A Shard costs its own writes**: no results are loaded at start-up, none kept in RAM; only
-  `processed` is read, to schedule. Measured on a MacBook Pro (Apple M3 Max, 64 GB), release
-  build, kvrocks in Docker Desktop reached over TCP through its published port: three Shards
-  of CC-MAIN-2026-34, `-e favicon` from WAT (45,836 to 47,306 favicon URLs, about 51,000
-  Sightings each), took 1.4 s, 1.6 s and 1.6 s to write, the store holding 0, 46 k and 93 k
-  favicons before each. The JSON save took 2.2–2.4 s at 100 Shards and grew with every one.
+  `processed` is read, to schedule. A Shard's ~51,000 favicon Sightings took 1.4 to 1.6 s to
+  write, whether the store held 0 or 93 k favicons before.
 - **Connection**: `--kvrocks` takes a Unix socket path (default `/tmp/kvrocks.sock`) or a
-  `redis://host:port` URL. TCP is there because kvrocks runs in Docker on macOS, and Docker
-  Desktop's containers live in a Linux VM: their sockets show in a shared directory but can't be
-  connected to from the Mac. The password comes from `CC_EXTRACT_KVROCKS_PASSWORD` only; a URL
-  with one is refused (options show in `ps`). An unreachable store stops the run before any
-  download (exit 1); a failed write leaves the pair undone (exit 3).
+  `redis://host:port` URL, for a kvrocks in Docker Desktop on macOS. The password comes from
+  `CC_EXTRACT_KVROCKS_PASSWORD` only; a URL with one is refused (options show in `ps`). An
+  unreachable store stops the run before any download (exit 1); a failed write leaves the pair
+  undone (exit 3).
 - **Removed**: the JSON files, `processed.log`, `--output-dir`, the end-of-run save, `merge` and
-  `examples/slurm/merge.sh`. `crawl.sh` is marked as not working until runs across several nodes
-  are designed. Inline favicon bytes are dropped once hashed.
-- **Tests**: `tests/store.rs` runs the crawl's store code against `MemoryStore`: several Shards
-  read back as their merge, a Shard written twice leaves every key unchanged, a write failing
-  half-way leaves the pair unmarked and the earlier pairs whole, unknown kinds in `processed`
-  are ignored. `tests/crawl_cli.rs` runs the binary against a real kvrocks when
-  `CC_EXTRACT_TEST_KVROCKS` names a throwaway one, and skips otherwise.
+  `examples/slurm/merge.sh`.
+- **Tests**: `tests/store.rs` runs the crawl's store code against `MemoryStore` (Shards read back
+  as their merge, a Shard written twice changing nothing, a write failing half-way leaving the
+  pair unmarked); `tests/crawl_cli.rs` runs the binary against the kvrocks
+  `CC_EXTRACT_TEST_KVROCKS` names, and skips without one.
 
 ### Rust concepts introduced
 
@@ -1369,7 +1275,7 @@ wait 20. The replies say which `SADD` added a new member: that count is "new Art
 A Unix socket is a file-system name for a connection between processes on one kernel: no TCP
 stack, no port, permissions from the file. It stops at the kernel: a Docker Desktop container
 on macOS runs under the VM's kernel, so its socket file is visible from the Mac but its
-listener is not.
+listener is not, hence the TCP URL.
 
 **`FromStr` as a `clap` value parser**
 `StoreAddress` implements `FromStr`; `clap` derives its parser from that, defaults included, so
@@ -1384,124 +1290,70 @@ mutex, and `PoisonError::into_inner` takes it anyway, the next test emptying the
 
 ---
 
-## Step 28: Image Hashes, Their Indexes, and Images Saved on Request
+## Steps 29–31: Runs Across Processes and Nodes, One Store
 
 ### What we built
 
-An inline favicon was kept under the SHA-256 of its bytes with Shodan's `mmh3`, and its bytes
-were dropped once hashed: a hash another tool searches by, if not computed during the crawl,
-could only be had by crawling again. Each image now carries the hashes other tools look favicons
-up by, can be found from any of them, and can be written to disk:
+A Crawl split among processes, each with its own `--offset` / `--limit`, on one node or
+several, now ends in one store, and re-running the same commands converges. Nothing in the
+store's data needed changing for several writers: Slices don't overlap, every write only adds,
+and runs are told apart by their start time and process id. What did change: `--limit` counted
+Shards to do, so a re-run of a partly done Slice went on into the next process's paths; an
+Archive failing the same way on every run left every run exiting 3, and a script re-running on
+3 never stopped; each process capped its in-memory jobs by all of the machine's free RAM; and a
+store far away and shared made writes slow and connections fragile.
 
-- **Two more hashes** (`src/inline_favicon.rs`): `sha1_hex` and `md5_hex`, from the RustCrypto
-  `sha1` and `md-5` crates (the family of `sha2` and `sha3`). `image:<sha256>` now holds `sha1`
-  and `md5` next to `media_type` and `mmh3`. SHA-256 stays the key: `mmh3` has 32 bits (about
-  116 colliding pairs among a million images, and an image can be built to any value), and MD5
-  and SHA-1 collide on purpose. They serve as other ways to look an image up.
-- **Indexes** (`src/store.rs`): `mmh3:<value>`, `sha1:<hex>` and `md5:<hex>`, sets of the
-  SHA-256s having that hash, written with the pair's other writes (`SADD`, so idempotent), before
-  its mark. Two images sharing an `mmh3` both stay in its set.
-- **`--save-images <dir>`**: `save_images` writes each image of a pair to
-  `<dir>/<sha256[0..2]>/<sha256>` (no extension: the media type is in the store), through
-  `<sha256>.<pid>.part` and a rename, as downloads are saved; a file already there is the image,
-  whole, and is left as is. The result loop saves a pair's images before its store writes: a
-  pair marked done has every image on disk, and one image that can't be written leaves the pair
-  undone (exit 3), its path in the message. Without `inline-favicon` requested, the option is
-  accepted and a start-up line says no image will be saved.
-- **Bytes, not base64**: `InlineFavicon` carried its image as base64 (`data`), for the JSON
-  files the store replaced. It now carries the raw `bytes`, moved in from the decoded
-  `InlineImage` rather than copied; base64 is only computed for `mmh3`.
-- **Tests**: the hash helpers against FIPS 180-2 and RFC 1321 vectors; `tests/store.rs` checks an
-  image's four fields and three index entries through `MemoryStore`, and two images under one
-  `mmh3`; `findings_in` checks every index on each read. `tests/saved_images.rs` tests
-  `save_images` on its own (exact bytes, nothing else in the directory, a file already there kept,
-  a regular file in the way failing with its path); `tests/crawl_cli.rs` runs the binary (saved
-  files, a second run writing nothing, the failure leaving `inline-favicon` undone while `onion`
-  is done, the start-up note).
-
-### Rust concepts introduced
-
-**One trait, several hash crates**
-`Sha256::digest`, `Sha1::digest` and `Md5::digest` are one method of the `digest` crate's
-`Digest` trait, implemented by each RustCrypto hash. Their outputs are arrays of different
-lengths; `hex(digest: &[u8])` takes any of them, `&Sha1::digest(..)` turning into a `&[u8]` by
-*deref coercion*: the output type, `hybrid_array::Array` (which `digest` 0.11 uses), implements
-`Deref<Target = [u8]>`. So one helper writes all three in hex.
-
-**A package name that isn't the library's**
-`md-5` is published under that name (`md5` was another crate's on crates.io) and declares its
-library name `md5` in its own `Cargo.toml` (`[lib] name = "md5"`): `Cargo.toml` lists `md-5`,
-the code writes `use md5::Md5`.
-
-**Privacy follows the module tree**
-`TempFile` and `with_suffix` are private items of the crate root, yet `inline_favicon` uses them
-(`use crate::{TempFile, with_suffix}`): a private item is visible in the module that declares it
-and in all its descendants, and every module is a descendant of the root. No `pub(crate)`
-needed.
-
-**Moving into a closure once a borrow ends**
-`self.favicons.entry(sha256_hex(&image.bytes)).or_insert_with(|| InlineFavicon::new(image))`:
-the key borrows `image` only while it is computed, so the closure, an `FnOnce` run at most once,
-may then move `image` into the new entry. `InlineFavicon::new(image: InlineImage)` takes it by
-value and moves `image.bytes` into the struct: the buffer changes owner, no byte is copied.
-
-**`try_exists` rather than `exists`**
-`Path::exists` answers `false` both when there is no file and when it can't tell (a parent that
-is a regular file, a directory it may not read). `Path::try_exists` returns `io::Result<bool>`:
-`Ok(false)` only for "no file", an `Err` otherwise, which `save_images` reports with the path
-instead of trying to write where it can't.
-
-**Struct update syntax in tests**
-`InlineFavicon { sha1: .., md5: .., ..png(..) }` builds a second image from the first, giving
-only the fields that differ; the rest are moved from the value after `..`.
-
----
-
-## Step 29: Slices, Given-Up Archives, and a Process's Share of RAM
-
-### What we built
-
-Several processes splitting one paths file, each with its own `--offset` / `--limit` and one
-shared store, had three problems on a re-run. `--limit` counted Shards to do, so a re-run of a
-partly done Slice went on into the next process's paths. An Archive failing the same way on
-every run (a 404 on a derived WAT or WET path, bytes corrupt at the source or in `download/`)
-left every run exiting with 3, and a script re-running on 3 never stopped. And each process
-capped its in-memory jobs by all of the machine's free RAM.
-
-- **Slices**: `--limit N` now covers the N non-blank paths after `--offset`, every one
-  considered (done Shards skipped, unusable lines reported), none after it read. Running the
-  same command again retries only the Slice's undone pairs; to advance, move `--offset`.
-- **Counted failures** (`src/lib.rs`): `download_failure_repeats` says whether a download error
-  is an HTTP 4xx other than 408 and 429; `parse_archive` fails with a `ParseError`, `Corrupt`
-  (the Archive's bytes: not gzip, cut short, a malformed record) or `Local` (a file that can't
-  be opened or read, the mmap copy that can't be written), on every Transport. Timeouts,
-  connection errors, 5xx, 408, 429, local I/O, store writes and image saves don't count.
-- **Failure records** (`src/store.rs`): one per Archive and run, written with the existing
-  add-only writes: the message in the hash `failures:<archive>` under the run's `RunId`
+- **Slices**: `--limit N` covers the N non-blank paths after `--offset`, every one considered
+  (done Shards skipped, unusable lines reported), none after it read. Running the same command
+  again retries only the Slice's undone pairs; to advance, move `--offset`.
+- **Counted failures** (`src/lib.rs`): only a failure repeating by nature counts: a download's
+  HTTP 4xx other than 408 and 429 (`download_failure_repeats`), and `ParseError::Corrupt`, the
+  Archive's bytes (not gzip, cut short, a malformed record), on every Transport. Timeouts,
+  connection errors, 5xx, 408, 429, `ParseError::Local` (a local file that can't be opened, read
+  or written), store writes and image saves don't.
+- **Records cut short** (Step 30, `src/warc_parser.rs`): a gzip stream can end cleanly inside a
+  record, and the parsers read most such cuts as the end of the records, so the pair was marked
+  done with the rest of the Archive missing. Data ending inside a record, headers or body, read
+  or passed over, now fails on every Transport with `the Archive ends inside a record`
+  (`cut_record()`, kind `UnexpectedEof`); `WarcSliceIter`'s items became `io::Result`s. Data
+  ending between records is still the end.
+- **Where it broke** (Step 30): every `Corrupt` message ends with `(at byte X of Y)`, X the
+  compressed bytes read when it came (a `Position`, added to by a `Counted` reader under the gzip
+  decoder), Y the compressed size. X runs past the fault by up to the rest of the gzip member
+  and one 32 KiB read; a record cut at the end gives X = Y. The failure records keep each
+  message, so a large run tells how often Archives are damaged, and how far in.
+- **Failure records** (`src/store.rs`): one per Archive and run, add-only like every write: the
+  message in the hash `failures:<archive>` under the run's `RunId`
   (`<seconds>.<nanoseconds>-<pid>` of its start), then `<archive> <run>` in the set `failures`.
-  A failure counts only when both keys hold it, so deleting either (`DEL failures:<archive>`
-  for one Archive, `DEL failures` for all) starts the count over, and a record half-written by
-  a kill counts nothing. `load_failures` reads them in two round trips, the hashes pipelined
-  (`Store::fields_of_each`).
+  A failure counts only when both keys hold it, so `DEL` of either starts the count over, and a
+  record half-written by a kill counts nothing.
 - **Given up after 3 runs** (`GIVE_UP_AFTER`): a pair whose Plan reads a given-up Archive is not
   scheduled. `Plan::avoiding` leaves out the kinds reading an avoided Format and plans the rest
-  again as if only they were requested, so with the WET given up `favicon` still reads WAT; no
-  other Plan is looked for, but `--formats warc` plans around it. Done wins over any record.
-- **Exit 4** (`EXIT_GIVEN_UP`): the run went to the end, nothing retryable is left, and some
-  pair of the Slice is given up. 3 wins over 4. A start-up line counts the Slice's given-up
-  Archives; the summary counts given-up Shards beside processed, skipped and failed, and lists
-  each given-up Archive with the kinds it leaves undone and its last error.
+  again, so with the WET given up `favicon` still reads WAT; no other Plan is looked for, but
+  `--formats warc` plans around it. Done wins over any record. Exit 4 (`EXIT_GIVEN_UP`) when
+  nothing retryable is left and some pair of the Slice is given up (3 wins over 4); the summary
+  lists each given-up Archive with the kinds it leaves undone and its last error.
 - **`--max-memory <GB>`**: with `-t memory`, jobs are capped by the smaller of the available RAM
-  and this share (`memory_jobs`, a pure function); the warning says which one lowered them.
-  Without `-t memory`, a start-up note says it has no effect. `crawl.sh` passes the node's
-  RAM divided by its processes, and counts exit 4 apart from "to retry".
-- **Tests**: `tests/store.rs` (3 runs give up, 2 don't, one run counts once, the latest run's
-  error kept, deleting either key starts over), `tests/download.rs` (404 counts; 408, 429, 503
-  and a stalled download don't, on disk and in memory), `tests/parse_failures.rs` (corrupt bytes
-  repeat on every Transport; a missing file, a directory, an mmap copy in the way don't), unit
-  tests of `Plan::avoiding` and `memory_jobs`, and `tests/crawl_cli.rs` end to end: the same
-  `-o 0 -l 2` command run 4 times never touches paths 3 and 4 and exits 3, 3, 4, 4; `DEL` of
-  the record schedules the Archive again; a given-up WET leaves `onion` until `--formats warc`.
+  and this share (`memory_jobs`, a pure function).
+- **Shards in tasks** (Step 31): the Shard futures ran inside `buffer_unordered`, progressing
+  only while the result loop polled it, so while the loop wrote to a slow store, a download left
+  unpolled for the 60 s read timeout failed on its next poll. `spawn_each(futures, jobs)` runs
+  each future in a `tokio::spawn` task, at most `jobs` at once: the downloads go on while the
+  loop writes.
+- **Reconnecting** (Step 31): one dropped `MultiplexedConnection` failed every later write of
+  the run. `KvrocksStore` now keeps its `Client` and an `Option` of the connection: a call
+  failing with an error the `redis` crate calls unrecoverable forgets it, and the next call opens
+  a new one (one attempt). The crate's `ConnectionManager` does the same with retries and
+  backoff, but needs two more crates.
+- **`crawl.sh`** passes the node's RAM divided by its processes as `--max-memory`, takes the
+  store's `redis://` URL (a socket path refused when the array has more than one task), and
+  counts exit 4 apart from "to retry".
+- **Tests**: unit tests of `Plan::avoiding` and `memory_jobs`; `tests/store.rs` (3 runs give up,
+  deleting either key starts over), `tests/download.rs` (what counts; a trickling download
+  outliving a slow consumer of `spawn_each`), `tests/parse_failures.rs` (cuts and flipped bytes,
+  one message on every Transport); and on the test kvrocks, the same `-o 0 -l 2` command run 4
+  times exiting 3, 3, 4, 4, two processes on disjoint Slices of one paths file, a write after
+  `CLIENT KILL` going through.
 
 ### Rust concepts introduced
 
@@ -1512,6 +1364,32 @@ returns in a `LocalFileError` as it leaves. The gzip decoder and the record pars
 pass errors up as they are, so at the top `err.get_ref()` (the payload, if any) and
 `is::<LocalFileError>()` tell a disk failing to read from bytes failing to decode, where the
 error's kind alone could not.
+
+**End of data: the normal end or an error**
+`Read::read` returning `Ok(0)` only says the data ended. Whether it may end there is the
+caller's to say: between records it is the end (`None`), inside one an error. `read_exact`
+says so with its own `UnexpectedEof`, but the gzip decoder returns the same kind for a member
+cut short, so its error can't be relabelled by kind; `read_full` loops on `read` itself and
+builds its error only where `read` returned `Ok(0)`, passing every other error up as it is.
+
+**An iterator whose items are `Result`s**
+`Iterator<Item = io::Result<T>>` gives three answers where `Option<T>` gives two: an item, an
+error, or the end. An iterator that fails should then return `None`, so a caller that ignores
+the error doesn't spin on it: `WarcSliceIter` moves its position to the end before returning
+the error.
+
+**`Cell`: one count, two holders**
+The gzip decoder owns the reader it reads until parsing ends, but the count is read while it
+still does; a `&mut u64` inside the reader would lock the count away for as long as the reader
+lives. `Cell<u64>` changes through a shared reference (`set`, `get`): the reader holds one
+`&Position`, the caller another. `Cell` hands out copies, never references into its value, so no
+reference can see the value change under it; it isn't `Sync`, so both holders stay on one
+thread. The `Cell` is declared before the readers borrowing it, as locals drop in reverse order.
+
+**Comparing lengths instead of adding offsets**
+`content_length > data.len() - body_start` asks the same as `body_start + content_length >
+data.len()`, but can't overflow: `body_start` is never past the end, while a malformed
+`Content-Length` can be near `usize::MAX`.
 
 **Deriving `Ord` on a struct**
 `#[derive(PartialOrd, Ord)]` compares fields in declaration order, like a tuple: `RunId`
@@ -1537,124 +1415,10 @@ means here: so many jobs fit that the count requested does.
 **`take(usize::MAX)` for "no limit"**
 An `Option<usize>` limit becomes one iterator chain: `.skip(offset).take(limit.unwrap_or(usize::MAX))`.
 
-**Struct update with `Default`**
-`Tally { new_artifacts: .., ..Tally::default() }` gives the one field that differs and takes
-the rest, all zero, from `#[derive(Default)]`.
-
 **Closures that own what they answer with**
 The test server's `serve_once(respond: impl FnOnce(TcpStream) + Send + 'static)` takes a
 closure rather than a `fn` pointer, so `answer("404 Not Found")` can return one holding its
 status line; `Send + 'static` because it moves to another thread, which may outlive the call.
-
----
-
-## Step 30: A Record Cut Short Fails, and Every Corrupt Error Says Where
-
-### What we built
-
-The gzip stream of an Archive can end cleanly with its last record unfinished. The record
-parsers read most such cuts as the end of the records: `WarcRecordIter` on data ending in a
-record's headers or in a body it passed over, `WarcSliceIter` (mmap) on any of them. The pair
-was then marked done with the rest of the Archive missing, and no failure counted. Only a body
-being read and cut short failed, and only on `disk` and `memory`. Now data ending inside a
-record, headers or body, read or passed over, whatever its type, fails on every Transport with
-one message, `the Archive ends inside a record`, as `ParseError::Corrupt`: counted, given up
-after 3 runs. Data ending between two records is still the end; a record missing its
-`Content-Length` still reads as one with an empty body.
-
-Every `Corrupt` error now ends with where it broke, `(at byte X of Y)`: X compressed bytes
-read when it came, Y the compressed Archive's size. The failure records already keep each
-counted message per Archive, so a large run tells, with no other code, how often Archives are
-damaged and whether they break at their start or further in, where reading on from the next
-gzip member would keep the records on either side of the fault. `Local` errors carry no
-position.
-
-- **The parsers** (`src/warc_parser.rs`): `cut_record()` builds the one error (kind
-  `UnexpectedEof`). `WarcRecordIter` returns it on EOF in the headers or a header line without
-  its `\n` (a blank line cut after its `\r` included), and reads bodies, kept or skipped,
-  through `read_full`, which returns it on EOF before the end. `WarcSliceIter`'s
-  items became `io::Result<WarcSlice>`: no `\r\n\r\n` after a `WARC/`, or a body past the end
-  of the data, is `Some(Err(..))`, then `None`.
-- **The position** (`src/lib.rs`): `ParseError::Corrupt { error, at, size }`, its `Display`
-  appending the position. A `Position` holds the compressed bytes read (a `Cell<u64>`, added to
-  by the `Counted` reader under the gzip decoder) and the size (the file's length, or the
-  buffer's in memory); `parse_stream` and `parse_mmap` turn each error into a `ParseError`
-  with `Position::error`. X runs past the fault: the decoder reads 32 KiB at a time and checks
-  a member's checksum at its end, so by up to the rest of the member and one read. A record
-  cut at the end is found once all bytes were read, so X = Y.
-- **Tests**: `tests/parse_failures.rs` (a last gzip member holding a record cut in its headers,
-  in its blank line, in a skipped `request` body, in a read `response` body: `Corrupt`, `the
-  Archive ends inside a record (at byte Y of Y)` on all three Transports; a member in the
-  middle of a 200 KB Archive of incompressible pages with 16 bytes flipped: the same message on
-  all three, X past the damage and at most 32 KiB past the member's end;
-  the earlier corrupt cases give the size, the local ones no position), `tests/download.rs`
-  (an in-memory download whose server announces 1,000 bytes, sends 500 and closes fails, and
-  doesn't count: hyper already checks the body against `Content-Length`).
-
-### Rust concepts introduced
-
-**End of data: the normal end or an error**
-`Read::read` returning `Ok(0)` only says the data ended. Whether it may end there is the
-caller's to say: between records it is the end (`None`), inside one an error. `read_exact`
-says so with its own `UnexpectedEof`, but the gzip decoder returns the same kind for a member
-cut short, so its error can't be relabelled by kind; `read_full` loops on `read` itself and
-builds its error only where `read` returned `Ok(0)`, passing every other error up as it is.
-
-**An iterator whose items are `Result`s**
-`Iterator<Item = io::Result<T>>` gives three answers where `Option<T>` gives two: an item, an
-error, or the end. An iterator that fails should then return `None`, so a caller that ignores
-the error doesn't spin on it: `WarcSliceIter` moves its position to the end before returning
-the error.
-
-**`Cell`: one count, two holders**
-The gzip decoder owns the reader it reads, until parsing ends, but the count is read while it
-still does. A `&mut u64` inside the reader would lock the count away for as long as the reader
-lives. `Cell<u64>` changes through a shared reference (`set`, `get`): the reader holds one
-`&Position`, the caller another. `Cell` hands out copies, never references into its value, so no
-reference can see the value change under it; it isn't `Sync`, so both holders stay on one
-thread. The `Cell` is declared before the readers borrowing it: locals drop in reverse order,
-so it outlives them.
-
-**Comparing lengths instead of adding offsets**
-`content_length > data.len() - body_start` asks the same as `body_start + content_length >
-data.len()`, but can't overflow: `body_start` is never past the end, while a malformed
-`Content-Length` can be near `usize::MAX`.
-
-## Step 31: Runs Across Several Nodes, One Store over TCP
-
-### What we built
-
-A Crawl split across several machines now ends in one store: every process, on every node,
-writes to one kvrocks server over TCP (`--kvrocks redis://host:port`), run outside the job.
-Nothing in the store's data needed changing (Slices don't overlap, every write only adds, and
-runs are told apart by their start time and process id); what did was how the crawl copes with a
-store that is far away and shared.
-
-- **Shards in tasks** (`src/lib.rs`, `src/main.rs`): the Shard futures used to run inside
-  `buffer_unordered`, progressing only while the result loop polled it. While the loop wrote a
-  Shard to the store, the downloads in flight were not polled, and one left unpolled for the
-  60 s read timeout failed on its next poll, data or not. A server shared by many writers makes
-  such long writes likely. `spawn_each(futures, jobs)` runs each future in a task of its own
-  (`tokio::spawn`), at most `jobs` at once: the downloads go on while the loop writes, and a
-  slow store only holds finished Shards back.
-- **Reconnecting** (`src/store.rs`): `KvrocksStore` kept one `MultiplexedConnection`, which
-  fails every command once the server has dropped it, so one network fault failed every write
-  of the rest of the run; now only the call that finds it gone fails. It now keeps its `Client` and an `Option` of the connection: a call
-  failing with an error the `redis` crate calls unrecoverable forgets the connection, and the
-  next call opens a new one (one attempt, 10 s connect timeout). Timeouts and refused commands
-  keep it. Start-up is unchanged: one attempt, then exit 1. The crate's `ConnectionManager`
-  does the same with retries and backoff, but needs two more crates.
-- **`crawl.sh`** no longer says it doesn't work: it takes the store's `redis://` URL, says the
-  password goes in the environment before `sbatch`, and refuses a socket path when the array
-  has more than one task.
-- **Tests**: `tests/download.rs` (a download from a server trickling data goes on while the
-  consumer of `spawn_each` takes longer than the read timeout to come back; without the
-  tasks it fails with `no data received for 0.5 s`), `tests/crawl_cli.rs` (gated on the test
-  kvrocks: two processes started together on disjoint Slices of one paths file leave both
-  Slices' done marks and Sightings in the store; after `CLIENT KILL` drops the store's
-  connection, the write that finds it gone may fail, and the one after it goes through).
-
-### Rust concepts introduced
 
 **`tokio::spawn` and its `Send + 'static` bound**
 A spawned future is handed to the runtime, which polls it on any of its worker threads and
