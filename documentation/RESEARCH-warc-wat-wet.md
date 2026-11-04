@@ -6,9 +6,10 @@ Code state: branch `favicon-extraction`, commit 86298b8.
 Names below are those of that commit, kept as measured. The binary is now
 `cc-extract`; the `memchr` and `bytes` strategies are `--onion-engine memchr`
 and `regex`, the `mmap` strategy `-t mmap`, and stream mode (`-m`) is
-`-t memory`. The `parse_warc_*` functions became one `parse_archive`, and the
-WAT + WET reading this document recommends is the default Plan on CC-MAIN
-(`documentation/FEATURES.md`).
+`-t memory`. The `parse_warc_*` functions became one `parse_archive`. The
+WAT + WET reading this document recommends was the default Plan on CC-MAIN
+for a while; WARC is the default now, as it finds the most, and WAT + WET is
+`--formats wat,wet` (`documentation/FEATURES.md`, section 2).
 
 ## 1. Question and TL;DR
 

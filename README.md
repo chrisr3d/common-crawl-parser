@@ -6,12 +6,12 @@ This project is also a **hands-on Rust tutorial** — each step introduces new l
 
 ## Purpose
 
-Common Crawl publishes petabytes of crawled web pages. Each Shard of a Crawl (one file-level part of it) comes in up to three Formats: WARC (raw HTTP responses, ~1 GB), WAT (JSON metadata extracted from them, ~170 MB) and WET (their plain text, ~70 MB). This tool downloads, for each Shard, the cheapest Formats that hold what was asked for, parses them, and extracts the requested Artifact kinds:
+Common Crawl publishes petabytes of crawled web pages. Each Shard of a Crawl (one file-level part of it) comes in up to three Formats: WARC (raw HTTP responses, ~1 GB), WAT (JSON metadata extracted from them, ~170 MB) and WET (their plain text, ~70 MB). This tool downloads, for each Shard, the Formats that find the most of what was asked for, parses them, and extracts the requested Artifact kinds:
 
-| Artifact kind | What | Formats it can read |
+| Artifact kind | What | Formats it can read, finding the most first |
 |---------------|------|---------------------|
-| `onion` (default) | `.onion` (Tor hidden service) addresses | WARC, or WAT + WET |
-| `favicon` (default) | Favicon URLs that HTML pages declare | WARC, or WAT |
+| `onion` (default) | `.onion` (Tor hidden service) addresses | WARC, then WAT + WET |
+| `favicon` (default) | Favicon URLs that HTML pages declare | WARC, then WAT |
 | `inline-favicon` | Favicon images that HTML pages embed as base64 `data:` URIs | WARC |
 
 The words used here (Shard, Format, Archive, Artifact, Sighting, Plan) are defined in [`GLOSSARY.md`](GLOSSARY.md).
@@ -32,7 +32,7 @@ The project was built incrementally and now features the following:
 10. **In-memory parsing** — Parse from memory with `--transport memory` to skip disk I/O entirely
 11. **Resource guards** — Layered concurrency caps (CPU cores, available RAM, a process's share of it with `--max-memory`) prevent oversubscription and OOM
 12. **Incremental extraction** — Pick Artifact kinds with `-e`; a later run adds kinds without redoing the ones already done
-13. **Format planning** — Per Shard, download only the cheapest Formats that serve every requested kind (`--formats` to force them): on CC-MAIN, `onion` and `favicon` read WAT + WET (~240 MB) instead of WARC (~1 GB), `favicon` alone WAT only
+13. **Format planning** — Per Shard, each requested kind reads the Formats that find the most of it: WARC (~1 GB). `--formats` forces smaller ones: with `wat,wet` (~240 MB), `onion` reads WAT + WET and `favicon` WAT, finding a little less. An Archive given up sends each kind reading it to its next Formats
 14. **HPC batch mode** — Split a Crawl across processes with `--offset` and `--limit`, each covering its own Slice of the paths file, all writing to one store; running the same command again retries only what its Slice left undone, and an Archive failing the same way on 3 runs is given up instead of retried forever. Across several nodes, every node writes to one store over TCP (the SLURM example in [`examples/slurm/`](examples/slurm/))
 
 Additional features:
@@ -89,10 +89,10 @@ cargo run -- warc.paths -j 2                   # 2 concurrent Shards (default: C
 cargo run -- warc.paths -d                     # delete each Shard's Archives after parsing
 cargo run -- warc.paths -e onion               # extract onions only (default: onion,favicon)
 cargo run -- warc.paths -e onion,favicon       # later: adds favicons, skips the onion work done
-cargo run -- warc.paths -e onion,inline-favicon  # inline favicons need WARC; onions read it too
+cargo run -- warc.paths -e onion,inline-favicon  # onions and inline favicons, from the same WARC
 cargo run -- warc.paths -e inline-favicon --save-images images  # also write each image to images/
 cargo run -- wat.paths.gz                      # any Format's paths file: Shards are the same
-cargo run -- warc.paths --formats warc         # force the Formats downloaded per Shard
+cargo run -- warc.paths --formats wat,wet      # smaller Formats: a quarter of the download, fewer onions
 cargo run -- warc.paths -t disk                # parse from the downloaded file (default)
 cargo run -- warc.paths -t memory              # parse from memory (no disk I/O)
 cargo run -- warc.paths -t memory --max-memory 12  # ... holding at most 12 GB of Archives
@@ -141,22 +141,24 @@ statuses. `tests/cli_help.rs` fails when the block above no longer matches the b
 
 ## Artifact Kinds and Plans
 
-Before downloading a Shard, the program picks its Plan: the cheapest Formats, among those the
-Shard's Dataset publishes, that serve every requested kind not yet done for it. Each kind then reads
-the cheapest of its own accepted Formats inside the Plan:
+Each kind lists the Formats it can read from those that find the most to those that find the
+least (table above). Before downloading a Shard, the program picks its Plan: each requested kind
+not yet done for it reads the first of its Formats the Shard's Dataset publishes. On CC-MAIN and
+CC-NEWS alike, every kind reads WARC (~1 GB per Shard). What a Format finds decides, not its
+size: WAT + WET miss about 2 % of live onions and every inline favicon.
 
-| `--extract` | Plan on CC-MAIN | Downloaded per Shard |
-|-------------|-----------------|----------------------|
-| `onion,favicon` (default) | WAT + WET: `onion` reads both, `favicon` WAT | ~240 MB |
-| `favicon` | WAT | ~170 MB |
-| `onion` | WAT + WET | ~240 MB |
-| anything with `inline-favicon` | WARC: every kind reads it | ~1 GB |
+`--formats` forces the Formats a run may download. Each kind then reads the first of its
+Formats made of them, and a forced Format no kind reads is not downloaded:
 
-CC-NEWS publishes WARC only, so its Plan is always WARC.
-`--formats` forces the Formats
-downloaded; it is rejected if they can't serve a requested kind
-(`cannot extract favicon from wet: it needs warc or wat`). WARC and WAT + WET find the same
-Artifacts on most pages, not all: see [`FEATURES.md`](documentation/FEATURES.md#known-limitations).
+| `--formats` | `onion` reads | `favicon` reads | Downloaded per Shard |
+|-------------|---------------|-----------------|----------------------|
+| none (default) | WARC | WARC | ~1 GB |
+| `wat,wet` | WAT + WET | WAT | ~240 MB (~170 MB for `favicon` alone) |
+| `warc,wat` | WARC | WARC | ~1 GB: no kind reads WAT |
+
+A forced set that can't serve a requested kind is rejected at startup (`cannot extract favicon
+from wet: it needs warc or wat`); `inline-favicon` needs WARC. What each Format finds and misses:
+see [`FEATURES.md`](documentation/FEATURES.md#known-limitations).
 
 ## Transports and Onion Engines
 
@@ -183,11 +185,11 @@ Key optimizations: the custom record parser skips the bodies of records no kind 
 of a WARC), SIMD literal search replaces the regex engine, `zlib-ng` backend for faster gzip
 decompression.
 
-The `memory` Transport holds every Archive of a Shard's Plan in RAM (~240 MB for WAT + WET,
-~1 GB for WARC) × concurrent jobs. Layered resource guards automatically cap concurrency:
-jobs are limited to 2× CPU cores, and with `--transport memory`, further limited by available
-RAM (queried on macOS and Linux), or `--max-memory` GB if lower, divided by the largest
-estimated Plan among the scheduled Shards, to prevent OOM. Processes sharing a machine each
+The `memory` Transport holds every Archive of a Shard's Plan in RAM (~1 GB for WARC, the
+default; ~240 MB for WAT + WET) × concurrent jobs. Layered resource guards automatically cap
+concurrency: jobs are limited to 2× CPU cores, and with `--transport memory`, further limited by
+available RAM (queried on macOS and Linux), or `--max-memory` GB if lower, divided by the
+largest estimated Plan among the scheduled Shards, to prevent OOM. Processes sharing a machine each
 see all of its available RAM: `--max-memory` gives each one its share.
 
 ## Results Store
@@ -234,11 +236,12 @@ anything is downloaded. If the store needs a password, it is read from
 `CC_EXTRACT_KVROCKS_PASSWORD`, never from an option.
 
 A failure that comes back on every run (a download answered 404, an Archive whose bytes don't
-decode or make the parser panic) is counted against its Archive, once per run. After 3 runs the Archive is given up: the
-kinds reading it are not scheduled again, the summary lists it with its last error, and a run
-with nothing else left to retry exits with 4. `--formats` can plan around it (a given-up WET:
-`--formats warc`). To retry it, delete its record (and an Archive corrupt in `download/`, so it
-is downloaded again):
+decode or make the parser panic) is counted against its Archive, once per run. After 3 runs the
+Archive is given up: each kind reading it reads its next Formats instead (a given-up WARC:
+`onion` reads WAT + WET, `favicon` WAT), and a kind with none left is not scheduled again. The
+summary lists the Archive with its last error, and a run with nothing else left to retry exits
+with 4. To retry it, delete its record (and an Archive corrupt in `download/`, so it is
+downloaded again):
 
 ```sh
 redis-cli -s /tmp/kvrocks.sock DEL failures:<archive file name>   # retry one Archive

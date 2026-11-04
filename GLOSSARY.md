@@ -51,11 +51,11 @@ One occurrence of an Artifact: the Page it was seen on, which gives when that Pa
 _Avoid_: source, occurrence
 
 **Format requirement**:
-The Format combinations able to serve an Artifact kind; for example `onion` is served by WARC alone or by WAT and WET together.
+The Format combinations able to serve an Artifact kind, from the one that finds the most to the one that finds the least; for example `onion` is served by WARC alone or, finding less, by WAT and WET together.
 _Avoid_: mapping, minimum format
 
 **Plan**:
-The Formats read for one Shard: the cheapest combination, among those its Dataset offers, that meets the Format requirement of every requested Artifact kind.
+The Formats read for one Shard: for each requested Artifact kind, the first combination of its Format requirement that the Shard's Dataset offers.
 _Avoid_: strategy
 
 ### Running

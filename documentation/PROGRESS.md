@@ -621,25 +621,30 @@ already holds the fixture, so no network is needed, and compares loaded results,
 
 ---
 
-## Steps 14–16: Formats: the Planner, WET and WAT Archives
+## Steps 14–16 and 33: Formats: the Planner, WET and WAT Archives
 
 ### What we built
 
-Each Shard is planned before download: the cheapest Formats serving every requested kind, one
-Archive per Format, each handed to the kinds that read it. On CC-MAIN, the default
-`-e onion,favicon` downloads WAT + WET (~240 MB per Shard) instead of WARC (~1 GB), `onion`
-reading both and `favicon` WAT only.
+Each Shard is planned before download: each requested kind reads the Formats that find the most
+of it among those the Shard offers, one Archive per Format, each handed to the kinds that read
+it. By default every kind reads WARC (~1 GB per Shard). Until Step 33 the cheapest Formats
+serving every kind won, so `-e onion,favicon` read WAT + WET on CC-MAIN (~240 MB), finding
+about 2 % fewer live onions.
 
 - **Formats and Datasets** (`src/format.rs`): `Format { Warc, Wat, Wet }` (suffix, directory,
   estimated size: 1 GB, 170 MB, 70 MB), `FormatSet`, and `Dataset { CcMain, CcNews }`, read from
   the path prefix, with the Formats each publishes. A Shard's three Archives differ only in the
   last directory and the suffix, so any one locates the others (`ArchivePath`), and the input can
   be a WARC, WAT or WET paths file.
-- **The planner** (`src/plan.rs`): `cheapest_fit` (a kind's cheapest accepted combination within
-  some Formats) and `cheapest_plan` (the cheapest subset of the Dataset's Formats that every kind
-  fits in). `onion` accepts WARC or WAT + WET, `favicon` WARC or WAT. `--formats` forces the
-  Plan; it is rejected at startup if it can't serve a kind (`Error: cannot extract favicon from
-  wet: it needs warc`), and for a Shard whose Dataset lacks one of its Formats.
+- **The planner** (`src/plan.rs`): each kind's Format requirement lists its combinations from the
+  one that finds the most (`onion` WARC, then WAT + WET; `favicon` WARC, then WAT), and
+  `first_fit` gives the first one made of some Formats. `Plan::new` gives each kind its first fit
+  among the Formats the Dataset publishes, or the forced ones: inside `--formats wat,wet`,
+  `onion` reads both and `favicon` WAT; inside `--formats warc,wat`, WAT is not downloaded.
+  Forced Formats are rejected at startup if they can't serve a kind (`Error: cannot extract
+  favicon from wet: it needs warc or wat`), and for a Shard whose Dataset lacks one of them.
+  Archive size estimates only budget RAM for `-t memory`. Before Step 33, `cheapest_fit` and
+  `cheapest_plan` (the cheapest subset of the Dataset's Formats) chose by size.
 - **Per Shard**: every Archive of the Plan is downloaded, each parsed with the extractors of the
   kinds reading it, and their Sightings unioned. A kind is saved and marked only if every Archive
   it reads parsed (`Plan::split_done`), so a failed download no longer stops kinds that don't
@@ -656,11 +661,15 @@ reading both and `favicon` WAT only.
   records in three not made from a `response`; the rest are parsed once, into structs declaring
   only the path down to `Head` (`PageRecord::Wat`). The crawl date is inside the JSON, so a
   record whose JSON can't be read is skipped. Onions are searched in the raw JSON, which keeps
-  addresses as WARC does with three exceptions: onions only in the plain text are gone (WET has
-  them), one right after an escape such as `\n` is missed, and one in the page URL is found.
+  addresses as WARC does with two exceptions: onions only in the plain text are gone (WET has
+  them), and one right after an escape such as `\n` is missed. An address in the page URL (a Tor
+  gateway's `<address>.onion.ly`), which the JSON repeats, WARC missed until Step 33 made its
+  search read the page URL before the response.
   Favicons come from `Head`; `data:` URLs are skipped, as ia-web-commons cuts them short.
 - **Tests**: `tests/wet_archive.rs` and `tests/wat_archive.rs` write the same pages as WARC, WAT
-  and WET; WAT + WET find what WARC finds.
+  and WET; WAT + WET find what WARC finds. Step 33 added unit tests of the default and forced
+  Plans, two gateway pages to the characterization fixture (an address in the URL alone, and in
+  both URL and body: one Sighting), and end-to-end runs of the default and forced Plans.
 
 ### Rust concepts introduced
 
@@ -685,6 +694,11 @@ it visits every non-empty subset (seven at most):
 Returns the item with the smallest key, or `None` from an empty iterator, so "nothing fits"
 needs no separate check. The key comes from a closure, so `FormatSet` needs no `Ord`; a tie
 keeps the first.
+
+**Lazy iterators and `next`**
+`combinations_inside` returns `map(...).filter(...)` unrun: each combination is built and
+checked only when asked for. `first_fit` asks once, with `next()`, so the combinations after
+the first fit are never looked at, where `min_by_key` had to see every item.
 
 **`FromIterator`; collecting into `Result` and `Option`**
 Implementing `FromIterator<Format> for FormatSet` makes it a `collect()` target. Collecting
@@ -1290,7 +1304,7 @@ mutex, and `PoisonError::into_inner` takes it anyway, the next test emptying the
 
 ---
 
-## Steps 29–31: Runs Across Processes and Nodes, One Store
+## Steps 29–31 and 33: Runs Across Processes and Nodes, One Store
 
 ### What we built
 
@@ -1328,11 +1342,15 @@ store far away and shared made writes slow and connections fragile.
   A failure counts only when both keys hold it, so `DEL` of either starts the count over, and a
   record half-written by a kill counts nothing.
 - **Given up after 3 runs** (`GIVE_UP_AFTER`): a pair whose Plan reads a given-up Archive is not
-  scheduled. `Plan::avoiding` leaves out the kinds reading an avoided Format and plans the rest
-  again, so with the WET given up `favicon` still reads WAT; no other Plan is looked for, but
-  `--formats warc` plans around it. Done wins over any record. Exit 4 (`EXIT_GIVEN_UP`) when
-  nothing retryable is left and some pair of the Slice is given up (3 wins over 4); the summary
-  lists each given-up Archive with the kinds it leaves undone and its last error.
+  scheduled. `Plan::avoiding` gives each kind its first combination among the Formats left
+  (`FormatSet::difference`): with the WARC given up, `onion` reads WAT + WET and `favicon` WAT,
+  and a kind with nothing left is left out, listed under each given-up Archive in its way. The
+  run giving an Archive up plans the Shard's undone kinds again the same way, so those with a
+  next combination are left to the next run (exit 3). Until Step 33 a kind reading an avoided
+  Format was left out, other combinations or not. Done wins over any record. Exit 4
+  (`EXIT_GIVEN_UP`) when nothing retryable is left and some pair of the Slice is given up (3 wins
+  over 4); the summary lists each given-up Archive with the kinds it leaves undone and its last
+  error.
 - **`--max-memory <GB>`**: with `-t memory`, jobs are capped by the smaller of the available RAM
   and this share (`memory_jobs`, a pure function).
 - **Shards in tasks** (Step 31): the Shard futures ran inside `buffer_unordered`, progressing
@@ -1353,7 +1371,8 @@ store far away and shared made writes slow and connections fragile.
   outliving a slow consumer of `spawn_each`), `tests/parse_failures.rs` (cuts and flipped bytes,
   one message on every Transport); and on the test kvrocks, the same `-o 0 -l 2` command run 4
   times exiting 3, 3, 4, 4, two processes on disjoint Slices of one paths file, a write after
-  `CLIENT KILL` going through.
+  `CLIENT KILL` going through. Step 33 added a given-up WARC (`onion` and `favicon` done from
+  WAT + WET, `inline-favicon` given up) and a given-up WARC then WET (`onion` given up under both).
 
 ### Rust concepts introduced
 

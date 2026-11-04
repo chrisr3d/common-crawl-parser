@@ -9,8 +9,8 @@ defined in `GLOSSARY.md`.
 ## At a glance
 
 One run takes a Common Crawl paths file, works out which Shards still need which
-of the requested Artifact kinds, downloads the cheapest Archives that serve them,
-and writes what it finds to a kvrocks store (see section 9):
+of the requested Artifact kinds, downloads for each kind the Archives that find
+the most of it, and writes what it finds to a kvrocks store (see section 9):
 
 - `onion`: every `.onion` address found, with the pages it appeared on.
 - `favicon`: every favicon URL an HTML page declares, with the pages that
@@ -25,7 +25,7 @@ are extracted in the same pass over each Archive.
 
 ```text
 paths file ──▶ schedule the Slice's Shards (offset, limit; skip the kinds done or given up)
-           ──▶ plan each Shard's Formats (cheapest serving every kind)
+           ──▶ plan each Shard's Formats (per kind, those finding the most)
            ──▶ download its Archives (to disk or to memory) ┐ up to --jobs Shards
            ──▶ parse them on the blocking thread pool       ┘ in flight at once
            ──▶ per kind done, one Shard at a time: write its Sightings to the
@@ -73,50 +73,59 @@ nothing. To go on to the next paths, move `--offset`.
 Code: `src/artifact.rs` (requirements), `src/plan.rs` (planner),
 `src/format.rs` (Formats and Datasets).
 
-Each kind accepts some combinations of Formats (its Format requirement):
+Each kind accepts some combinations of Formats (its Format requirement),
+listed from the one that finds the most to the one that finds the least:
 
-| Artifact kind | Accepted combinations | Default |
+| Artifact kind | Accepted combinations, finding the most first | Default |
 |---|---|---|
-| `onion` | WARC, or WAT + WET | on |
-| `favicon` | WARC, or WAT | on |
+| `onion` | WARC, then WAT + WET | on |
+| `favicon` | WARC, then WAT | on |
 | `inline-favicon` | WARC | off |
 
-A Shard's Plan is the cheapest combination of Formats, among those its Dataset
-publishes, that contains an accepted combination for every kind still to do
-for it. Cost is the estimated Archive size: WARC ~1 GB, WAT ~170 MB,
-WET ~70 MB. Inside the Plan, each kind reads the cheapest of its own accepted
-combinations:
+For each Shard, every kind still to do for it reads the first of its
+combinations made of Formats the Shard's Dataset publishes. The Shard's Plan
+is what the kinds read together, and only those Archives are downloaded.
+CC-MAIN publishes all three Formats and CC-NEWS WARC only, so by default every
+kind reads WARC on both (~1 GB per Shard).
 
-| Kinds to do | Plan on CC-MAIN | Who reads what |
-|---|---|---|
-| `onion` + `favicon` | WAT + WET (~240 MB) | `onion` both, `favicon` WAT |
-| `onion` | WAT + WET | `onion` both |
-| `favicon` | WAT (~170 MB) | `favicon` WAT |
-| anything with `inline-favicon` | WARC (~1 GB) | every kind WARC |
+The order rests on what each combination found over 99 Shards of
+CC-MAIN-2026-34 (`RESEARCH-warc-wat-wet.md`, section 4.7). WARC finds every onion WAT +
+WET find, and more: about 2 % of live onions sit where only WARC keeps them
+(inline scripts, attribute values, comments). For favicon URLs, WARC and WAT
+share 99.9 % of WARC's Sightings, each finding a few the other misses (see
+Known limitations). The size of the Archives chooses nothing: WAT + WET is
+about a quarter of WARC's download (~240 MB per Shard), one option away
+(`--formats wat,wet`). The estimated sizes (WARC ~1 GB, WAT ~170 MB, WET
+~70 MB) only budget RAM for `-t memory` (section 8).
 
-CC-MAIN publishes all three Formats; CC-NEWS publishes WARC only, so its Plan
-is always WARC. Since the
-Plan depends on the kinds still to do, two Shards of one run can have different
-Plans.
-
-`--formats warc,wat,wet` forces the Formats downloaded for every Shard. It is
-rejected at startup if they can't serve a requested kind
+`--formats warc,wat,wet` forces the Formats a run may download for every
+Shard. It is rejected at startup if they can't serve a requested kind
 (`cannot extract favicon from wet: it needs warc or wat`), and when a Shard is
-planned if its Dataset doesn't publish one of them. Each kind still reads the
-cheapest combination it accepts among the forced Formats, and a forced Format
-no kind reads is not downloaded.
+planned if its Dataset doesn't publish one of them. The same rule applies
+inside them: each kind reads the first of its combinations made of forced
+Formats, and a forced Format no kind reads is not downloaded.
+
+| `--formats` | `onion` reads | `favicon` reads | `inline-favicon` reads |
+|---|---|---|---|
+| none (default) | WARC | WARC | WARC |
+| `wat,wet` | WAT + WET (~240 MB) | WAT (~170 MB) | rejected |
+| `warc,wat` | WARC | WARC: WAT is not downloaded | WARC |
+| `wat` | rejected | WAT | rejected |
 
 A kind reading several Archives gets the union of what each one gave: Sightings
 are not joined record by record. A (Shard, kind) pair is done only when every
-Archive that kind reads has been downloaded and parsed; a failed
-WET Archive leaves `onion` undone but still lets `favicon` finish from WAT.
+Archive that kind reads has been downloaded and parsed: inside `--formats
+wat,wet`, a failed WET Archive leaves `onion` undone but still lets `favicon`
+finish from WAT.
 
-A kind whose Plan reads a given-up Archive (section 9) is left out of the
-Shard's Plan, and the kinds left are planned again as if only they were
-requested: with the WET given up, `favicon` is planned alone (WAT), `onion`
-is given up. No other Plan is looked for around the Archive, even when one
-exists (`onion` could read WARC); `--formats` can force one, such as
-`--formats warc`.
+A kind whose combination reads a given-up Archive (section 9) reads instead
+its next combination avoiding every given-up Archive of the Shard, inside the
+forced Formats if any: less data beats none. It is left out, given up, only
+when no combination is left. With the WARC given up, `onion` reads WAT + WET,
+`favicon` WAT, and `inline-favicon` is given up; with the WET given up too,
+`onion` is given up as well. Since the Plan depends on the kinds still to do
+and on the Shard's given-up Archives, two Shards of one run can have
+different Plans.
 
 ## 3. Download
 
@@ -277,17 +286,20 @@ lowercasing (`onion_search::checked_address`), so they count the same onions.
 
 **Where it looks.** Every page record, whatever its content type:
 
-- WARC: the whole HTTP response: HTML, JavaScript, JSON, plain text, and the HTTP
-  headers. Headers matter: in the sample measured in
-  `RESEARCH-warc-wat-wet.md`, 53 % of matches came from `Onion-Location` and
-  `Content-Security-Policy` headers.
-- WAT: the raw JSON bytes, which repeat the HTTP headers and hold the page's
-  links, link texts and `<meta>` contents. An address is made of ASCII letters,
-  digits and `.`, which JSON never escapes, so it is found as in WARC.
+- WARC: the page URL (`WARC-Target-URI`), then the whole HTTP response: HTML,
+  JavaScript, JSON, plain text, and the HTTP headers. Headers matter: in the
+  sample measured in `RESEARCH-warc-wat-wet.md`, 53 % of matches came from
+  `Onion-Location` and `Content-Security-Policy` headers. The URL holds the
+  address of a page read through a Tor web gateway (`<address>.onion.ly/…`).
+- WAT: the raw JSON bytes, which repeat the WARC headers (the page URL among
+  them) and the HTTP headers, and hold the page's links, link texts and
+  `<meta>` contents. An address is made of ASCII letters, digits and `.`,
+  which JSON never escapes, so it is found as in WARC.
 - WET: the page's text.
 
 Together, WAT and WET hold most places an onion is found: over 99 Shards they
-found 208 of the 215 distinct onions WARC found.
+found 208 of the 215 distinct onions WARC found. The one they found alone was
+in a gateway page's URL, which the WARC search has read since.
 [Known limitations](#known-limitations) lists where the rest were.
 
 **What it records.** For each address, in lowercase, one Sighting per distinct
@@ -301,8 +313,8 @@ shard     CC-MAIN-20250101000000-20250101010101-00000
 ```
 
 `date` is when the page was crawled, in every Format. The same page crawled in
-two Shards yields two Sightings. Several mentions on one page, or in both its
-WAT and WET records, yield one.
+two Shards yields two Sightings. Several mentions on one page (its URL
+included), or in both its WAT and WET records, yield one.
 
 ## 6. Favicon extraction
 
@@ -495,7 +507,8 @@ The number of jobs (default: one per logical CPU core) is capped in two steps:
 1. At most 2x the number of logical CPU cores.
 2. With `--transport memory` only, at most `memory / largest Plan`, where the
    largest Plan is the biggest estimated size among the scheduled Shards'
-   Plans (~240 MB for WAT + WET, ~1 GB for WARC), and the memory the smaller
+   Plans (~1 GB for WARC, the default; ~240 MB for `--formats wat,wet`), and
+   the memory the smaller
    of the available RAM and `--max-memory` (in GB of 2^30 bytes, fractions
    allowed). RAM is read from `sysctl` on macOS or `/proc/meminfo` on Linux
    (`MemAvailable`); on other platforms `--max-memory` alone caps, and
@@ -588,8 +601,8 @@ kinds and Shards, and exits with 3.
 a member without a kind this version knows is ignored, its pairs done again. A
 later run with more kinds extracts only the new ones for the Shards already
 done. A Shard whose download or parse failed is not marked for the kinds
-reading the Archive that failed, and is retried on the next run, unless the
-Archive is given up.
+reading the Archive that failed, and is retried on the next run; once the
+Archive is given up, on the kinds' next combination (below).
 
 **Given-up Archives.** Some failures come back on every run: they are counted
 against the Archive, at most once per run.
@@ -617,14 +630,16 @@ records are read in two round trips: `failures`, then the hashes of the
 Archives it lists, sent together.
 
 After 3 runs counted a failure on it (fixed, with no option), the Archive is
-given up, and so is every pair whose Plan reads it: such a pair is not
-scheduled, and the given-up Archive is not downloaded (section 2). A pair done
-later all the same, through `--formats` planning around the Archive, is
-marked done as usual: done wins over any record. The run that gives an
-Archive up says so at that Shard; at start-up, a line gives the number of
-given-up Archives in the Slice (those leaving out a requested kind not yet
-done), and the summary lists each with the kinds it leaves undone and its last
-error.
+given up and no longer downloaded. Each pair reading it is planned on its next
+combination avoiding the Shard's given-up Archives, and is given up only when
+none is left: such a pair is not scheduled (section 2). A pair done on its
+next combination is marked done as usual, the record staying in the store:
+done wins over any record. The run that gives an Archive up says so at that
+Shard, and gives up there the kinds with no combination left; the others are
+left undone for the next run, which reads their next combination (exit 3). At
+start-up, a line gives the number of given-up Archives in the Slice (those
+leaving out a requested kind not yet done), and the summary lists each with
+the kinds it leaves undone and its last error.
 
 To retry, delete the records: the Archive is scheduled again, its count
 started over. An Archive corrupt in `download/` is parsed again as it is: remove
@@ -703,7 +718,7 @@ own machine can reach.
 | `-j`, `--jobs N` | CPU cores | Shards in flight at once (capped, see section 8) |
 | `-d`, `--delete` | off | Delete each Shard's Archives from `download/` once parsed (not with `-t memory`) |
 | `-e`, `--extract K,...` | `onion,favicon` | Artifact kinds: `onion`, `favicon`, `inline-favicon` |
-| `--formats F,...` | the Plan | Force the Formats downloaded: `warc`, `wat`, `wet` |
+| `--formats F,...` | per kind, those finding the most (WARC) | Force the Formats a run may download: `warc`, `wat`, `wet` (section 2) |
 | `-t`, `--transport T` | `disk` | `disk`, `memory` or `mmap` |
 | `--max-memory GB` | available RAM | With `-t memory`, the most RAM the process's downloads may hold, in GB of 2^30 bytes (section 8) |
 | `--onion-engine E` | `memchr` | `memchr` or `regex` |
@@ -722,7 +737,7 @@ command again:
 | 1 | Stopped early, such as on a missing or unreadable paths file, an unreachable store, an `--offset` past the end, or a Plan no Shard can meet | Once the cause is fixed |
 | 2 | Invalid option or value (`clap`'s code for usage errors) | Once the command is fixed |
 | 3 | Ran to the end with some Shards left with kinds a run may still do: a failed download, parse, store write or image save | Yes, the same command |
-| 4 | Ran to the end with nothing left to retry, but some pairs of the Slice given up, by this run or an earlier one: an Archive they read failed the same way on 3 runs | Only once the given-up Archives' records are deleted, or with `--formats` planning around them (section 9) |
+| 4 | Ran to the end with nothing left to retry, but some pairs of the Slice given up, by this run or an earlier one: each combination they may read (inside `--formats`) reads an Archive that failed the same way on 3 runs | Only once the given-up Archives' records are deleted, or with `--formats` letting in another combination (section 9) |
 
 Early stops come before anything is downloaded or written. Shards that fail
 don't stop the run: the others go on, and the run exits with 3 at the end. 3
@@ -735,18 +750,17 @@ to retry, and leave the exit status at 0.
 
 Behaviour that is surprising or incomplete today, roughly in order of impact.
 
-- **WAT + WET miss some onions WARC finds.** Over 99 Shards of
-  CC-MAIN-2026-34, the default Plan missed 7 of the 215 distinct onions WARC
-  found (3.3 %) and 21 of its 1,470 Sightings (1.4 %). Every one sat where
+- **WAT + WET (`--formats wat,wet`, or a given-up WARC) miss some onions
+  WARC finds.** Over 99 Shards of CC-MAIN-2026-34, they missed 7 of the 215
+  distinct onions WARC found (3.3 %) and 21 of its 1,470 Sightings (1.4 %). Every one sat where
   WAT and WET keep nothing: inline scripts, JSON inside `<script>`,
   attributes WAT doesn't keep (`<input value>`, `data-*`) and HTML comments.
   Several were a site's own Tor mirror. The bodies of non-HTML responses
   (JavaScript, JSON, CSS, PDF, plain text) are dropped too. In WAT, an address
   right after a JSON escape of a control character (`\n`, `\t`) is missed, the
-  escape's last letter reading as part of it; one in the page URL itself is
-  found, since the JSON repeats the WARC headers (WARC only searches the HTTP
-  response). `--formats warc` finds them all, for about 4 times the download
-  (`RESEARCH-warc-wat-wet.md`, section 4.7).
+  escape's last letter reading as part of it. WARC, the default, finds them
+  all, for about 4 times the download (`RESEARCH-warc-wat-wet.md`, section
+  4.7).
 - **Favicons differ slightly between WARC and WAT.** Over 99 Shards of
   CC-MAIN-2026-34 they share 99.9 % of WARC's Sightings; 3,880 are found only
   in WARC, 1,109 only in WAT. What still differs, from a sample of the pages:

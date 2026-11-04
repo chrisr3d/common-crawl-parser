@@ -23,7 +23,7 @@ Rust learning project (crate `cc-extract`): extracts Artifacts (`.onion` address
 
 ## Design rules
 
-Parsing separates three independent choices: Transport (how bytes arrive: disk, memory, mmap), Format (how records are read: WARC, WAT, WET), Artifact kind (what is extracted). Per Shard, the planner (`src/plan.rs`) downloads the cheapest Formats serving every requested kind. Keep the three independent:
+Parsing separates three independent choices: Transport (how bytes arrive: disk, memory, mmap), Format (how records are read: WARC, WAT, WET), Artifact kind (what is extracted). Per Shard, the planner (`src/plan.rs`) gives each requested kind the first Formats of its Format requirement the Shard offers, those finding the most. Keep the three independent:
 
 - One parsing loop (`parse_archive`, `src/lib.rs`) serves every Transport and Format, and never names a kind: kind-specific work lives in the extractors (`src/extractor.rs`).
 - Every Transport and `--onion-engine` combination gives identical results (`tests/parse_characterization.rs` cross-checks them).
