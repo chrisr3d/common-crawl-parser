@@ -61,8 +61,9 @@ impl ArtifactKind {
         Self::value_variants()
     }
 
-    /// The Format combinations this kind can be extracted from,
-    /// among which the planner chooses (`plan`).
+    /// The Format combinations this kind can be extracted from, from the
+    /// one that finds the most to the one that finds the least: the
+    /// planner reads the first one a Shard offers (`plan`).
     ///
     /// ## A static table as a `match`
     ///
@@ -79,11 +80,16 @@ impl ArtifactKind {
     /// as a `const` item.
     pub const fn format_requirement(self) -> FormatRequirement {
         match self {
-            // WAT keeps the HTTP headers, links and `<meta>` contents, WET
-            // the visible text: either alone misses onions, the two
-            // together missed none in the sample (`RESEARCH-warc-wat-wet.md`).
+            // WARC keeps the whole response. WAT keeps the HTTP headers,
+            // links and `<meta>` contents, WET the visible text: either
+            // alone misses onions, and together they still miss those in
+            // inline scripts, attribute values and comments, about 2 % of
+            // the live onions WARC found on 99 Shards
+            // (`RESEARCH-warc-wat-wet.md`, section 4.7).
             ArtifactKind::Onion => &[&[Format::Warc], &[Format::Wat, Format::Wet]],
-            // WAT lists every `<link>` and `<meta>` tag of the `<head>`.
+            // WAT lists every `<link>` and `<meta>` tag of the `<head>`, as
+            // Common Crawl's parser read them; scanning the WARC page also
+            // finds those after the comments that parser misreads.
             ArtifactKind::Favicon => &[&[Format::Warc], &[Format::Wat]],
             // Only WARC keeps the images: WAT cuts every `data:` URL after
             // its first comma (`trimDataUrl` in ia-web-commons), and WET

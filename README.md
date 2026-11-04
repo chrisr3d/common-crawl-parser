@@ -127,7 +127,7 @@ Options:
   -j, --jobs <JOBS>                  Number of concurrent download+parse tasks (default: number of CPU cores)
   -d, --delete                       Delete each Shard's Archives once parsed
   -e, --extract <EXTRACT>            Artifact kinds to extract, comma-separated [default: onion,favicon] [possible values: onion, favicon, inline-favicon]
-      --formats <FORMATS>            Formats to download for every Shard, comma-separated (default: the cheapest ones serving every kind) [possible values: warc, wat, wet]
+      --formats <FORMATS>            Formats to download for every Shard, comma-separated (default: for each kind, those finding the most: WARC) [possible values: warc, wat, wet]
   -t, --transport <TRANSPORT>        How downloaded Archives reach the parser [default: disk] [possible values: disk, memory, mmap]
       --max-memory <GB>              Most RAM this process's in-memory downloads may hold, in GB of 2^30 bytes (default: the available RAM)
       --onion-engine <ONION_ENGINE>  Search used to find .onion addresses [default: memchr] [possible values: memchr, regex]

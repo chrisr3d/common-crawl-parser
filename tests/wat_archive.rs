@@ -259,8 +259,9 @@ fn seen_on(page_url: &str, date: &str) -> Sighting {
 }
 
 /// `onion` accepts WAT + WET instead of WARC, `favicon` WAT.
-/// The Plan for both reads WAT and WET; the favicon extractor finds nothing
-/// in WET, so handing it WET too changes nothing.
+/// Inside `--formats wat,wet`, the Plan for both reads WAT and WET; the
+/// favicon extractor finds nothing in WET, so handing it WET too changes
+/// nothing.
 #[test]
 fn wat_and_wet_together_find_what_warc_finds() {
     let [warc, wat, wet] = write_archives(

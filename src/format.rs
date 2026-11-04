@@ -70,9 +70,9 @@ impl Format {
         }
     }
 
-    /// Typical size of one Archive in this Format: the cost the planner
-    /// minimizes, and what the RAM guard of `--transport memory` expects
-    /// one download to hold.
+    /// Typical size of one Archive in this Format: what the RAM guard of
+    /// `--transport memory` expects one download to hold. It chooses no
+    /// Format: the planner goes by what each Format finds (`plan`).
     pub fn estimated_size(self) -> u64 {
         match self {
             Format::Warc => 1024 * MB,
@@ -122,11 +122,9 @@ impl fmt::Display for Format {
 /// operations then become single integer operations:
 ///
 /// - union: `a | b`, intersection: `a & b`
+/// - difference: `a & !b`
 /// - "every member of `a` is in `b`": no bit of `a` is outside `b`, so
 ///   `a & !b == 0`
-///
-/// and the subsets of a set are numbers no larger than the set itself
-/// (`subsets`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FormatSet(u8);
 
@@ -157,6 +155,11 @@ impl FormatSet {
         FormatSet(self.0 & other.0)
     }
 
+    /// The Formats of `self` that are not in `other`: `a & !b`.
+    pub fn difference(self, other: FormatSet) -> FormatSet {
+        FormatSet(self.0 & !other.0)
+    }
+
     pub fn is_empty(self) -> bool {
         self == FormatSet::EMPTY
     }
@@ -175,21 +178,6 @@ impl FormatSet {
     /// The total estimated size of one Archive per Format in the set.
     pub fn estimated_size(self) -> u64 {
         self.iter().map(Format::estimated_size).sum()
-    }
-
-    /// Every non-empty subset of this set.
-    ///
-    /// ## Enumerating subsets with a bitmask
-    ///
-    /// A subset only clears bits, so its value is at most the set's own;
-    /// counting from 1 (the smallest non-empty set) up to the set's value
-    /// visits every subset, plus numbers that have a bit the set lacks,
-    /// which `is_subset_of` drops. With three Formats that is at most
-    /// seven numbers, so trying them all costs nothing.
-    pub fn subsets(self) -> impl Iterator<Item = FormatSet> {
-        (1..=self.0)
-            .map(FormatSet)
-            .filter(move |subset| subset.is_subset_of(self))
     }
 }
 

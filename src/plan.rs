@@ -1,15 +1,17 @@
 // The planner — which Formats to read for one Shard
 //
 // Each Artifact kind accepts some Format combinations, its Format
-// requirement (`ArtifactKind::format_requirement`). The Plan for a Shard is
-// the cheapest set of Formats, among those its Dataset publishes, that
-// contains an accepted combination of every requested kind. Each kind then
-// reads the cheapest of its own combinations inside the Plan: with `onion`
-// (WARC, or WAT + WET) and `favicon` (WARC, or WAT), the Plan is WAT + WET,
-// `onion` reads both and `favicon` reads WAT only.
+// requirement (`ArtifactKind::format_requirement`), listed from the one
+// that finds the most to the one that finds the least. For each Shard,
+// every requested kind reads the first of them made of Formats its Dataset
+// publishes (of the forced ones, with `--formats`), and the Plan is what
+// the kinds read together: with `onion` (WARC, then WAT + WET) and
+// `favicon` (WARC, then WAT) on CC-MAIN, both read WARC.
 //
-// The cost of a set is the estimated size of its Archives
-// (`Format::estimated_size`), what a Shard costs to download.
+// What a kind finds decides, not what its Archives cost to download: the
+// size estimates (`Format::estimated_size`) only budget RAM. A kind whose
+// Archive is given up reads its next combination avoiding it, and is left
+// out only when none is left (`Plan::avoiding`).
 
 use std::error::Error;
 use std::fmt;
@@ -18,57 +20,62 @@ use crate::artifact::ArtifactKind;
 use crate::format::{Dataset, Format, FormatSet};
 
 // ---------------------------------------------------------------------------
-// Format requirements and the planner
+// Format requirements
 // ---------------------------------------------------------------------------
 
-/// The Format combinations that can serve one Artifact kind; any one of
-/// them is enough. `&[&[Format::Warc], &[Format::Wat, Format::Wet]]` reads
-/// "WARC, or WAT and WET together".
+/// The Format combinations that can serve one Artifact kind, from the one
+/// that finds the most to the one that finds the least; any one of them is
+/// enough. `&[&[Format::Warc], &[Format::Wat, Format::Wet]]` reads "WARC,
+/// or else WAT and WET together".
 pub type FormatRequirement = &'static [&'static [Format]];
 
-/// The cheapest of `requirement`'s combinations made only of Formats in
-/// `inside`; `None` when none of them fits.
+/// `requirement`'s combinations made only of Formats in `inside`, in its
+/// order, as sets.
 ///
-/// ## `Iterator::min_by_key`
+/// ## Lazy iterators
 ///
-/// `min_by_key` returns the item whose key is smallest, `None` for an empty
-/// iterator, so "no combination fits" needs no separate check. The key is
-/// computed by a closure (here the estimated size), so the items themselves
-/// need no `Ord`.
-pub fn cheapest_fit(requirement: FormatRequirement, inside: FormatSet) -> Option<FormatSet> {
+/// Nothing is built when this returns: each combination is turned into a
+/// set and checked only when the caller asks for the next one, so a caller
+/// stopping at the first (`first_fit`) never looks at the others.
+fn combinations_inside(
+    requirement: FormatRequirement,
+    inside: FormatSet,
+) -> impl Iterator<Item = FormatSet> {
     requirement
         .iter()
         .map(|combination| FormatSet::of(combination))
-        .filter(|combination| combination.is_subset_of(inside))
-        .min_by_key(|combination| combination.estimated_size())
+        .filter(move |combination| combination.is_subset_of(inside))
 }
 
-/// The cheapest subset of `available` that contains an accepted
-/// combination of every requirement; `None` when even all of `available`
-/// can't serve one of them.
+/// The first of `requirement`'s combinations made only of Formats in
+/// `inside`, the one finding the most; `None` when none of them fits.
 ///
-/// Every non-empty subset is tried (`FormatSet::subsets`): with three
-/// Formats there are seven, so a cleverer search would gain nothing.
-pub fn cheapest_plan(
-    available: FormatSet,
-    requirements: &[FormatRequirement],
-) -> Option<FormatSet> {
-    available
-        .subsets()
-        .filter(|&plan| {
-            requirements
-                .iter()
-                .all(|&requirement| cheapest_fit(requirement, plan).is_some())
-        })
-        .min_by_key(|plan| plan.estimated_size())
+/// `Iterator::next` gives the first item, `None` from an empty iterator,
+/// so "no combination fits" needs no separate check.
+pub fn first_fit(requirement: FormatRequirement, inside: FormatSet) -> Option<FormatSet> {
+    combinations_inside(requirement, inside).next()
+}
+
+/// The Formats a Shard of `dataset` may read: the `forced` ones
+/// (`--formats`), if the Dataset publishes each of them, else every Format
+/// it publishes.
+fn allowed_formats(dataset: Dataset, forced: Option<FormatSet>) -> Result<FormatSet, PlanError> {
+    let available = dataset.available_formats();
+    let Some(forced) = forced else {
+        return Ok(available);
+    };
+    match forced.iter().find(|&format| !available.contains(format)) {
+        Some(format) => Err(PlanError::Unavailable { dataset, format }),
+        None => Ok(forced),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Plans
 // ---------------------------------------------------------------------------
 
-/// The kinds `Plan::avoiding` left out, each with the avoided Formats it
-/// read.
+/// The kinds `Plan::avoiding` left out, each with the avoided Formats that
+/// stand in its way.
 pub type LeftOut = Vec<(ArtifactKind, FormatSet)>;
 
 /// What one Shard reads: for each requested kind, the Formats its
@@ -79,70 +86,61 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Plan a Shard of `dataset` for `kinds`: the cheapest Formats the
-    /// Dataset publishes, or the `forced` ones (`--formats`).
+    /// Plan a Shard of `dataset` for `kinds`: each reads the first of its
+    /// combinations among the Formats the Dataset publishes, or among the
+    /// `forced` ones (`--formats`).
     pub fn new(
         dataset: Dataset,
         kinds: &[ArtifactKind],
         forced: Option<FormatSet>,
     ) -> Result<Plan, PlanError> {
-        let available = dataset.available_formats();
-        let formats = match forced {
-            Some(forced) => {
-                if let Some(format) = forced.iter().find(|&format| !available.contains(format)) {
-                    return Err(PlanError::Unavailable { dataset, format });
-                }
-                forced
-            }
-            None => {
-                let requirements: Vec<FormatRequirement> =
-                    kinds.iter().map(|kind| kind.format_requirement()).collect();
-                // `None` only when some kind can't be served even by every
-                // Format the Dataset publishes: `within` then names it.
-                cheapest_plan(available, &requirements).unwrap_or(available)
-            }
-        };
-        Plan::within(formats, kinds)
+        Plan::within(allowed_formats(dataset, forced)?, kinds)
     }
 
-    /// Plan `kinds` as `new` does, leaving out each kind that reads one of
-    /// the `avoided` Formats (such as one whose Archive was given up). The
-    /// kinds left are planned again as if only they were requested, until
-    /// none of them reads one.
+    /// Plan `kinds` as `new` does, around the `avoided` Formats (such as
+    /// one whose Archive was given up): each kind reads the first of its
+    /// combinations that reads none of them, and is left out when none is
+    /// left. Less data beats none: with WARC avoided, `onion` reads WAT +
+    /// WET, `favicon` WAT, and `inline-favicon` is left out.
     ///
     /// Returns the Plan of the kinds left, `None` when none is, and each
-    /// kind left out with the avoided Formats it read. No other Plan is
-    /// looked for around an avoided Format: a kind is left out even if
-    /// another of its combinations would do (`forced` Formats can plan
-    /// around one).
+    /// kind left out with the avoided Formats its combinations read, those
+    /// standing in its way. Fails as `new` does,
+    /// whatever is avoided: a kind no combination can serve is a
+    /// configuration error, not a given-up Archive.
     pub fn avoiding(
         dataset: Dataset,
         kinds: &[ArtifactKind],
         forced: Option<FormatSet>,
         avoided: FormatSet,
     ) -> Result<(Option<Plan>, LeftOut), PlanError> {
+        let formats = allowed_formats(dataset, forced)?;
+        // Only the check matters here: every kind must be served when
+        // nothing is avoided. The Plan it builds is dropped.
+        Plan::within(formats, kinds)?;
+
+        let mut reads = Vec::new();
         let mut left_out = Vec::new();
-        let mut kinds = kinds.to_vec();
-        // Each pass leaves out at least one kind or ends the loop, so it
-        // ends after at most one pass per kind.
-        while !kinds.is_empty() {
-            let plan = Plan::new(dataset, &kinds, forced)?;
-            let reading_avoided: LeftOut = plan
-                .reads
-                .iter()
-                .map(|&(kind, reads)| (kind, reads.intersection(avoided)))
-                .filter(|(_, avoided_read)| !avoided_read.is_empty())
-                .collect();
-            if reading_avoided.is_empty() {
-                return Ok((Some(plan), left_out));
+        for &kind in kinds {
+            let requirement = kind.format_requirement();
+            match first_fit(requirement, formats.difference(avoided)) {
+                Some(read) => reads.push((kind, read)),
+                None => {
+                    let in_the_way = combinations_inside(requirement, formats)
+                        .fold(FormatSet::EMPTY, |all, combination| {
+                            all.union(combination.intersection(avoided))
+                        });
+                    left_out.push((kind, in_the_way));
+                }
             }
-            kinds.retain(|kind| !reading_avoided.iter().any(|(left, _)| left == kind));
-            left_out.extend(reading_avoided);
         }
-        Ok((None, left_out))
+        // `bool::then_some` turns `true` into `Some(value)`, `false` into
+        // `None`.
+        let plan = (!reads.is_empty()).then_some(Plan { reads });
+        Ok((plan, left_out))
     }
 
-    /// Each of `kinds` reading the cheapest of its combinations inside
+    /// Each of `kinds` reading the first of its combinations inside
     /// `formats`; fails on the first kind none of them fits.
     ///
     /// ## Collecting into a `Result`
@@ -155,7 +153,7 @@ impl Plan {
         let reads = kinds
             .iter()
             .map(
-                |&kind| match cheapest_fit(kind.format_requirement(), formats) {
+                |&kind| match first_fit(kind.format_requirement(), formats) {
                     Some(reads) => Ok((kind, reads)),
                     None => Err(PlanError::Unserved { kind, formats }),
                 },
@@ -248,97 +246,100 @@ impl Error for PlanError {}
 mod tests {
     use super::*;
     use crate::format::Dataset;
+    use ArtifactKind::{Favicon, InlineFavicon, Onion};
     use Format::{Warc, Wat, Wet};
 
     // The real requirement tables.
-    const ONION: FormatRequirement = ArtifactKind::Onion.format_requirement();
-    const FAVICON: FormatRequirement = ArtifactKind::Favicon.format_requirement();
-    const INLINE_FAVICON: FormatRequirement = ArtifactKind::InlineFavicon.format_requirement();
+    const ONION: FormatRequirement = Onion.format_requirement();
+    const FAVICON: FormatRequirement = Favicon.format_requirement();
 
-    fn cc_main() -> FormatSet {
-        Dataset::CcMain.available_formats()
+    fn set(formats: &[Format]) -> FormatSet {
+        FormatSet::of(formats)
+    }
+
+    /// What each of `plan`'s kinds reads, in the order requested.
+    fn reads(plan: &Plan) -> Vec<(ArtifactKind, FormatSet)> {
+        plan.kinds()
+            .into_iter()
+            .map(|kind| {
+                let read = Format::all()
+                    .iter()
+                    .copied()
+                    .filter(|&format| plan.kinds_reading(format).contains(&kind))
+                    .collect();
+                (kind, read)
+            })
+            .collect()
     }
 
     #[test]
-    fn onion_and_favicon_plan_wat_and_wet() {
+    fn each_kind_reads_its_first_combination_inside_the_formats() {
+        let wat_wet = set(&[Wat, Wet]);
         assert_eq!(
-            cheapest_plan(cc_main(), &[ONION, FAVICON]),
-            Some(FormatSet::of(&[Wat, Wet]))
+            first_fit(ONION, Dataset::CcMain.available_formats()),
+            Some(set(&[Warc]))
         );
+        assert_eq!(first_fit(ONION, wat_wet), Some(wat_wet));
+        assert_eq!(first_fit(FAVICON, wat_wet), Some(set(&[Wat])));
     }
 
     #[test]
-    fn favicon_alone_plans_wat() {
-        assert_eq!(
-            cheapest_plan(cc_main(), &[FAVICON]),
-            Some(FormatSet::of(&[Wat]))
-        );
+    fn no_combination_fits_outside_the_formats() {
+        assert_eq!(first_fit(FAVICON, set(&[Wet])), None);
     }
 
+    // `Plan::new` and `Plan::avoiding` use the real requirement table.
+
     #[test]
-    fn inline_favicon_plans_warc_whatever_comes_with_it() {
-        for others in [&[][..], &[ONION], &[FAVICON], &[ONION, FAVICON]] {
-            let requirements = [others, &[INLINE_FAVICON]].concat();
-            assert_eq!(
-                cheapest_plan(cc_main(), &requirements),
-                Some(FormatSet::of(&[Warc])),
-                "with {} other kind(s)",
-                others.len()
-            );
+    fn every_kind_reads_warc_on_cc_main() {
+        for kinds in [
+            &[Onion][..],
+            &[Favicon],
+            &[Onion, Favicon],
+            &[Onion, Favicon, InlineFavicon],
+        ] {
+            let plan = Plan::new(Dataset::CcMain, kinds, None).unwrap();
+            assert_eq!(plan.formats(), set(&[Warc]), "{kinds:?}");
+            assert_eq!(plan.kinds_reading(Warc), kinds, "{kinds:?}");
         }
     }
 
     #[test]
-    fn cc_news_plans_warc() {
+    fn every_kind_reads_warc_on_cc_news() {
+        let kinds = [Onion, Favicon, InlineFavicon];
+        let plan = Plan::new(Dataset::CcNews, &kinds, None).unwrap();
+        assert_eq!(plan.formats(), set(&[Warc]));
+        assert_eq!(plan.kinds_reading(Warc), kinds);
+    }
+
+    #[test]
+    fn forced_wat_and_wet_serve_onion_from_both_and_favicon_from_wat() {
+        let plan = Plan::new(Dataset::CcMain, &[Onion, Favicon], Some(set(&[Wat, Wet]))).unwrap();
         assert_eq!(
-            cheapest_plan(Dataset::CcNews.available_formats(), &[ONION, FAVICON]),
-            Some(FormatSet::of(&[Warc]))
+            reads(&plan),
+            [(Onion, set(&[Wat, Wet])), (Favicon, set(&[Wat]))]
         );
     }
 
     #[test]
-    fn each_kind_reads_its_cheapest_combination_inside_the_plan() {
-        let wat_wet = FormatSet::of(&[Wat, Wet]);
-        assert_eq!(cheapest_fit(ONION, wat_wet), Some(wat_wet));
-        assert_eq!(cheapest_fit(FAVICON, wat_wet), Some(FormatSet::of(&[Wat])));
-
-        // Inside a Plan of every Format, WAT + WET is cheaper than WARC.
-        assert_eq!(cheapest_fit(ONION, cc_main()), Some(wat_wet));
-    }
-
-    #[test]
-    fn no_combination_fits_outside_the_plan() {
-        assert_eq!(cheapest_fit(FAVICON, FormatSet::of(&[Wet])), None);
-    }
-
-    // `Plan::new` and `Plan::within` use the real requirement table.
-
-    #[test]
-    fn default_kinds_read_wat_and_wet_on_cc_main() {
-        let plan = Plan::new(
-            Dataset::CcMain,
-            &[ArtifactKind::Onion, ArtifactKind::Favicon],
-            None,
-        )
-        .unwrap();
-        assert_eq!(plan.formats(), FormatSet::of(&[Wat, Wet]));
+    fn forced_formats_no_kind_reads_are_not_downloaded() {
+        // Inside WARC + WAT, `favicon` and `onion` read WARC first: no
+        // kind reads WAT.
+        let plan = Plan::new(Dataset::CcMain, &[Onion, Favicon], Some(set(&[Warc, Wat]))).unwrap();
         assert_eq!(
-            plan.kinds_reading(Wat),
-            [ArtifactKind::Onion, ArtifactKind::Favicon]
+            reads(&plan),
+            [(Onion, set(&[Warc])), (Favicon, set(&[Warc]))]
         );
-        assert_eq!(plan.kinds_reading(Wet), [ArtifactKind::Onion]);
-
-        let plan = Plan::new(Dataset::CcMain, &[ArtifactKind::Favicon], None).unwrap();
-        assert_eq!(plan.formats(), FormatSet::of(&[Wat]));
+        assert_eq!(plan.formats(), set(&[Warc]));
     }
 
     #[test]
     fn forced_formats_must_serve_every_kind() {
-        let wet = FormatSet::of(&[Wet]);
+        let wet = set(&[Wet]);
         assert_eq!(
-            Plan::new(Dataset::CcMain, &[ArtifactKind::Favicon], Some(wet)),
+            Plan::new(Dataset::CcMain, &[Favicon], Some(wet)),
             Err(PlanError::Unserved {
-                kind: ArtifactKind::Favicon,
+                kind: Favicon,
                 formats: wet
             })
         );
@@ -348,11 +349,11 @@ mod tests {
     fn wet_alone_cannot_serve_onion() {
         // WET drops HTTP headers and attribute values, where most onions
         // are: it serves `onion` only together with WAT.
-        let wet = FormatSet::of(&[Wet]);
+        let wet = set(&[Wet]);
         assert_eq!(
-            Plan::new(Dataset::CcMain, &[ArtifactKind::Onion], Some(wet)),
+            Plan::new(Dataset::CcMain, &[Onion], Some(wet)),
             Err(PlanError::Unserved {
-                kind: ArtifactKind::Onion,
+                kind: Onion,
                 formats: wet
             })
         );
@@ -361,11 +362,7 @@ mod tests {
     #[test]
     fn forced_formats_must_be_published_by_the_dataset() {
         assert_eq!(
-            Plan::new(
-                Dataset::CcNews,
-                &[ArtifactKind::Onion],
-                Some(FormatSet::of(&[Warc, Wat]))
-            ),
+            Plan::new(Dataset::CcNews, &[Onion], Some(set(&[Warc, Wat]))),
             Err(PlanError::Unavailable {
                 dataset: Dataset::CcNews,
                 format: Wat
@@ -374,79 +371,88 @@ mod tests {
     }
 
     #[test]
-    fn forced_formats_no_kind_reads_are_not_downloaded() {
-        let plan = Plan::new(
-            Dataset::CcMain,
-            &[ArtifactKind::Onion],
-            Some(FormatSet::of(&[Warc, Wat])),
-        )
-        .unwrap();
-        assert_eq!(plan.formats(), FormatSet::of(&[Warc]));
+    fn around_an_avoided_warc_each_kind_falls_back_on_its_next_combination() {
+        let kinds = [Onion, Favicon, InlineFavicon];
+
+        let (plan, left_out) = Plan::avoiding(Dataset::CcMain, &kinds, None, set(&[Warc])).unwrap();
+
+        assert_eq!(
+            reads(&plan.unwrap()),
+            [(Onion, set(&[Wat, Wet])), (Favicon, set(&[Wat]))]
+        );
+        // No other combination serves `inline-favicon`.
+        assert_eq!(left_out, [(InlineFavicon, set(&[Warc]))]);
     }
 
     #[test]
-    fn a_kind_reading_an_avoided_format_is_left_out_and_the_rest_planned_again() {
-        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
+    fn a_kind_is_left_out_when_every_combination_reads_an_avoided_format() {
+        let kinds = [Onion, Favicon];
 
         let (plan, left_out) =
-            Plan::avoiding(Dataset::CcMain, &kinds, None, FormatSet::of(&[Wet])).unwrap();
+            Plan::avoiding(Dataset::CcMain, &kinds, None, set(&[Warc, Wet])).unwrap();
 
-        assert_eq!(
-            plan,
-            Some(Plan::new(Dataset::CcMain, &[ArtifactKind::Favicon], None).unwrap())
-        );
-        assert_eq!(plan.unwrap().formats(), FormatSet::of(&[Wat]));
-        assert_eq!(left_out, [(ArtifactKind::Onion, FormatSet::of(&[Wet]))]);
+        assert_eq!(reads(&plan.unwrap()), [(Favicon, set(&[Wat]))]);
+        // Each avoided Format stands in the way of one combination.
+        assert_eq!(left_out, [(Onion, set(&[Warc, Wet]))]);
     }
 
     #[test]
-    fn no_other_plan_is_looked_for_around_an_avoided_format() {
-        // `favicon` could read WARC instead: it is left out all the same.
-        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
-        let wat = FormatSet::of(&[Wat]);
-
-        assert_eq!(
-            Plan::avoiding(Dataset::CcMain, &kinds, None, wat),
-            Ok((
-                None,
-                vec![(ArtifactKind::Onion, wat), (ArtifactKind::Favicon, wat)]
-            ))
-        );
-    }
-
-    #[test]
-    fn forced_formats_can_plan_around_an_avoided_one() {
-        let warc = FormatSet::of(&[Warc]);
+    fn forced_formats_fall_back_inside_themselves() {
+        // WAT + WET is not inside WARC + WAT: `onion` has nothing left.
         let (plan, left_out) = Plan::avoiding(
             Dataset::CcMain,
-            &[ArtifactKind::Onion],
-            Some(warc),
-            FormatSet::of(&[Wet]),
+            &[Onion, Favicon],
+            Some(set(&[Warc, Wat])),
+            set(&[Warc]),
         )
         .unwrap();
 
-        assert_eq!(plan.unwrap().formats(), warc);
-        assert!(left_out.is_empty());
+        assert_eq!(reads(&plan.unwrap()), [(Favicon, set(&[Wat]))]);
+        assert_eq!(left_out, [(Onion, set(&[Warc]))]);
     }
 
     #[test]
-    fn nothing_avoided_plans_as_new_does() {
-        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
+    fn no_plan_when_every_kind_is_left_out() {
         assert_eq!(
-            Plan::avoiding(Dataset::CcMain, &kinds, None, FormatSet::EMPTY),
-            Ok((
-                Some(Plan::new(Dataset::CcMain, &kinds, None).unwrap()),
-                vec![]
-            ))
+            Plan::avoiding(Dataset::CcNews, &[Onion, Favicon], None, set(&[Warc])),
+            Ok((None, vec![(Onion, set(&[Warc])), (Favicon, set(&[Warc]))]))
+        );
+    }
+
+    #[test]
+    fn an_avoided_format_no_kind_reads_changes_nothing() {
+        let kinds = [Onion, Favicon];
+        for avoided in [FormatSet::EMPTY, set(&[Wet])] {
+            assert_eq!(
+                Plan::avoiding(Dataset::CcMain, &kinds, None, avoided),
+                Ok((
+                    Some(Plan::new(Dataset::CcMain, &kinds, None).unwrap()),
+                    vec![]
+                )),
+                "{avoided}"
+            );
+        }
+    }
+
+    #[test]
+    fn avoiding_fails_as_new_does_on_formats_serving_no_combination() {
+        let wet = set(&[Wet]);
+        assert_eq!(
+            Plan::avoiding(Dataset::CcMain, &[Favicon], Some(wet), set(&[Warc])),
+            Err(PlanError::Unserved {
+                kind: Favicon,
+                formats: wet
+            })
         );
     }
 
     #[test]
     fn a_kind_is_done_only_once_every_format_it_reads_parsed() {
-        let kinds = [ArtifactKind::Onion, ArtifactKind::Favicon];
-        let plan = Plan::new(Dataset::CcMain, &kinds, None).unwrap();
+        let kinds = [Onion, Favicon];
+        let plan = Plan::new(Dataset::CcMain, &kinds, Some(set(&[Wat, Wet]))).unwrap();
 
         assert_eq!(plan.split_done(FormatSet::EMPTY), (vec![], kinds.to_vec()));
+        assert_eq!(plan.split_done(set(&[Wat])), (vec![Favicon], vec![Onion]));
         assert_eq!(plan.split_done(plan.formats()), (kinds.to_vec(), vec![]));
     }
 }

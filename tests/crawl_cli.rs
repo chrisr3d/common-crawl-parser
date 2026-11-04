@@ -414,8 +414,8 @@ fn saved_png(workspace: &Path) -> PathBuf {
 /// A kind added later runs alone on a Shard already done for the
 /// others, and ends up with the same store as asking for every kind at once.
 ///
-/// Every run reads WARC (`--formats warc`), the one Format both kinds can
-/// share: the test is about kinds, not Formats.
+/// Every run reads WARC, the default for both kinds: the test is about
+/// kinds, not Formats.
 #[test]
 fn adding_a_kind_later_runs_only_that_kind() {
     let Some(store) = TestStore::take("adding_a_kind_later_runs_only_that_kind") else {
@@ -425,14 +425,12 @@ fn adding_a_kind_later_runs_only_that_kind() {
         "adding_a_kind_later_runs_only_that_kind",
         &[(WARC_NAME, warc_archive())],
     );
-    let crawl_warc =
-        |args: &[&str]| crawl(&store, &dir, &[&["--formats", "warc"][..], args].concat());
 
-    crawl_warc(&["-e", "onion"]);
-    let second_run = crawl_warc(&["-e", "onion,favicon"]);
+    crawl(&store, &dir, &["-e", "onion"]);
+    let second_run = crawl(&store, &dir, &["-e", "onion,favicon"]);
     let stepwise = store.state();
     store.command(&["FLUSHDB"]);
-    crawl_warc(&["-e", "onion,favicon"]);
+    crawl(&store, &dir, &["-e", "onion,favicon"]);
 
     assert!(
         second_run.contains(&format!("{SHARD}: extracting favicon from warc\n")),
@@ -443,35 +441,36 @@ fn adding_a_kind_later_runs_only_that_kind() {
     assert_eq!(stepwise.0, expected_sightings());
 }
 
-/// On CC-MAIN, `onion` and `favicon` are read from WAT + WET,
-/// derived from the WARC paths file line, and give what WARC gives. The
-/// WARC Archive is not in `download/`: fetching it would fail the run.
+/// On CC-MAIN, `onion` and `favicon` read WARC, the Format finding the
+/// most, by default and inside `--formats warc,wat` alike: the WAT and WET
+/// Archives are not in `download/`, and fetching them would fail the run.
 ///
 /// The results are in the store only: no results file is written where
 /// the crawl runs.
 #[test]
-fn default_kinds_read_wat_and_wet() {
-    let Some(store) = TestStore::take("default_kinds_read_wat_and_wet") else {
+fn default_kinds_read_warc() {
+    let Some(store) = TestStore::take("default_kinds_read_warc") else {
         return;
     };
-    let dir = workspace(
-        "default_kinds_read_wat_and_wet",
-        &[(WAT_NAME, wat_archive()), (WET_NAME, wet_archive())],
-    );
+    let dir = workspace("default_kinds_read_warc", &[(WARC_NAME, warc_archive())]);
 
-    let stderr = crawl(&store, &dir, &[]);
+    for args in [&[][..], &["--formats", "warc,wat"]] {
+        store.command(&["FLUSHDB"]);
+        let stderr = crawl(&store, &dir, args);
 
-    assert!(
-        stderr.contains(&format!("{SHARD}: extracting onion,favicon from wat,wet\n")),
-        "the Plan should be WAT + WET:\n{stderr}"
-    );
-    assert_eq!(
-        store.state(),
-        (
-            expected_sightings(),
-            vec![format!("{SHARD} favicon"), format!("{SHARD} onion")]
-        )
-    );
+        assert!(
+            stderr.contains(&format!("{SHARD}: extracting onion,favicon from warc\n")),
+            "the Plan should be WARC with {args:?}:\n{stderr}"
+        );
+        assert_eq!(
+            store.state(),
+            (
+                expected_sightings(),
+                vec![format!("{SHARD} favicon"), format!("{SHARD} onion")]
+            ),
+            "{args:?}"
+        );
+    }
     assert!(!dir.join("output").exists());
     let json_files: Vec<PathBuf> = fs::read_dir(&dir)
         .unwrap()
@@ -484,8 +483,36 @@ fn default_kinds_read_wat_and_wet() {
     assert!(json_files.is_empty(), "{json_files:?}");
 }
 
-/// `favicon` alone is read from WAT only: the WET Archive is not in
-/// `download/` either.
+/// Inside `--formats wat,wet`, `onion` reads both, derived from the WARC
+/// paths file line, and gives what WARC gives; `favicon` reads WAT only.
+#[test]
+fn inside_wat_and_wet_onion_reads_both_and_favicon_wat() {
+    let test_name = "inside_wat_and_wet_onion_reads_both_and_favicon_wat";
+    let Some(store) = TestStore::take(test_name) else {
+        return;
+    };
+    let dir = workspace(
+        test_name,
+        &[(WAT_NAME, wat_archive()), (WET_NAME, wet_archive())],
+    );
+
+    let stderr = crawl(&store, &dir, &["--formats", "wat,wet"]);
+
+    assert!(
+        stderr.contains(&format!("{SHARD}: extracting onion,favicon from wat,wet\n")),
+        "the Plan should be WAT + WET:\n{stderr}"
+    );
+    assert_eq!(
+        store.state(),
+        (
+            expected_sightings(),
+            vec![format!("{SHARD} favicon"), format!("{SHARD} onion")]
+        )
+    );
+}
+
+/// `favicon` alone inside `--formats wat,wet` reads only WAT: the WET
+/// Archive is not in `download/` either.
 #[test]
 fn favicon_alone_reads_only_wat() {
     let Some(store) = TestStore::take("favicon_alone_reads_only_wat") else {
@@ -493,7 +520,7 @@ fn favicon_alone_reads_only_wat() {
     };
     let dir = workspace("favicon_alone_reads_only_wat", &[(WAT_NAME, wat_archive())]);
 
-    let stderr = crawl(&store, &dir, &["-e", "favicon"]);
+    let stderr = crawl(&store, &dir, &["-e", "favicon", "--formats", "wat,wet"]);
 
     assert!(
         stderr.contains(&format!("{SHARD}: extracting favicon from wat\n")),
@@ -534,9 +561,9 @@ fn run(store: &TestStore, workspace: &Path, args: &[&str]) -> (Option<i32>, Stri
 }
 
 /// An Archive that fails to parse leaves the kinds reading it undone, and
-/// the run, which goes on to the end, exits with `EXIT_UNDONE`. Here the
-/// WET Archive isn't gzip: `onion` (WAT + WET) is left undone, `favicon`
-/// (WAT only) is done.
+/// the run, which goes on to the end, exits with `EXIT_UNDONE`. Here, inside
+/// `--formats wat,wet`, the WET Archive isn't gzip: `onion` (WAT + WET) is
+/// left undone, `favicon` (WAT only) is done.
 #[test]
 fn an_archive_failing_to_parse_exits_undone() {
     let Some(store) = TestStore::take("an_archive_failing_to_parse_exits_undone") else {
@@ -547,7 +574,10 @@ fn an_archive_failing_to_parse_exits_undone() {
         &[(WAT_NAME, wat_archive()), (WET_NAME, b"not gzip".to_vec())],
     );
 
-    let output = cc_extract_into(&store, &dir).output().unwrap();
+    let output = cc_extract_into(&store, &dir)
+        .args(["--formats", "wat,wet"])
+        .output()
+        .unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -572,7 +602,7 @@ fn a_failed_store_write_exits_undone() {
     };
     let dir = workspace(
         "a_failed_store_write_exits_undone",
-        &[(WAT_NAME, wat_archive())],
+        &[(WARC_NAME, warc_archive())],
     );
     store.command(&["SET", "favicon:https://example.com/icon.png", "not a set"]);
 
@@ -707,7 +737,7 @@ fn a_paths_file_cut_short_stops_the_run() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_cc-extract"))
         .current_dir(&dir)
-        .args(["warc.paths.gz", "--formats", "warc", "--limit", "1"])
+        .args(["warc.paths.gz", "--limit", "1"])
         .args(["--kvrocks", &no_store(&dir)])
         .output()
         .unwrap();
@@ -725,10 +755,9 @@ fn a_paths_file_cut_short_stops_the_run() {
     );
 }
 
-/// Only WARC serves `inline-favicon`, so asking for it plans WARC
-/// even on CC-MAIN, and `onion` reads that WARC instead of WAT + WET. The
-/// WAT and WET Archives are not in `download/`: fetching them would fail
-/// the run.
+/// Only WARC serves `inline-favicon`, and `onion` reads the same WARC
+/// Archive, the one downloaded. The WAT and WET Archives are not in
+/// `download/`: fetching them would fail the run.
 ///
 /// The PNG on two pages is one Artifact, keyed by the SHA-256 of its bytes,
 /// with two Sightings.
@@ -971,7 +1000,9 @@ fn save_images_without_inline_favicon_says_none_will_be_saved() {
 }
 
 /// The command a Slice's process runs: `--offset 0 --limit 2` over a paths
-/// file of 4 Shards, `favicon` from WARC.
+/// file of 4 Shards, `favicon` from WARC. `--formats warc` leaves `favicon`
+/// no other combination, so a WARC Archive given up gives it up too,
+/// instead of sending it to WAT.
 const SLICE_ARGS: [&str; 8] = ["-o", "0", "-l", "2", "-e", "favicon", "--formats", "warc"];
 
 /// A working directory for `test_name` with 4 Shards: their WARC Archives
@@ -1019,7 +1050,7 @@ fn processes_on_disjoint_slices_fill_one_store_together() {
         .map(|offset| {
             cc_extract_into(&store, &dir)
                 .args(["-o", offset, "-l", "2"])
-                .args(["-e", "favicon", "--formats", "warc"])
+                .args(["-e", "favicon"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -1139,43 +1170,108 @@ fn deleting_its_record_retries_a_given_up_archive() {
     );
 }
 
-/// Given up, the WET Archive leaves `onion` (WAT + WET) given up under the
-/// default Plan, while `favicon` (WAT) is done. No other Plan is looked for
-/// on its own: `--formats warc` plans around the WET, and with the WARC
-/// Archive `onion` is done.
+/// Given up, the WARC Archive sends each kind to its next combination:
+/// the run giving it up leaves `onion` and `favicon` to the next run, which
+/// reads them from WAT + WET and WAT, and exits 4 for `inline-favicon`
+/// alone, which no other Format serves.
 #[test]
-fn a_given_up_wet_leaves_onion_until_formats_plan_around_it() {
-    let test_name = "a_given_up_wet_leaves_onion_until_formats_plan_around_it";
+fn a_given_up_warc_leaves_only_inline_favicon_undone() {
+    let test_name = "a_given_up_warc_leaves_only_inline_favicon_undone";
     let Some(store) = TestStore::take(test_name) else {
         return;
     };
     let dir = workspace(
         test_name,
-        &[(WAT_NAME, wat_archive()), (WET_NAME, b"not gzip".to_vec())],
+        &[
+            (WARC_NAME, b"not gzip".to_vec()),
+            (WAT_NAME, wat_archive()),
+            (WET_NAME, wet_archive()),
+        ],
+    );
+    let args = ["-e", "onion,favicon,inline-favicon"];
+
+    for run_number in 1..=3 {
+        let (code, stderr) = run(&store, &dir, &args);
+        assert_eq!(code, Some(EXIT_UNDONE), "run {run_number}:\n{stderr}");
+        if run_number == 3 {
+            assert!(
+                stderr.contains(&format!("{WARC_NAME}: given up"))
+                    && stderr.contains(&format!("{SHARD}] inline-favicon given up\n"))
+                    && stderr.contains("onion,favicon will be extracted again next run"),
+                "run 3 should give up inline-favicon only:\n{stderr}"
+            );
+        }
+    }
+    let (code, stderr) = run(&store, &dir, &args);
+
+    assert_eq!(code, Some(EXIT_GIVEN_UP), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "{SHARD} — inline-favicon given up ({WARC_NAME})\n"
+        )) && stderr.contains(&format!("{SHARD}: extracting onion,favicon from wat,wet\n")),
+        "run 4 should read WAT + WET without inline-favicon:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "  {WARC_NAME}: inline-favicon undone, last error: Parse error: "
+        )),
+        "the summary should name the Archive:\n{stderr}"
+    );
+    assert_eq!(
+        store.state(),
+        (
+            expected_sightings(),
+            vec![format!("{SHARD} favicon"), format!("{SHARD} onion")]
+        )
+    );
+}
+
+/// With the WARC Archive given up, then the WET, `onion` has no combination
+/// left, and is given up under both; `favicon` is done from WAT.
+#[test]
+fn a_given_up_warc_and_wet_leave_onion_undone() {
+    let test_name = "a_given_up_warc_and_wet_leave_onion_undone";
+    let Some(store) = TestStore::take(test_name) else {
+        return;
+    };
+    let dir = workspace(
+        test_name,
+        &[
+            (WARC_NAME, b"not gzip".to_vec()),
+            (WAT_NAME, wat_archive()),
+            (WET_NAME, b"not gzip".to_vec()),
+        ],
     );
 
-    for _ in 0..3 {
-        run(&store, &dir, &[]);
+    // Three runs give the WARC up, three more the WET, which `onion` reads
+    // from the fourth on.
+    for run_number in 1..=6 {
+        let (code, stderr) = run(&store, &dir, &[]);
+        let expected = if run_number == 6 {
+            EXIT_GIVEN_UP
+        } else {
+            EXIT_UNDONE
+        };
+        assert_eq!(code, Some(expected), "run {run_number}:\n{stderr}");
     }
     let (code, stderr) = run(&store, &dir, &[]);
 
     assert_eq!(code, Some(EXIT_GIVEN_UP), "{stderr}");
     assert!(
-        stderr.contains(&format!("{SHARD} — onion given up ({WET_NAME}), skipping")),
+        stderr.contains(&format!(
+            "{SHARD} — onion given up ({WARC_NAME}, {WET_NAME}), skipping"
+        )),
         "the Shard should not be scheduled:\n{stderr}"
     );
+    for archive in [WARC_NAME, WET_NAME] {
+        assert!(
+            stderr.contains(&format!("  {archive}: onion undone, last error: ")),
+            "the summary should name {archive}:\n{stderr}"
+        );
+    }
     assert_eq!(
         store.members("processed"),
         BTreeSet::from([format!("{SHARD} favicon")])
-    );
-
-    fs::write(dir.join("download").join(WARC_NAME), warc_archive()).unwrap();
-    let (code, stderr) = run(&store, &dir, &["--formats", "warc"]);
-
-    assert_eq!(code, Some(0), "{stderr}");
-    assert_eq!(
-        store.members("processed"),
-        BTreeSet::from([format!("{SHARD} favicon"), format!("{SHARD} onion")])
     );
 }
 

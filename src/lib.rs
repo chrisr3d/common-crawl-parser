@@ -22,9 +22,9 @@
 // `parse_archive` only connects them: a new kind needs its own `Extractor`,
 // but the parsing loop stays as it is.
 //
-// Which Formats are read for a Shard is the planner's choice (`plan`): the
-// cheapest Archives that serve every requested kind (`format` says what
-// Common Crawl publishes and where).
+// Which Formats are read for a Shard is the planner's choice (`plan`): for
+// each requested kind, the Formats that find the most among those the
+// Shard offers (`format` says what Common Crawl publishes and where).
 
 pub mod artifact;
 pub mod extractor;

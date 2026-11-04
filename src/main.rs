@@ -27,6 +27,7 @@ use clap::{Parser, ValueEnum};
 use futures::stream::StreamExt;
 
 use cc_extract::inline_favicon::save_images;
+use cc_extract::plan::LeftOut;
 use cc_extract::store::{
     DEFAULT_SOCKET, FailureRecord, GIVE_UP_AFTER, PASSWORD_VARIABLE, RunId, Store, StoreResult,
     artifact_count, load_failures, load_processed, record_failure, save_then_mark,
@@ -298,7 +299,7 @@ Exit status:
   1  Stopped early, such as on a missing or unreadable paths file or an unreachable store: fix the cause, then run again
   2  Invalid option or value
   3  Some Shards left with kinds a run may still do (failed download, parse, store write or image save): run the same command again
-  4  Nothing left to retry, but some kinds given up: an Archive they read failed the same way on 3 runs (the summary lists them)")]
+  4  Nothing left to retry, but some kinds given up: each Format combination they may read (inside --formats) reads an Archive that failed the same way on 3 runs (the summary lists them)")]
 struct Config {
     /// Path to a WARC, WAT or WET paths file (supports .gz)
     ///
@@ -356,12 +357,13 @@ struct Config {
     )]
     extract: Vec<ArtifactKind>,
 
-    /// Formats to download for every Shard, comma-separated (default: the
-    /// cheapest ones serving every kind)
+    /// Formats to download for every Shard, comma-separated (default: for
+    /// each kind, those finding the most: WARC)
     ///
     /// Rejected if they can't serve a requested kind, or if a Shard's
-    /// Dataset doesn't publish one of them. Each kind still reads the
-    /// cheapest Formats it accepts among these; one no kind reads is not
+    /// Dataset doesn't publish one of them. Each kind reads the first
+    /// Formats it accepts among these, from those finding the most (with
+    /// wat,wet: onion reads both, favicon WAT); one no kind reads is not
     /// downloaded.
     //
     // `Option<Vec<_>>`: `None` when the flag is absent, so "not given" is
@@ -448,7 +450,6 @@ struct Failure {
 /// main task merges them sequentially — no locks needed.
 struct ShardResult {
     shard: Shard,
-    plan: Plan,
     partly_given_up: bool,
     /// What each kind found, for the kinds whose Archives all parsed.
     found: Vec<(ArtifactKind, Findings)>,
@@ -666,9 +667,9 @@ async fn print_totals(store: &mut impl Store, kinds: &[ArtifactKind]) {
 const EXIT_UNDONE: u8 = 3;
 
 /// Exit status of a run that went to the end with nothing to retry, but
-/// some pairs of its Slice given up: their Plan reads an Archive given up,
-/// whether by this run or an earlier one. Running the same command again
-/// would change nothing.
+/// some pairs of its Slice given up: each Format combination their kind may
+/// read (inside `--formats`) reads an Archive given up, whether by this run
+/// or an earlier one. Running the same command again would change nothing.
 const EXIT_GIVEN_UP: u8 = 4;
 
 /// A given-up Archive of the Slice, as the summary lists it.
@@ -695,6 +696,47 @@ fn note_given_up(
         })
         .kinds
         .insert(kind);
+}
+
+/// Whether `records` give up the Archive `archive` (its file name).
+fn is_given_up(records: &HashMap<String, FailureRecord>, archive: &str) -> bool {
+    records.get(archive).is_some_and(FailureRecord::given_up)
+}
+
+/// The Formats whose Archive of `path`'s Shard `records` give up: a Plan
+/// for the Shard reads none of them.
+fn given_up_formats(path: &ArchivePath, records: &HashMap<String, FailureRecord>) -> FormatSet {
+    path.dataset()
+        .available_formats()
+        .iter()
+        .filter(|&format| {
+            path.in_format(format)
+                .is_some_and(|archive| is_given_up(records, archive.file_name()))
+        })
+        .collect()
+}
+
+/// Note in `given_up` each kind `left_out` of a Plan for `path`'s Shard,
+/// under each given-up Archive in its way; returns those Archives' file
+/// names.
+fn note_left_out(
+    given_up: &mut BTreeMap<String, GivenUp>,
+    path: &ArchivePath,
+    left_out: &LeftOut,
+    records: &HashMap<String, FailureRecord>,
+) -> BTreeSet<String> {
+    let mut archives = BTreeSet::new();
+    for &(kind, formats) in left_out {
+        for format in formats.iter() {
+            let archive = path
+                .in_format(format)
+                .expect("only Formats whose path derives are given up");
+            let name = archive.file_name();
+            note_given_up(given_up, name, kind, &records[name].last_error);
+            archives.insert(name.to_string());
+        }
+    }
+    archives
 }
 
 /// What the run did with the Shards of its Slice, for the summary. Each
@@ -973,8 +1015,9 @@ async fn run_crawl(config: Config) -> ExitCode {
     // We do this upfront so we know exactly which Shards to process
     // concurrently. Every path of the Slice is considered. A Shard done for
     // every requested kind is skipped; any other is planned for its missing
-    // kinds only, leaving out those whose Plan reads a given-up Archive,
-    // and its Plan's Archive paths are derived from the line.
+    // kinds only, around its given-up Archives (leaving out the kinds with
+    // no combination left), and its Plan's Archive paths are derived from
+    // the line.
     let mut work_items: Vec<ScheduledShard> = Vec::new();
     let mut tally = Tally {
         new_artifacts: kinds.iter().map(|&kind| (kind, 0)).collect(),
@@ -982,11 +1025,6 @@ async fn run_crawl(config: Config) -> ExitCode {
     };
     // The given-up Archives of the Slice, by file name.
     let mut given_up: BTreeMap<String, GivenUp> = BTreeMap::new();
-    // The records are handed in rather than captured: a closure borrowing
-    // `failure_records` would keep the result loop from adding to them.
-    let is_given_up = |records: &HashMap<String, FailureRecord>, archive: &str| -> bool {
-        records.get(archive).is_some_and(FailureRecord::given_up)
-    };
 
     for (i, uri) in uris.iter().enumerate() {
         let path = match ArchivePath::parse(uri) {
@@ -1010,17 +1048,10 @@ async fn run_crawl(config: Config) -> ExitCode {
             continue;
         }
 
-        // The Formats whose Archive of this Shard is given up: no kind
-        // reading one is planned, and the Archive is not downloaded.
-        let avoided: FormatSet = path
-            .dataset()
-            .available_formats()
-            .iter()
-            .filter(|&format| {
-                path.in_format(format)
-                    .is_some_and(|archive| is_given_up(&failure_records, archive.file_name()))
-            })
-            .collect();
+        // The Formats whose Archive of this Shard is given up are not
+        // downloaded: each kind reading one falls back on its next
+        // combination, or is left out when none is left.
+        let avoided = given_up_formats(&path, &failure_records);
 
         // A Plan fails only on a configuration no Shard of this Dataset can
         // meet (such as `--formats wat` on CC-NEWS), so the run stops here,
@@ -1032,17 +1063,7 @@ async fn run_crawl(config: Config) -> ExitCode {
             });
 
         // Each kind left out is a given-up pair, for the summary.
-        let mut given_up_archives: BTreeSet<String> = BTreeSet::new();
-        for &(kind, formats) in &left_out {
-            for format in formats.iter() {
-                let archive = path
-                    .in_format(format)
-                    .expect("only Formats whose path derives are avoided");
-                let name = archive.file_name();
-                note_given_up(&mut given_up, name, kind, &failure_records[name].last_error);
-                given_up_archives.insert(name.to_string());
-            }
-        }
+        let given_up_archives = note_left_out(&mut given_up, &path, &left_out, &failure_records);
         let left_out_display = || {
             let kinds: Vec<ArtifactKind> = left_out.iter().map(|&(kind, _)| kind).collect();
             let archives: Vec<String> = given_up_archives.iter().cloned().collect();
@@ -1243,7 +1264,6 @@ async fn run_crawl(config: Config) -> ExitCode {
                 if downloaded.is_empty() {
                     return ShardResult {
                         shard,
-                        plan,
                         partly_given_up,
                         found: Vec::new(),
                         undone: kinds,
@@ -1275,7 +1295,8 @@ async fn run_crawl(config: Config) -> ExitCode {
                 // compiler prevents use-after-move.
                 //
                 // The closure takes ownership of what it captures; the
-                // clones keep a `shard` and a `plan` here for the result.
+                // clones keep a `shard` and a `plan` here for what follows
+                // the parse.
                 let parse_shard = shard.clone();
                 let parse_plan = plan.clone();
 
@@ -1331,7 +1352,6 @@ async fn run_crawl(config: Config) -> ExitCode {
 
                 ShardResult {
                     shard,
-                    plan,
                     partly_given_up,
                     found,
                     undone,
@@ -1458,31 +1478,30 @@ async fn run_crawl(config: Config) -> ExitCode {
             );
         }
 
-        // A kind left undone by an Archive given up now is a given-up pair:
-        // no later run does it. A later run may do the others.
-        let mut retryable: Vec<ArtifactKind> = Vec::new();
-        let mut given_up_now: Vec<ArtifactKind> = Vec::new();
-        for kind in undone {
-            let mut reads_given_up = false;
-            for failure in &result.failures {
-                let name = failure.archive.file_name();
-                if is_given_up(&failure_records, name)
-                    && result
-                        .plan
-                        .kinds_reading(failure.archive.format())
-                        .contains(&kind)
-                {
-                    let last_error = &failure_records[name].last_error;
-                    note_given_up(&mut given_up, name, kind, last_error);
-                    reads_given_up = true;
-                }
+        // Once an Archive of the Shard is given up now, the kinds left
+        // undone are planned again around every given-up Archive of the
+        // Shard, as the next run will: a kind left out is a given-up pair,
+        // which no later run does. A later run may do the others, some on
+        // their next combination.
+        let given_up_now: Vec<ArtifactKind> = match result
+            .failures
+            .iter()
+            .find(|failure| is_given_up(&failure_records, failure.archive.file_name()))
+        {
+            Some(failure) => {
+                let path = &failure.archive;
+                let avoided = given_up_formats(path, &failure_records);
+                let (_, left_out) = Plan::avoiding(path.dataset(), &undone, forced, avoided)
+                    .expect("the same kinds were planned for this Shard at start-up");
+                note_left_out(&mut given_up, path, &left_out, &failure_records);
+                left_out.into_iter().map(|(kind, _)| kind).collect()
             }
-            if reads_given_up {
-                given_up_now.push(kind);
-            } else {
-                retryable.push(kind);
-            }
-        }
+            None => Vec::new(),
+        };
+        let mut retryable: Vec<ArtifactKind> = undone
+            .into_iter()
+            .filter(|kind| !given_up_now.contains(kind))
+            .collect();
         if !given_up_now.is_empty() {
             eprintln!("  [{}] {} given up", result.shard, kind_list(&given_up_now));
         }
