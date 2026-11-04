@@ -7,13 +7,17 @@
 // type without anything being copied.
 //
 // One variant per Format. A WAT record is JSON: it is parsed here, once,
-// into `WatMetadata`, and every extractor reads the parsed fields.
+// into `WatMetadata`, and every extractor reads the parsed fields. A WARC
+// record is an HTTP response: which ones are HTML pages, and the charset
+// each is read in (`charset`), is decided here too.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use memchr::memmem;
 use serde::Deserialize;
+
+use crate::charset::Charset;
 
 /// One crawled page read from an Archive.
 ///
@@ -65,25 +69,76 @@ impl<'a> PageRecord<'a> {
     }
 }
 
-/// A WARC `response` record: page URL, crawl date and the full HTTP response.
+/// A WARC `response` record: page URL, crawl date, the type Common Crawl
+/// identified and the full HTTP response.
 pub struct WarcResponse<'a> {
     /// The `WARC-Target-URI` header.
     pub page_url: &'a str,
     /// The `WARC-Date` header.
     pub date: &'a str,
+    /// The `WARC-Identified-Payload-Type` header: the type Common Crawl
+    /// detected from the HTTP body's bytes, such as `text/html`. `None`
+    /// when the record has none (CC-NEWS writes none).
+    pub identified_payload_type: Option<&'a [u8]>,
     /// The complete HTTP response: status line, headers, blank line, body.
     pub http_response: &'a [u8],
 }
 
 impl<'a> WarcResponse<'a> {
-    /// The HTTP body, if the response declares an HTML `Content-Type`.
+    /// The HTTP body and its charset, if the response is an HTML page.
     ///
-    /// `None` for other content types and for malformed responses with no
-    /// blank line between headers and body.
-    pub fn html_body(&self) -> Option<&'a [u8]> {
+    /// Which responses are HTML is Common Crawl's own check, the one that
+    /// picks the pages its WAT and WET Archives read as HTML: the type it
+    /// identified from the bytes is `text/html` or `application/xhtml+xml`.
+    /// A server's `Content-Type` is often missing or wrong (`text/plain`,
+    /// `charset=utf-8` alone, a first `application/octet-stream`), so it
+    /// decides only for records without an identified type: it must hold
+    /// `text/html` or `application/xhtml`.
+    ///
+    /// `None` for other responses and for malformed ones with no blank line
+    /// between headers and body.
+    pub fn html_page(&self) -> Option<HtmlPage<'a>> {
         let (http_headers, http_body) = split_http_response(self.http_response)?;
-        is_html_content(http_headers).then_some(http_body)
+        let is_html = match self.identified_payload_type {
+            Some(identified) => is_html_type(identified),
+            None => is_html_content(http_headers),
+        };
+        if !is_html {
+            return None;
+        }
+        let (charset, body) = Charset::of_html_page(http_headers, http_body);
+        Some(HtmlPage { body, charset })
     }
+
+    /// The HTTP body decoded, if the response is in UTF-16, whatever its
+    /// type: the one charset whose bytes don't show its ASCII text, onion
+    /// addresses included, as ASCII. A browser reads such a response
+    /// decoded, and so does Common Crawl before writing a page's WET text.
+    ///
+    /// `None` for every other response, nearly all of them: their bytes
+    /// show their addresses as they are.
+    pub fn utf16_text(&self) -> Option<String> {
+        let (http_headers, http_body) = split_http_response(self.http_response)?;
+        match Charset::of_response(http_headers, http_body) {
+            // `decode_without_bom_handling` returns a `Cow<str>` and
+            // whether any byte was malformed (replaced by U+FFFD). Decoded
+            // UTF-16 is always a new `String`, so `into_owned` copies
+            // nothing more.
+            (charset @ Charset::Declared(encoding), body) if charset.is_utf16() => {
+                Some(encoding.decode_without_bom_handling(body).0.into_owned())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// An HTML page of a WARC response: its HTTP body, and the charset a
+/// browser reads it in.
+pub struct HtmlPage<'a> {
+    /// The HTTP body, without its byte-order mark if it had one.
+    pub body: &'a [u8],
+    /// The charset a browser reads the body in.
+    pub charset: Charset,
 }
 
 /// A WET `conversion` record: page URL, crawl date and the page's visible
@@ -309,6 +364,14 @@ fn split_http_response(data: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&data[..separator], &data[separator + 4..]))
 }
 
+/// Whether a type Common Crawl identified is an HTML page's: exactly
+/// `text/html` or `application/xhtml+xml`, in any case.
+fn is_html_type(identified: &[u8]) -> bool {
+    [&b"text/html"[..], b"application/xhtml+xml"]
+        .iter()
+        .any(|html_type| identified.eq_ignore_ascii_case(html_type))
+}
+
 /// Check if HTTP headers indicate an HTML content type.
 ///
 /// Looks for `Content-Type:` header containing `text/html` or `application/xhtml`.
@@ -344,15 +407,17 @@ fn is_html_content(http_headers: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// `html_body()` of a response with this `Content-Type` and body `<p>`.
+    /// The body `html_page()` gives for a response with this
+    /// `Content-Type` and body `<p>`.
     fn html_body_for(content_type: &str) -> Option<Vec<u8>> {
         let http_response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\r\n<p>");
         let response = WarcResponse {
             page_url: "https://example.com/",
             date: "2025-01-01T00:00:00Z",
+            identified_payload_type: None,
             http_response: http_response.as_bytes(),
         };
-        response.html_body().map(<[u8]>::to_vec)
+        response.html_page().map(|page| page.body.to_vec())
     }
 
     #[test]

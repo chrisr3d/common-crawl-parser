@@ -20,6 +20,7 @@ sha1 = "0.11"      # SHA-1 of inline favicons, one of the ways to look one up
 md-5 = "0.11"      # MD5 of inline favicons, one of the ways to look one up
 sha3 = "0.12"      # SHA3-256, the checksum inside v3 onion addresses
 url = "2"          # URL resolution as browsers do it (WHATWG); already built for reqwest
+encoding_rs = "0.8"  # charsets as browsers decode them (WHATWG Encoding Standard, Firefox's)
 redis = { version = "1.8.1", default-features = false, features = ["tokio-comp"] }
 
 # Only for examples, tests and benchmarks: never compiled into the library or

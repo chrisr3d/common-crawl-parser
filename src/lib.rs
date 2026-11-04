@@ -15,7 +15,7 @@
 //     in memory, or a decompressed copy that is memory-mapped), see
 //     `Transport` below
 //   - Format: how records are read: WARC, WAT or WET (`warc_parser`,
-//     `page_record`)
+//     `page_record`; a WARC page in its charset, `charset`)
 //   - Artifact kind: what is extracted, one `Extractor` per kind
 //     (`extractor`, `artifact`)
 //
@@ -27,6 +27,7 @@
 // Shard offers (`format` says what Common Crawl publishes and where).
 
 pub mod artifact;
+pub mod charset;
 pub mod extractor;
 pub mod favicon_search;
 pub mod format;
@@ -45,7 +46,7 @@ pub use extractor::{
 };
 pub use format::{ArchivePath, Dataset, Format, FormatSet};
 pub use inline_favicon::{InlineFavicon, InlineFavicons};
-pub use page_record::{PageRecord, WarcResponse, WatMetadata, WetConversion};
+pub use page_record::{HtmlPage, PageRecord, WarcResponse, WatMetadata, WetConversion};
 pub use plan::{FormatRequirement, Plan, PlanError};
 pub use store::{KvrocksStore, StoreAddress};
 
@@ -955,7 +956,14 @@ fn parse_stream<R: Read>(
         // read.
         let page_url = String::from_utf8_lossy(&record.target_uri);
         let date = String::from_utf8_lossy(&record.date);
-        if let Some(page) = to_page_record(format, &page_url, &date, &record.body) {
+        let page = to_page_record(
+            format,
+            &page_url,
+            &date,
+            &record.identified_payload_type,
+            &record.body,
+        );
+        if let Some(page) = page {
             hand_over(&page, shard, extractors, &mut records_scanned);
         }
     }
@@ -1082,7 +1090,14 @@ fn parse_mmap(
         // invalid ones.
         let page_url = String::from_utf8_lossy(record.target_uri);
         let date = String::from_utf8_lossy(record.date);
-        if let Some(page) = to_page_record(format, &page_url, &date, record.body) {
+        let page = to_page_record(
+            format,
+            &page_url,
+            &date,
+            record.identified_payload_type,
+            record.body,
+        );
+        if let Some(page) = page {
             hand_over(&page, shard, extractors, &mut records_scanned);
         }
     }
@@ -1092,7 +1107,8 @@ fn parse_mmap(
 
 /// The page one record of a `format` Archive holds: its `body` (the bytes
 /// after the WARC headers) is the HTTP response in WARC, a JSON document in
-/// WAT, the page's text in WET.
+/// WAT, the page's text in WET. `identified_payload_type` is the record's
+/// header of that name, empty if it has none: only WARC reads it.
 ///
 /// `None` for a WAT record that describes no page: one made from a WARC
 /// `request` or `metadata` record, or one whose JSON can't be read. Such a
@@ -1101,12 +1117,15 @@ fn to_page_record<'a>(
     format: Format,
     page_url: &'a str,
     date: &'a str,
+    identified_payload_type: &'a [u8],
     body: &'a [u8],
 ) -> Option<PageRecord<'a>> {
     match format {
         Format::Warc => Some(PageRecord::Warc(WarcResponse {
             page_url,
             date,
+            identified_payload_type: Some(identified_payload_type)
+                .filter(|identified| !identified.is_empty()),
             http_response: body,
         })),
         // `date` is when the WAT was generated: the crawl date is read

@@ -69,13 +69,15 @@ impl WarcBuilder {
     /// Append one record, compressed as its own gzip member.
     ///
     /// `Content-Length` is computed from `block`, and every record gets a
-    /// unique `WARC-Record-ID`, as the WARC format requires.
+    /// unique `WARC-Record-ID`, as the WARC format requires. `headers` are
+    /// written after the others, as `(name, value)`.
     fn record(
         mut self,
         warc_type: &str,
         target_uri: Option<&str>,
         date: &str,
         content_type: &str,
+        headers: &[(&str, &str)],
         block: &[u8],
     ) -> Self {
         self.records_written += 1;
@@ -97,6 +99,9 @@ impl WarcBuilder {
         if let Some(uri) = target_uri {
             write!(record, "WARC-Target-URI: {uri}\r\n").unwrap();
         }
+        for (name, value) in headers {
+            write!(record, "{name}: {value}\r\n").unwrap();
+        }
         record.extend_from_slice(b"\r\n");
         record.extend_from_slice(block);
         record.extend_from_slice(b"\r\n\r\n");
@@ -112,6 +117,7 @@ impl WarcBuilder {
             None,
             date,
             "application/warc-fields",
+            &[],
             fields.as_bytes(),
         )
     }
@@ -123,17 +129,32 @@ impl WarcBuilder {
             Some(target_uri),
             date,
             "application/http; msgtype=request",
+            &[],
             http_request.as_bytes(),
         )
     }
 
     /// A `response` record: the full HTTP response, headers and body.
     pub fn response(self, target_uri: &str, date: &str, http_response: &[u8]) -> Self {
+        self.response_with(target_uri, date, &[], http_response)
+    }
+
+    /// A `response` record with these WARC `headers` besides the usual
+    /// ones, such as the `WARC-Identified-Payload-Type` Common Crawl writes
+    /// in CC-MAIN.
+    pub fn response_with(
+        self,
+        target_uri: &str,
+        date: &str,
+        headers: &[(&str, &str)],
+        http_response: &[u8],
+    ) -> Self {
         self.record(
             "response",
             Some(target_uri),
             date,
             "application/http; msgtype=response",
+            headers,
             http_response,
         )
     }
@@ -145,6 +166,7 @@ impl WarcBuilder {
             Some(target_uri),
             date,
             "application/warc-fields",
+            &[],
             fields.as_bytes(),
         )
     }
@@ -157,6 +179,7 @@ impl WarcBuilder {
             Some(target_uri),
             date,
             "text/plain",
+            &[],
             text.as_bytes(),
         )
     }
@@ -170,6 +193,7 @@ impl WarcBuilder {
             Some(target_uri),
             date,
             "application/json",
+            &[],
             json.as_bytes(),
         )
     }
@@ -188,14 +212,21 @@ pub fn gzip_member(bytes: &[u8]) -> Vec<u8> {
     member.finish().unwrap()
 }
 
-/// Build an HTTP `200 OK` response: status line, `headers`, blank line, `body`.
-pub fn http_response(headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+/// Build an HTTP `200 OK` response: status line, `headers`, blank line,
+/// `body`, given as text or as bytes in any encoding.
+///
+/// `&(impl AsRef<[u8]> + ?Sized)` borrows anything viewable as bytes:
+/// `&str`, `&String`, `&[u8]`, `&Vec<u8>`. `?Sized` lets the borrowed type
+/// be one of unknown size, such as `str` or `[u8]`, which only exist behind
+/// a reference.
+pub fn http_response(headers: &[(&str, &str)], body: &(impl AsRef<[u8]> + ?Sized)) -> Vec<u8> {
     let mut response = Vec::new();
     write!(response, "HTTP/1.1 200 OK\r\n").unwrap();
     for (name, value) in headers {
         write!(response, "{name}: {value}\r\n").unwrap();
     }
-    write!(response, "\r\n{body}").unwrap();
+    write!(response, "\r\n").unwrap();
+    response.extend_from_slice(body.as_ref());
     response
 }
 

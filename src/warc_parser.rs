@@ -4,9 +4,11 @@
 // per record. To find the pages we only need two pieces of information:
 //   1. Is this record one of the pages? (WARC-Type header)
 //   2. What are the body bytes? (Content-Length header + body data)
-// and for a page, where and when it was crawled (WARC-Target-URI, WARC-Date).
+// and for a page, where and when it was crawled (WARC-Target-URI, WARC-Date)
+// and the type Common Crawl detected from its bytes
+// (WARC-Identified-Payload-Type).
 //
-// By parsing only these four headers and skipping the other records' bodies
+// By parsing only these five headers and skipping the other records' bodies
 // entirely, we avoid reading ~60% of the decompressed data into memory. This
 // is the same philosophy ripgrep uses: do the minimum work to determine
 // relevance, then only process what matters.
@@ -79,13 +81,17 @@ struct RecordHeaders<V> {
     target_uri: V,
     /// Its `WARC-Date`: when the record was written. Empty if it has none.
     date: V,
+    /// Its `WARC-Identified-Payload-Type`: the type Common Crawl detected
+    /// from the payload's bytes. Empty if it has none.
+    identified_payload_type: V,
 }
 
 impl<V> RecordHeaders<V> {
     /// Read one header `line`, keeping what it says if it is a header the
     /// parsers read: `WARC-Type` (compared with `record_type`),
-    /// `Content-Length`, `WARC-Target-URI` or `WARC-Date`. Any other line
-    /// is passed over. A header given twice keeps its last value.
+    /// `Content-Length`, `WARC-Target-URI`, `WARC-Date` or
+    /// `WARC-Identified-Payload-Type`. Any other line is passed over. A
+    /// header given twice keeps its last value.
     ///
     /// The bound `V: From<&'a [u8]>` sits on the method, where `'a` is
     /// known: for a `&[u8]`, it must be the data's lifetime, so that a value
@@ -102,6 +108,8 @@ impl<V> RecordHeaders<V> {
             self.target_uri = V::from(value);
         } else if let Some(value) = header_value(line, b"WARC-Date:") {
             self.date = V::from(value);
+        } else if let Some(value) = header_value(line, b"WARC-Identified-Payload-Type:") {
+            self.identified_payload_type = V::from(value);
         }
     }
 
@@ -125,12 +133,13 @@ impl<V> RecordHeaders<V> {
 /// The value of `line` if it is the header `name` (`WARC-Type:`, ...),
 /// without the ASCII whitespace around it. `name` is compared ignoring
 /// ASCII case: WARC allows names in any case, though Common Crawl writes
-/// them as above.
+/// them as above. HTTP header lines are read alike (`charset` reads the
+/// `Content-Type:`), hence `pub(crate)`.
 ///
 /// `split_at_checked` cuts `line` after `name.len()` bytes, or returns
 /// `None` if it is shorter. A cut in bytes is always possible, where
 /// slicing a `str` panics if the cut falls inside a multi-byte character.
-fn header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     let (head, value) = line.split_at_checked(name.len())?;
     head.eq_ignore_ascii_case(name).then(|| value.trim_ascii())
 }
@@ -218,14 +227,19 @@ const MAX_BODY_RESERVE: usize = 8 * 1024 * 1024;
 /// In addition to the body, we extract metadata from WARC headers:
 /// - `target_uri`: the original URL that was crawled (WARC-Target-URI header)
 /// - `date`: the timestamp of the crawl (WARC-Date header)
+/// - `identified_payload_type`: the type Common Crawl detected from the
+///   payload's bytes, such as `text/html` (WARC-Identified-Payload-Type
+///   header, written in CC-MAIN, not in CC-NEWS)
 ///
-/// These let us track *where* and *when* each .onion address was found,
-/// not just *which archive* it appeared in. They are the header's bytes,
-/// as `WarcSlice`'s: the caller reads them as text.
+/// The first two let us track *where* and *when* each .onion address was
+/// found, not just *which archive* it appeared in. They are the header's
+/// bytes, as `WarcSlice`'s, empty when the record has none: the caller
+/// reads them as text.
 pub struct WarcRecord {
     pub body: Vec<u8>,
     pub target_uri: Vec<u8>,
     pub date: Vec<u8>,
+    pub identified_payload_type: Vec<u8>,
 }
 
 /// Iterates the WARC records of one type from a `BufRead` source.
@@ -381,6 +395,7 @@ impl<R: BufRead> Iterator for WarcRecordIter<R> {
                 body,
                 target_uri: headers.target_uri,
                 date: headers.date,
+                identified_payload_type: headers.identified_payload_type,
             }));
         }
     }
@@ -436,6 +451,7 @@ pub struct WarcSlice<'a> {
     pub body: &'a [u8],
     pub target_uri: &'a [u8],
     pub date: &'a [u8],
+    pub identified_payload_type: &'a [u8],
 }
 
 /// Iterates the WARC records of one type from a contiguous byte slice.
@@ -560,6 +576,7 @@ impl<'a> Iterator for WarcSliceIter<'a> {
                 body: &self.data[body_start..body_end],
                 target_uri: headers.target_uri,
                 date: headers.date,
+                identified_payload_type: headers.identified_payload_type,
             }));
         }
     }

@@ -24,13 +24,14 @@
 //
 // A favicon is what a browser would load, so the page is read by the HTML
 // standard's tokenizer rules, as far as these tags need: tag names in any
-// case, attributes in any order and spacing, quoted or not, entities such
-// as `&amp;` decoded in their values; nothing read inside comments or
-// `<script>`, `<style>`, `<title>` and the other elements holding text
-// only. URLs resolve with the `url` crate, by the URL standard browsers
-// follow: against the page's first `<base href>`, itself resolved against
-// the page URL, else against the page URL (the HTML standard's "document
-// base URL").
+// case, attributes in any order and spacing, quoted or not, values read
+// in the page's charset (`charset`) and entities such as `&amp;` decoded in
+// them; nothing read inside comments or `<script>`, `<style>`, `<title>`
+// and the other elements holding text only. URLs resolve with the `url`
+// crate, by the URL standard browsers follow: against the page's first
+// `<base href>`, itself resolved against the page URL, else against the
+// page URL (the HTML standard's "document base URL"), their queries
+// percent-encoded in the page's charset.
 //
 // WAT records need no scanning: ia-web-commons has already parsed the page
 // and listed its `<link>` and `<meta>` tags and its `<base href>`, entities
@@ -51,10 +52,12 @@
 
 use std::borrow::Cow;
 
+use encoding_rs::{EncoderResult, Encoding, UTF_8};
 use memchr::memmem;
 use url::Url;
 
-use crate::page_record::Head;
+use crate::charset::Charset;
+use crate::page_record::{Head, HtmlPage};
 
 /// A favicon reference found in an HTML page.
 ///
@@ -93,7 +96,7 @@ pub struct FaviconResult {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Extract favicon references from an HTML byte slice.
+/// Extract favicon references from an HTML page.
 ///
 /// `page_url` is the WARC-Target-URI of the page — used to resolve relative
 /// favicon URLs into absolute ones, through the page's `<base href>` if it
@@ -103,26 +106,93 @@ pub struct FaviconResult {
 ///
 /// One pass over the page (`scan_page`) collects the favicon values of its
 /// `<link>` and `<meta>` tags, in page order, and its first `<base href>`;
-/// then each value is either decoded as an inline image or resolved into an
+/// then each value is read as text in the page's charset, its entities
+/// decoded, and is either decoded as an inline image or resolved into an
 /// absolute URL.
-pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
-    let tags = scan_page(body);
+///
+/// ## Scanning bytes, decoding values
+///
+/// In nearly every charset (`Encoding::is_ascii_compatible`), each ASCII
+/// character is its ASCII byte, and the bytes of other characters are never
+/// the `<`, `>`, quotes, `=`, `/` or whitespace markup is made of: the page
+/// is scanned as it is, and only the few values found are decoded. A UTF-8
+/// page, nearly all of them, costs nothing more. UTF-16 and ISO-2022-JP
+/// write markup otherwise: such a page is decoded whole first, then scanned.
+pub fn extract_favicons(page: &HtmlPage<'_>, page_url: &str) -> FaviconResult {
+    // Declared before the slice borrowing it, so that it outlives it.
+    let decoded;
+    let markup = match page.charset {
+        Charset::Declared(encoding) if !encoding.is_ascii_compatible() => {
+            decoded = encoding.decode_without_bom_handling(page.body).0;
+            decoded.as_bytes()
+        }
+        _ => page.body,
+    };
+    let tags = scan_page(markup);
     let mut result = FaviconResult::default();
     if tags.favicon_values.is_empty() {
         return result;
     }
 
-    // A `<base href>` that isn't UTF-8 is ignored, as a favicon URL that
-    // isn't would be.
-    let base_href = tags
-        .base_href
-        .as_deref()
-        .and_then(|href| std::str::from_utf8(href).ok());
-    let base = document_base(page_url, base_href);
+    // An undeclared page is read through for its charset only if a value
+    // isn't ASCII, its entities decoded: UTF-8 and windows-1252, the two it
+    // can be read in, read and write ASCII alike.
+    let encoding = match page.charset {
+        Charset::Undeclared if tags.is_ascii_text() => UTF_8,
+        charset => charset.encoding(page.body),
+    };
+    let text = PageText {
+        // The values found in a page decoded whole are UTF-8 already.
+        value_encoding: if encoding.is_ascii_compatible() {
+            encoding
+        } else {
+            UTF_8
+        },
+        // UTF-16 pages percent-encode in UTF-8, as the URL standard says
+        // (`output_encoding`).
+        query_encoding: encoding.output_encoding(),
+    };
+
+    // `Option<Cow<str>>`, then `Option<&str>` borrowing from it.
+    let base_href = tags.base_href.map(|href| text.read(href));
+    let base = document_base(page_url, base_href.as_deref(), text.query_encoding);
     for value in &tags.favicon_values {
-        process_favicon_value(value, base.as_ref(), &mut result);
+        process_favicon_value(
+            &text.read(value),
+            base.as_ref(),
+            text.query_encoding,
+            &mut result,
+        );
     }
     result
+}
+
+/// How the values a scan found become text, and how URLs are written in
+/// the page they were found in.
+struct PageText {
+    /// The encoding the values are in.
+    value_encoding: &'static Encoding,
+    /// The encoding a URL's query is percent-encoded in: a browser sends
+    /// `?q=é` from a windows-1252 page as `?q=%E9`, not `?q=%C3%A9`.
+    query_encoding: &'static Encoding,
+}
+
+impl PageText {
+    /// `value`, as written in the page, read as a browser reads an
+    /// attribute value: decoded from the page's charset, then its entities
+    /// decoded (`&#233;` is `é` in every charset). Bytes not valid in the
+    /// charset read as U+FFFD, the replacement character.
+    ///
+    /// Borrowed from the page when neither step changes anything, as for
+    /// nearly every value. A value decoded from another charset is a new
+    /// `String`, living only inside this function: its entities are then
+    /// decoded into one the result owns.
+    fn read<'a>(&self, value: &'a [u8]) -> Cow<'a, str> {
+        match self.value_encoding.decode_without_bom_handling(value).0 {
+            Cow::Borrowed(text) => decode_entities(text),
+            Cow::Owned(text) => Cow::Owned(decode_entities(&text).into_owned()),
+        }
+    }
 }
 
 /// The favicon URLs declared in a WAT record's `<head>`, resolved to
@@ -140,7 +210,9 @@ pub fn extract_favicons(body: &[u8], page_url: &str) -> FaviconResult {
 pub fn favicons_in_head(head: &Head<'_>, page_url: &str) -> Vec<String> {
     // `""`: the page has no `<base href>`.
     let base_href = Some(head.base.as_ref()).filter(|href| !href.is_empty());
-    let base = document_base(page_url, base_href);
+    // ia-web-commons decoded the page: its charset is unknown here, and URLs
+    // are written as from a UTF-8 page.
+    let base = document_base(page_url, base_href, UTF_8);
     let link_urls = head
         .links
         .iter()
@@ -158,7 +230,7 @@ pub fn favicons_in_head(head: &Head<'_>, page_url: &str) -> Vec<String> {
         if value.is_empty() || strip_data_scheme(value).is_some() {
             continue;
         }
-        push_resolved(&mut urls, base.as_ref(), value);
+        push_resolved(&mut urls, base.as_ref(), value, UTF_8);
     }
     urls
 }
@@ -199,15 +271,31 @@ fn is_tile_image_name(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"msapplication-TileImage")
 }
 
-/// What one pass over a page finds, borrowed from the page unless an
-/// entity had to be decoded.
+/// What one pass over a page finds: values as written, borrowed from the
+/// page. Their entities are decoded once their charset made them text
+/// (`PageText::read`).
 #[derive(Default)]
 struct PageTags<'a> {
     /// The `href` of each favicon `<link>` and the `content` of each
     /// `msapplication-TileImage` `<meta>`, in page order.
-    favicon_values: Vec<Cow<'a, [u8]>>,
+    favicon_values: Vec<&'a [u8]>,
     /// The `href` of the first `<base>` that has one.
-    base_href: Option<Cow<'a, [u8]>>,
+    base_href: Option<&'a [u8]>,
+}
+
+impl PageTags<'_> {
+    /// Whether every value found is ASCII text, its entities too (`&#233;`
+    /// is no ASCII). Such values read the same in every charset that writes
+    /// ASCII as ASCII bytes.
+    fn is_ascii_text(&self) -> bool {
+        self.favicon_values
+            .iter()
+            .chain(&self.base_href)
+            .all(|value| {
+                std::str::from_utf8(value)
+                    .is_ok_and(|text| text.is_ascii() && decode_entities(text).is_ascii())
+            })
+    }
 }
 
 /// Read a page as a browser's HTML tokenizer does, as far as favicons
@@ -282,8 +370,11 @@ fn read_start_tag<'a>(page: &'a [u8], name_start: usize, tags: &mut PageTags<'a>
                 values: [rel, href],
                 end,
             } = read_attributes(page, name_end, [b"rel", b"href"])?;
+            // `rel` and `name` are read as UTF-8 whatever the page's
+            // charset: the tokens they are compared with are ASCII, written
+            // alike in every charset whose pages are scanned as bytes.
             if let (Some(rel), Some(href)) = (rel, href)
-                && is_favicon_rel(&rel)
+                && is_favicon_rel(decode_entities(&String::from_utf8_lossy(rel)).as_bytes())
             {
                 tags.favicon_values.push(href);
             }
@@ -295,7 +386,7 @@ fn read_start_tag<'a>(page: &'a [u8], name_start: usize, tags: &mut PageTags<'a>
                 end,
             } = read_attributes(page, name_end, [b"name", b"content"])?;
             if let (Some(name), Some(content)) = (name, content)
-                && is_tile_image_name(&name)
+                && is_tile_image_name(decode_entities(&String::from_utf8_lossy(name)).as_bytes())
             {
                 tags.favicon_values.push(content);
             }
@@ -431,9 +522,8 @@ fn ends_tag_name(b: u8) -> bool {
 
 /// A start tag read to its end, keeping the values of `N` attributes.
 struct StartTag<'a, const N: usize> {
-    /// Each value, its entities decoded; `None` if the tag has no such
-    /// attribute.
-    values: [Option<Cow<'a, [u8]>>; N],
+    /// Each value, as written; `None` if the tag has no such attribute.
+    values: [Option<&'a [u8]>; N],
     /// Just past the tag's `>`.
     end: usize,
 }
@@ -456,15 +546,9 @@ fn read_attributes<'a, const N: usize>(
     from: usize,
     names: [&[u8]; N],
 ) -> Option<StartTag<'a, N>> {
-    // `[None; N]` repeats a `Copy` value, which `Option<&[u8]>` is and
-    // `Option<Cow<[u8]>>` isn't: the values are kept as slices of the page,
-    // and decoded once the tag is read, with the array's `map`.
+    // `[None; N]` repeats a `Copy` value, which `Option<&[u8]>` is.
     let mut values = [None; N];
-    let mut attributes = Attributes {
-        page,
-        pos: from,
-        end: None,
-    };
+    let mut attributes = Attributes::new(page, from);
     // `&mut attributes` lends the iterator to the loop instead of moving it
     // in (`&mut I` is an iterator too), so its `end` can be read after.
     for (name, value) in &mut attributes {
@@ -473,8 +557,8 @@ fn read_attributes<'a, const N: usize>(
         }
     }
     Some(StartTag {
-        values: values.map(|value| value.map(decode_entities)),
-        end: attributes.end?,
+        values,
+        end: attributes.end()?,
     })
 }
 
@@ -490,13 +574,35 @@ fn read_attributes<'a, const N: usize>(
 /// - whitespace and `/` separate attributes, yet a name may also follow a
 ///   closing quote directly (`rel="icon"href="…"`);
 /// - the first `>` outside a quoted value ends the tag, however far.
-struct Attributes<'a> {
+///
+/// These are also the rules by which a browser looks for a `<meta>`
+/// charset before reading the page (`charset`), so that reads its tags
+/// with this iterator too: `pub(crate)` makes it visible to the whole
+/// crate, not outside it.
+pub(crate) struct Attributes<'a> {
     page: &'a [u8],
     /// Where the next attribute is looked for.
     pos: usize,
     /// Once the iterator is done: just past the tag's `>`, or `None` if the
     /// page ended inside the tag.
     end: Option<usize>,
+}
+
+impl<'a> Attributes<'a> {
+    /// The attributes of the start tag in `page` whose name ends at `from`.
+    pub(crate) fn new(page: &'a [u8], from: usize) -> Self {
+        Attributes {
+            page,
+            pos: from,
+            end: None,
+        }
+    }
+
+    /// Once the iterator is done: just past the tag's `>`, or `None` if the
+    /// page ended inside the tag.
+    pub(crate) fn end(&self) -> Option<usize> {
+        self.end
+    }
 }
 
 impl<'a> Iterator for Attributes<'a> {
@@ -577,28 +683,29 @@ fn skip_while(page: &[u8], from: usize, keep_going: impl Fn(u8) -> bool) -> usiz
 /// 128 to 159 mapped to Windows-1252 characters as HTML does.
 ///
 /// Borrowed, without copying, when the value holds no `&`: nearly always.
-fn decode_entities(value: &[u8]) -> Cow<'_, [u8]> {
-    let Some(first_amp) = memchr::memchr(b'&', value) else {
+/// A reference is ASCII, so each cut below falls between two characters.
+fn decode_entities(value: &str) -> Cow<'_, str> {
+    let Some(first_amp) = memchr::memchr(b'&', value.as_bytes()) else {
         return Cow::Borrowed(value);
     };
-    let mut decoded = Vec::with_capacity(value.len());
+    let mut decoded = String::with_capacity(value.len());
     let mut pos = 0;
     let mut amp = Some(first_amp);
     while let Some(at) = amp {
-        decoded.extend_from_slice(&value[pos..at]);
-        pos = match character_reference(&value[at + 1..]) {
+        decoded.push_str(&value[pos..at]);
+        pos = match character_reference(&value.as_bytes()[at + 1..]) {
             Some((character, len)) => {
-                decoded.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+                decoded.push(character);
                 at + 1 + len
             }
             None => {
-                decoded.push(b'&');
+                decoded.push('&');
                 at + 1
             }
         };
-        amp = memchr::memchr(b'&', &value[pos..]).map(|offset| pos + offset);
+        amp = memchr::memchr(b'&', &value.as_bytes()[pos..]).map(|offset| pos + offset);
     }
-    decoded.extend_from_slice(&value[pos..]);
+    decoded.push_str(&value[pos..]);
     Cow::Owned(decoded)
 }
 
@@ -660,13 +767,13 @@ fn character_reference(text: &[u8]) -> Option<(char, usize)> {
 /// As in AIL, a value is one of two kinds:
 /// - `data:` URIs → decode the base64 payload, store as inline favicon
 /// - Everything else → resolve to absolute URL against the page's base URL
-///   (`document_base`)
-fn process_favicon_value(value: &[u8], base: Option<&Url>, result: &mut FaviconResult) {
-    // Convert to string — favicon URLs should be valid UTF-8 (they're in
-    // HTML attributes). If not, skip this value.
-    let Ok(value) = std::str::from_utf8(value) else {
-        return;
-    };
+///   (`document_base`), its query percent-encoded in `query_encoding`
+fn process_favicon_value(
+    value: &str,
+    base: Option<&Url>,
+    query_encoding: &'static Encoding,
+    result: &mut FaviconResult,
+) {
     // HTML strips ASCII whitespace around a URL, and fetches nothing for
     // an empty one.
     let value = value.trim_ascii();
@@ -679,7 +786,7 @@ fn process_favicon_value(value: &[u8], base: Option<&Url>, result: &mut FaviconR
             result.inline_favicons.push(image);
         }
     } else {
-        push_resolved(&mut result.urls, base, value);
+        push_resolved(&mut result.urls, base, value, query_encoding);
     }
 }
 
@@ -724,17 +831,22 @@ fn decode_inline_image(data_uri: &str) -> Option<InlineImage> {
 /// "document base URL": its first `<base href>` resolved against the page
 /// URL, else the page URL. A `<base href>` that is no URL leaves the page
 /// URL, as in a browser. `None` if the page URL is no URL either: then
-/// only absolute values resolve.
-fn document_base(page_url: &str, base_href: Option<&str>) -> Option<Url> {
+/// only absolute values resolve. `query_encoding` is the page's encoding for
+/// URL queries (`PageText`).
+fn document_base(
+    page_url: &str,
+    base_href: Option<&str>,
+    query_encoding: &'static Encoding,
+) -> Option<Url> {
     let page = Url::parse(page_url).ok();
     match base_href {
-        Some(href) => resolve(page.as_ref(), href).or(page),
+        Some(href) => resolve(page.as_ref(), href, query_encoding).or(page),
         None => page,
     }
 }
 
-/// `value` resolved against `base` as a browser resolves it; `None` if it
-/// is no URL.
+/// `value` resolved against `base` as a browser resolves it in a page
+/// whose encoding for URL queries is `query_encoding`; `None` if it is no URL.
 ///
 /// ## The `url` crate: URLs as browsers read them
 ///
@@ -745,15 +857,85 @@ fn document_base(page_url: &str, base_href: Option<&str>) -> Option<Url> {
 /// of these is a rule a hand-written resolver gets wrong sooner or later.
 /// `Url::options().base_url(base).parse(value)` is `base.join(value)`, also
 /// for a base that may be missing.
-fn resolve(base: Option<&Url>, value: &str) -> Option<Url> {
-    Url::options().base_url(base).parse(value).ok()
+///
+/// ## A query in the page's encoding
+///
+/// The path of a URL is always percent-encoded from UTF-8, but its query,
+/// for `http`, `https`, `ftp` and `file` URLs, from the encoding of the page
+/// it is written in: an old rule browsers keep, as servers of legacy pages
+/// read their queries in that charset. `encoding_override` hands `url` a
+/// function encoding a query's text (`encode_query`).
+///
+/// ## A closure as a `&dyn Fn`
+///
+/// The function must return bytes borrowed from the text it is given
+/// (`Cow<'_, [u8]>`). A closure's signature is inferred from its body,
+/// which can't express "the output borrows from whichever input": written
+/// with the trait object's type, `&dyn Fn(&str) -> Cow<'_, [u8]>`, it gets
+/// that signature, for every lifetime of the input.
+fn resolve(base: Option<&Url>, value: &str, query_encoding: &'static Encoding) -> Option<Url> {
+    let encode: &dyn Fn(&str) -> Cow<'_, [u8]> = &|query| encode_query(query_encoding, query);
+    // UTF-8 is `url`'s own encoding: no function needed.
+    let encode = (query_encoding != UTF_8).then_some(encode);
+    Url::options()
+        .base_url(base)
+        .encoding_override(encode)
+        .parse(value)
+        .ok()
+}
+
+/// `query` written in `encoding`, as a browser writes a URL's query from a
+/// page in that encoding. A character the encoding lacks is written
+/// `%26%23<number>%3B`: the HTML reference `&#<number>;`, percent-encoded
+/// so that its `&` and `;` read as nothing else. `url` percent-encodes the
+/// other bytes, and leaves a `%` as it is.
+///
+/// ## Encoding with `encoding_rs`
+///
+/// `Encoding::encode` writes a whole text at once, but writes a missing
+/// character as `&#<number>;`, which can't be told from the same text
+/// written in the page. It is enough for nearly every query, all of whose
+/// characters the encoding has. Otherwise an `Encoder` encodes step by step
+/// into a `Vec` (`encode_from_utf8_to_vec_without_replacement`): it writes
+/// into the room the `Vec` has, and stops at the end of the text, when the
+/// room runs out (`OutputFull`), or at a character it lacks
+/// (`Unmappable`), saying how far it read each time.
+fn encode_query<'a>(encoding: &'static Encoding, query: &'a str) -> Cow<'a, [u8]> {
+    let (bytes, _, has_missing_characters) = encoding.encode(query);
+    if !has_missing_characters {
+        return bytes;
+    }
+    let mut encoder = encoding.new_encoder();
+    let mut encoded = Vec::new();
+    let mut rest = query;
+    loop {
+        // `None` only if the length overflowed, which a query can't.
+        let room = encoder.max_buffer_length_from_utf8_without_replacement(rest.len());
+        encoded.reserve(room.unwrap_or(rest.len()));
+        let (result, read) =
+            encoder.encode_from_utf8_to_vec_without_replacement(rest, &mut encoded, true);
+        rest = &rest[read..];
+        match result {
+            EncoderResult::InputEmpty => return Cow::Owned(encoded),
+            EncoderResult::OutputFull => {}
+            EncoderResult::Unmappable(character) => {
+                let reference = format!("%26%23{}%3B", u32::from(character));
+                encoded.extend_from_slice(reference.as_bytes());
+            }
+        }
+    }
 }
 
 /// Resolve `value` against `base` and append it, unless it is no URL or
 /// the page already declared the same favicon. It is written as `url`
 /// serializes it, which is what a browser requests.
-fn push_resolved(urls: &mut Vec<String>, base: Option<&Url>, value: &str) {
-    let Some(url) = resolve(base, value) else {
+fn push_resolved(
+    urls: &mut Vec<String>,
+    base: Option<&Url>,
+    value: &str,
+    query_encoding: &'static Encoding,
+) {
+    let Some(url) = resolve(base, value, query_encoding) else {
         return;
     };
     let url = String::from(url);
@@ -831,10 +1013,19 @@ mod tests {
     use super::*;
     use crate::page_record::{Link, Meta};
 
+    /// What `extract_favicons` finds in `html`, a page declared UTF-8.
+    fn utf8_favicons(html: &[u8], page_url: &str) -> FaviconResult {
+        let page = HtmlPage {
+            body: html,
+            charset: Charset::Declared(UTF_8),
+        };
+        extract_favicons(&page, page_url)
+    }
+
     #[test]
     fn basic_link_icon() {
         let html = br#"<html><head><link rel="icon" href="/favicon.png"></head></html>"#;
-        let result = extract_favicons(html, "https://example.com/page");
+        let result = utf8_favicons(html, "https://example.com/page");
         assert!(
             result
                 .urls
@@ -846,7 +1037,7 @@ mod tests {
     #[test]
     fn shortcut_icon() {
         let html = br#"<link rel="shortcut icon" href="/icons/fav.ico">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -858,7 +1049,7 @@ mod tests {
     #[test]
     fn apple_touch_icon() {
         let html = br#"<link rel="apple-touch-icon" href="/apple-icon.png">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -870,7 +1061,7 @@ mod tests {
     #[test]
     fn mask_icon() {
         let html = br#"<link rel="mask-icon" href="/safari-pinned.svg">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -882,7 +1073,7 @@ mod tests {
     #[test]
     fn msapplication_tile_image() {
         let html = br#"<meta name="msapplication-TileImage" content="/icons/tile.png">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -894,7 +1085,7 @@ mod tests {
     #[test]
     fn no_root_favicon_guess_without_tags() {
         let html = b"<html><head><title>No icons</title></head></html>";
-        let result = extract_favicons(html, "https://example.com/page/deep");
+        let result = utf8_favicons(html, "https://example.com/page/deep");
         assert!(
             result.urls.is_empty(),
             "only declared favicons are recorded"
@@ -904,7 +1095,7 @@ mod tests {
     #[test]
     fn declared_root_favicon_is_kept() {
         let html = br#"<link rel="icon" href="/favicon.ico">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert_eq!(result.urls, ["https://example.com/favicon.ico"]);
     }
 
@@ -919,7 +1110,7 @@ mod tests {
     fn inline_data_uri_decoded_with_its_media_type() {
         // "hello" in base64 = "aGVsbG8="
         let html = br#"<link rel="icon" href="data:image/png;base64,aGVsbG8=">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert_eq!(
             result.inline_favicons,
             [inline_image("image/png", b"hello")]
@@ -933,7 +1124,7 @@ mod tests {
         // With spaces after the `;`s, as some pages write it.
         let html =
             br#"<link rel="icon" href="data:Image/SVG+XML; charset=utf-8; base64,PHN2Zy8+">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert_eq!(
             result.inline_favicons,
             [inline_image("image/svg+xml", b"<svg/>")]
@@ -944,7 +1135,7 @@ mod tests {
     fn data_uri_not_in_base64_is_dropped() {
         // Percent-encoded data, even when it happens to read as base64.
         let html = br#"<link rel="icon" href="data:image/svg+xml,abcd">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(result.inline_favicons.is_empty());
         assert!(result.urls.is_empty());
     }
@@ -952,7 +1143,7 @@ mod tests {
     #[test]
     fn absolute_url_left_as_is() {
         let html = br#"<link rel="icon" href="https://cdn.other.com/favicon.png">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -964,7 +1155,7 @@ mod tests {
     #[test]
     fn protocol_relative_url() {
         let html = br#"<link rel="icon" href="//cdn.example.com/fav.ico">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -976,7 +1167,7 @@ mod tests {
     #[test]
     fn relative_url_resolved() {
         let html = br#"<link rel="icon" href="images/fav.png">"#;
-        let result = extract_favicons(html, "https://example.com/blog/post");
+        let result = utf8_favicons(html, "https://example.com/blog/post");
         assert!(
             result
                 .urls
@@ -988,7 +1179,7 @@ mod tests {
     #[test]
     fn relative_url_resolved_against_relative_base() {
         let html = br#"<base href="/static/"><link rel="icon" href="icons/fav.png">"#;
-        let result = extract_favicons(html, "https://example.net/docs/page.html");
+        let result = utf8_favicons(html, "https://example.net/docs/page.html");
         assert_eq!(result.urls, ["https://example.net/static/icons/fav.png"]);
     }
 
@@ -999,7 +1190,7 @@ mod tests {
             <link rel="icon" href="fav.png">
             <link rel="apple-touch-icon" href="/touch.png">
         "#;
-        let result = extract_favicons(html, "https://example.net/docs/page.html");
+        let result = utf8_favicons(html, "https://example.net/docs/page.html");
         assert_eq!(
             result.urls,
             [
@@ -1028,7 +1219,7 @@ mod tests {
             "#,
         ];
         for html in pages {
-            let result = extract_favicons(html, "https://example.net/docs/page.html");
+            let result = utf8_favicons(html, "https://example.net/docs/page.html");
             assert_eq!(result.urls, ["https://example.net/first/fav.png"]);
         }
     }
@@ -1036,7 +1227,7 @@ mod tests {
     #[test]
     fn single_quoted_attributes() {
         let html = br#"<link rel='icon' href='/favicon.png'>"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(
             result
                 .urls
@@ -1052,7 +1243,7 @@ mod tests {
             <link rel="apple-touch-icon" href="/icon2.png">
             <meta name="msapplication-TileImage" content="/icon3.png">
         "#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert_eq!(result.urls.len(), 3);
         assert!(result.urls.iter().any(|u| u.ends_with("icon1.png")));
         assert!(result.urls.iter().any(|u| u.ends_with("icon2.png")));
@@ -1065,20 +1256,20 @@ mod tests {
             <link rel="stylesheet" href="/style.css">
             <link rel="canonical" href="https://example.com/">
         "#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(result.urls.is_empty());
     }
 
     #[test]
     fn empty_body() {
-        let result = extract_favicons(b"", "https://example.com/");
+        let result = utf8_favicons(b"", "https://example.com/");
         assert!(result.urls.is_empty());
     }
 
     #[test]
     fn case_insensitive_rel() {
         let html = br#"<LINK REL="ICON" HREF="/fav.png">"#;
-        let result = extract_favicons(html, "https://example.com/");
+        let result = utf8_favicons(html, "https://example.com/");
         assert!(result.urls.iter().any(|u| u.ends_with("fav.png")));
     }
 
@@ -1107,7 +1298,7 @@ mod tests {
     /// `favicons_in_head` the same in `head`, the WAT form of that page.
     fn assert_warc_and_wat(html: &str, head: &Head<'_>, page_url: &str, expected: &[&str]) {
         assert_eq!(
-            extract_favicons(html.as_bytes(), page_url).urls,
+            utf8_favicons(html.as_bytes(), page_url).urls,
             expected,
             "WARC: {html:?}"
         );
@@ -1224,7 +1415,7 @@ mod tests {
         ]);
         assert_warc_and_wat(&html, &head, PAGE, &["https://example.net/touch.png"]);
 
-        let inline = extract_favicons(html.as_bytes(), PAGE).inline_favicons;
+        let inline = utf8_favicons(html.as_bytes(), PAGE).inline_favicons;
         assert_eq!(inline, [inline_image("image/png", &[0; 5 * 1024 / 4 * 3])]);
     }
 
@@ -1378,7 +1569,7 @@ mod tests {
 
     /// The favicon URLs the WARC scanner finds in `html`, crawled at `PAGE`.
     fn warc_favicons(html: &str) -> Vec<String> {
-        extract_favicons(html.as_bytes(), PAGE).urls
+        utf8_favicons(html.as_bytes(), PAGE).urls
     }
 
     #[test]
@@ -1402,7 +1593,7 @@ mod tests {
         let html = format!(
             r#"<link rel="icon" href="{data_uri}"><link rel="mask-icon" href="/mask.svg">"#
         );
-        let result = extract_favicons(html.as_bytes(), PAGE);
+        let result = utf8_favicons(html.as_bytes(), PAGE);
         assert_eq!(
             result.inline_favicons,
             [inline_image("image/png", &[0; 100 * 1024 / 4 * 3])]
@@ -1422,6 +1613,48 @@ mod tests {
         ] {
             assert_eq!(warc_favicons(html), ["https://example.net/i.png"]);
         }
+    }
+
+    /// The favicon URLs `extract_favicons` finds in `html`, a page that
+    /// declares no charset, crawled at `PAGE`.
+    fn undeclared_favicons(html: &[u8]) -> Vec<String> {
+        let page = HtmlPage {
+            body: html,
+            charset: Charset::Undeclared,
+        };
+        extract_favicons(&page, PAGE).urls
+    }
+
+    #[test]
+    fn an_undeclared_page_writes_its_queries_in_the_charset_it_reads_in() {
+        let link = r#"<link rel="icon" href="/caf&#233;.png?q=caf&#233;">"#;
+        // Latin-1 text elsewhere: windows-1252, even for an entity's `é`.
+        assert_eq!(
+            undeclared_favicons(&[b"<p>caf\xe9</p>", link.as_bytes()].concat()),
+            ["https://example.net/caf%C3%A9.png?q=caf%E9"]
+        );
+        // ASCII and UTF-8 pages: UTF-8, a stray byte elsewhere or not.
+        let utf8 = "https://example.net/caf%C3%A9.png?q=caf%C3%A9";
+        assert_eq!(undeclared_favicons(link.as_bytes()), [utf8]);
+        let link = r#"<link rel="icon" href="/café.png?q=café">"#;
+        assert_eq!(
+            undeclared_favicons(&[b"<p>\xff</p>", link.as_bytes()].concat()),
+            [utf8]
+        );
+    }
+
+    #[test]
+    fn a_character_the_page_charset_lacks_is_written_as_a_reference() {
+        // `中` (U+4E2D, 20013) is no windows-1252 character: a browser
+        // writes `&#20013;` there, percent-encoded.
+        let page = HtmlPage {
+            body: br#"<link rel="icon" href="/i.png?q=&#20013;&#233;">"#,
+            charset: Charset::Declared(encoding_rs::WINDOWS_1252),
+        };
+        assert_eq!(
+            extract_favicons(&page, PAGE).urls,
+            ["https://example.net/i.png?q=%26%2320013%3B%E9"]
+        );
     }
 
     // -- Base64 decoder tests --

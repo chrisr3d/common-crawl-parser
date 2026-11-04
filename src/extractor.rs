@@ -68,8 +68,8 @@ pub enum OnionEngine {
 }
 
 /// Finds `.onion` addresses anywhere in a page: the page URL and the whole
-/// HTTP response of a WARC record, the JSON of a WAT record, the text of a
-/// WET record.
+/// HTTP response of a WARC record (decoded too if it is UTF-16), the JSON
+/// of a WAT record, the text of a WET record.
 pub struct OnionExtractor {
     search: OnionSearch,
     sightings: Sightings,
@@ -125,10 +125,16 @@ impl Extractor for OnionExtractor {
             // such as `Onion-Location`. The URL holds the address of a
             // page read through a Tor gateway (`<address>.onion.ly`); an
             // address in both the URL and the response is still one
-            // Sighting (`add_sightings`).
+            // Sighting (`add_sightings`). A response in UTF-16 is searched
+            // decoded as well: its bytes hide the addresses in its body.
+            // Its bytes are still searched, for its headers and for a body
+            // declared UTF-16 but written in ASCII.
             PageRecord::Warc(response) => {
                 let mut found = search(response.page_url.as_bytes());
                 found.extend(search(response.http_response));
+                if let Some(text) = response.utf16_text() {
+                    found.extend(search(text.as_bytes()));
+                }
                 found
             }
             // The raw JSON, searched like the HTTP response: an address is
@@ -182,8 +188,8 @@ impl Extractor for FaviconExtractor {
             // The scanner also decodes inline `data:` favicons: those are
             // the `inline-favicon` kind's (`InlineFaviconExtractor`).
             PageRecord::Warc(response) => response
-                .html_body()
-                .map(|html| favicon_search::extract_favicons(html, response.page_url).urls),
+                .html_page()
+                .map(|page| favicon_search::extract_favicons(&page, response.page_url).urls),
             // ia-web-commons already parsed the page's `<head>`.
             PageRecord::Wat(metadata) => metadata
                 .head
@@ -238,13 +244,13 @@ impl Extractor for InlineFaviconExtractor {
         let PageRecord::Warc(response) = record else {
             return;
         };
-        let Some(html) = response.html_body() else {
+        let Some(page) = response.html_page() else {
             return;
         };
         // The same scan as the favicon extractor's, which keeps the URLs:
         // with both kinds requested, a page is scanned twice, a few
         // microseconds next to its decompression.
-        let images = favicon_search::extract_favicons(html, response.page_url).inline_favicons;
+        let images = favicon_search::extract_favicons(&page, response.page_url).inline_favicons;
         if images.is_empty() {
             return;
         }
