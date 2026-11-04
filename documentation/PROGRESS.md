@@ -471,7 +471,8 @@ pub fn parse_archive(
 - **Transport** (`lib.rs`): `Disk(PathBuf)`, `Memory(Vec<u8>)` or `Mmap(PathBuf)`. Disk and
   Memory share the streaming loop; Mmap decompresses to a copy and uses the slice parser.
 - **Format** (`page_record.rs`): each record becomes a `PageRecord::Warc(WarcResponse)`
-  borrowing the parser's bytes; `WarcResponse::html_body()` holds the HTML check.
+  borrowing the parser's bytes; `WarcResponse::html_body()` holds the HTML check
+  (`html_page()` since Step 34).
 - **Artifact kind** (`extractor.rs`): `trait Extractor`, one implementation per kind. The loop
   hands every record to every extractor and never names a kind.
 - **Domain types** (`artifact.rs`): `ArtifactKind`, `Shard` (the Archive name without its
@@ -784,7 +785,7 @@ take their constants from the real table
 
 ---
 
-## Steps 17 and 25: WARC Favicon Tags Read as a Browser Reads Them
+## Steps 17, 25 and 34: WARC Pages Read as a Browser Reads Them
 
 ### What we built
 
@@ -820,6 +821,33 @@ UTF-16) or comments WAT's parser misreads (`--->`). Parse time is unchanged or s
 The done marks don't record which rules extracted a pair, so new rules apply to the Shards
 extracted from then on.
 
+Step 34 read the pages behind most of the 1,109 favicon Sightings WAT found and WARC didn't. Of
+16 such pages read back, 8 had no HTML `Content-Type` (none, `charset=utf-8` alone, `text/plain`,
+a first `application/octet-stream`), 5 were in UTF-16, 1 had its URL in Latin-1:
+
+- **Common Crawl's HTML check** (`WarcResponse::html_page`): both record parsers read
+  `WARC-Identified-Payload-Type`, the type Common Crawl detected from the bytes; a response is HTML
+  when it is `text/html` or `application/xhtml+xml`. Without it (CC-NEWS), `Content-Type` decides
+  as before.
+- **Charsets** (the new `src/charset.rs`, with the `encoding_rs` crate): the HTML standard's
+  encoding sniffing, byte-order mark, then HTTP `charset`, then a UTF-16 `<?x`, then a `<meta>` in
+  the first 1024 bytes (the prescan, reading tags with the scanner's `Attributes`) or an XML
+  declaration's `encoding`, else UTF-8 unless UTF-8 reads none of the bytes beyond ASCII,
+  windows-1252 then. `HtmlPage` carries the body and its `Charset` to the scanner.
+- **Values decoded, pages scanned as bytes** (`extract_favicons`): `PageTags` keeps values as
+  written; `PageText::read` decodes each from the page's charset, then its entities. Only UTF-16
+  and ISO-2022-JP pages, whose markup isn't ASCII bytes, are decoded whole before the scan. URL
+  queries are percent-encoded in the page's charset, as browsers do (`encoding_override`,
+  `encode_query`), a character it lacks as `%26%23<number>%3B`.
+- **Onions in UTF-16** (`WarcResponse::utf16_text`): a response in UTF-16, by byte-order mark,
+  HTTP charset or XML declaration, is searched decoded as well as in bytes.
+- **Tests**: `tests/warc_pages.rs` builds pages identified or not, in UTF-16 (both byte orders, by
+  mark, charset or XML declaration), windows-1252, Shift_JIS, windows-1251 and ISO-2022-JP, and
+  reads them on every Transport with both engines; unit tests pin the prescan and the undeclared
+  default (`charset.rs`), queries in legacy charsets (`favicon_search.rs`). On a real 1 GB CC-NEWS
+  Archive, results are unchanged, all six combinations agree, and parse time is within noise
+  (7.83 s against 7.81 s, over five runs each).
+
 ### Rust concepts introduced
 
 **`OnceCell`: computed on first use, through `&self`**
@@ -854,11 +882,13 @@ still there after the loop to read `attributes.end`.
 with an array pattern, `let StartTag { values: [rel, href], end } = ...?;`, checked at compile
 time to have `N` elements. `[None; N]` needs a `Copy` element, which `Option<&[u8]>` is and
 `Option<Cow<[u8]>>` isn't: the values are collected as slices, then decoded at once with
-`values.map(|value| value.map(decode_entities))` (`[T; N]::map`).
+`values.map(|value| value.map(decode_entities))` (`[T; N]::map`). Since Step 34 they stay
+slices, decoded once the page's charset made them text.
 
 **`Cow<[u8]>`: decoded only when needed**
 `decode_entities` returns `Cow::Borrowed(value)` when the value holds no `&` (a `memchr`), and
 a new `Vec` (`Cow::Owned`) only otherwise. `PageTags` keeps either, borrowed from the page.
+(Since Step 34 it decodes a `&str` into a `Cow<str>`, after the charset.)
 
 **`char` from a number**
 `char::from_u32(code)` is `None` for a surrogate or a number past U+10FFFF, which HTML reads as
@@ -874,6 +904,66 @@ copying it.
 **Clippy's `type_complexity`**
 `Option<([Option<Cow<'a, [u8]>>; N], usize)>` drew the lint; a named struct with documented
 fields (`StartTag`) reads better than the tuple it replaced.
+
+**`&'static Encoding`: a value that is a reference to a `static`**
+`encoding_rs` defines each encoding once, as a `static`, and hands out `&'static Encoding`:
+copied freely, stored in an enum (`Charset::Declared(&'static Encoding)`), compared with `==`,
+which for an `Encoding` compares addresses. No lifetime to carry: `'static` lives for the whole
+program.
+
+**Keeping a `Cow` borrowed through two steps**
+`decode_without_bom_handling` returns `Cow::Borrowed` when the bytes are already valid UTF-8,
+and `decode_entities` borrows when there is no `&`. Chaining them, the second borrows from the
+first's result: when that is `Borrowed`, it points into the page and the result can be returned;
+when it is `Owned`, a `String` local to the function, the result must own its text too. A `match`
+on the two variants (`PageText::read`) says so, and the usual value is never copied.
+
+**A variable declared before its value: `let decoded;`**
+`let decoded;` declares a variable assigned later, in one `match` arm (a page decoded whole);
+the compiler checks it is assigned before any use. Declared before the slice borrowing it, it is
+dropped after it, so the arm can return `decoded.as_bytes()` while the other borrows the page.
+
+**A closure written as a `&dyn Fn`**
+`url`'s `encoding_override` wants a function whose output borrows from its input (`&dyn Fn(&str)
+-> Cow<'_, [u8]>`). A closure's signature is inferred from its body, which can't say "the output
+lives as long as whichever input"; given the trait object's type
+(`let encode: &dyn Fn(&str) -> Cow<'_, [u8]> = &|query| ...`), it gets that signature, for every
+lifetime of the input.
+
+**`pub(crate)`: visible in the crate, not outside**
+The prescan reads attributes by the same rules as the favicon scanner: `pub(crate) struct
+Attributes` and its `pub(crate)` methods let `charset` use it, while the crate's users still
+can't.
+
+**`Option<Option<T>>` and `flatten`**
+The prescan tells three states apart: no charset named yet (`None`), a name no encoding answers
+to (`Some(None)`), an encoding (`Some(Some(e))`). `flatten` merges the last two levels once the
+difference no longer matters.
+
+**`next_back` on a `DoubleEndedIterator`**
+`split`, `filter` and `filter_map` can yield from either end: `.next_back()` finds the last
+`Content-Type` searching from the end, where `.last()` walks every line (Clippy's
+`double_ended_iterator_last`).
+
+**`utf8_chunks`: reading bytes as UTF-8, errors included**
+`<[u8]>::utf8_chunks()` cuts bytes into chunks, each a run of valid UTF-8 (`valid()`, a `&str`)
+then the bytes after it that are not (`invalid()`, maybe empty). One pass, no error stopping it:
+`body.utf8_chunks().any(|chunk| !chunk.valid().is_ascii())` says whether UTF-8 reads any
+character beyond ASCII, where `str::from_utf8` stops at the first bad byte.
+
+**An encoder step by step**
+`Encoding::encode` writes a whole text at once, and a character the encoding lacks as `&#N;`,
+which can't be told from the same text written in the page. An `Encoder`'s
+`encode_from_utf8_to_vec_without_replacement(rest, &mut vec, true)` writes into the room the
+`Vec` has and returns why it stopped, `InputEmpty`, `OutputFull` or `Unmappable(char)`, with how
+far it read: a loop reserves room, writes its own text for each missing character, and goes on
+from there.
+
+**`&(impl Trait + ?Sized)`**
+The test helper `http_response(headers, body: &(impl AsRef<[u8]> + ?Sized))` borrows a `&str`, a
+`&String`, a `&[u8]` or a `&Vec<u8>` alike. A generic parameter is `Sized` unless it says
+`?Sized`; `str` and `[u8]` are not (their length is in the reference), so without it `&str` and
+`&[u8]` wouldn't fit. Taking a reference keeps every caller's `&format!(..)` a needed borrow.
 
 ---
 

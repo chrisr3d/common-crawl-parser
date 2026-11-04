@@ -186,7 +186,7 @@ allocating for them:
 
 | Format | Record read | What a page record gives the extractors |
 |---|---|---|
-| WARC | `response` | The record block, i.e. the whole HTTP response (status line, headers, body), with `WARC-Target-URI` and `WARC-Date` |
+| WARC | `response` | The record block, i.e. the whole HTTP response (status line, headers, body), with `WARC-Target-URI`, `WARC-Date` and `WARC-Identified-Payload-Type` |
 | WAT | `metadata` | The record's JSON, and the `<base>`, `<link>` and `<meta>` tags ia-web-commons listed from the page's `<head>` |
 | WET | `conversion` | The page's visible text, with `WARC-Target-URI` and `WARC-Date` |
 
@@ -198,6 +198,50 @@ record, declaring only what is read. A WAT record's own `WARC-Date` is when the
 WAT was generated, so the crawl date comes from the JSON
 (`Envelope.WARC-Header-Metadata.WARC-Date`). A record whose JSON can't be read is
 skipped.
+
+**Which WARC responses are HTML pages.** Common Crawl's own check, the one that
+picks the pages its WAT and WET Archives read as HTML: the type it identified
+from the response's bytes, in the record's `WARC-Identified-Payload-Type`, is
+`text/html` or `application/xhtml+xml` (in any case). CC-MAIN writes that
+header, CC-NEWS doesn't: a record without one is an HTML page when its HTTP
+`Content-Type` contains `text/html` or `application/xhtml`. A server's
+`Content-Type` is often missing or wrong (`charset=utf-8` alone, `text/plain`,
+a first `application/octet-stream`), and a type identified as anything else
+(`text/plain`, `application/xml`) is no HTML page, whatever the server said.
+
+**Charsets.** Each WARC response is read in the charset a browser reads it in,
+by the HTML standard's encoding sniffing (`src/charset.rs`):
+
+1. a byte-order mark at the start of the body (UTF-8, UTF-16LE, UTF-16BE),
+   which wins over the rest;
+2. the `charset` parameter of the last HTTP `Content-Type` naming a type
+   (`text/html; charset=Shift_JIS`); one naming no type (`charset=utf-8` alone,
+   `*/*`) or an unknown charset counts for nothing;
+3. the first bytes of an XML declaration in UTF-16 (`<?x` as `<\0?\0x\0` or
+   `\0<\0?\0x`), which show the byte order;
+4. for an HTML page, the first `<meta charset="…">`, or `<meta
+   http-equiv="Content-Type" content="…; charset=…">`, in its first 1024 bytes,
+   comments and the attributes of other tags passed over (the standard's
+   *prescan*), else the `encoding` of an XML declaration opening the page
+   (`<?xml version="1.0" encoding="ISO-8859-1"?>`). UTF-16 declared in either
+   reads as UTF-8, since it could be read as ASCII; `x-user-defined` in a
+   `<meta>` as windows-1252;
+5. else UTF-8, unless the page holds bytes beyond ASCII and UTF-8 reads none
+   of them: windows-1252 then. Browsers guessing from the bytes read UTF-8
+   pages as UTF-8, and fall back on windows-1252 in most of the world. A page
+   holding one UTF-8 character beyond ASCII is read as UTF-8, a stray byte
+   elsewhere (or a last character cut short by Common Crawl's size limit)
+   notwithstanding. The page is read through for this only when a favicon
+   value isn't ASCII, its entities decoded.
+
+Every charset of the WHATWG Encoding Standard is read, by any of its labels
+(`latin1` and `iso-8859-1` are windows-1252, as in browsers), with
+`encoding_rs`, Firefox's implementation of that standard. A charset writing
+ASCII as ASCII bytes and no other character with them, every one but UTF-16 and
+ISO-2022-JP, costs nothing more: the page is searched as bytes, and only the
+favicon values found are decoded. A UTF-16 or ISO-2022-JP page is decoded whole
+first. A charset browsers refuse to read (`iso-2022-kr`, `hz-gb-2312`: the
+standard's *replacement* encoding) gives nothing, as in a browser.
 
 The Transport decides how the compressed bytes reach the parser. All three give
 the same results:
@@ -291,6 +335,13 @@ lowercasing (`onion_search::checked_address`), so they count the same onions.
   sample measured in `RESEARCH-warc-wat-wet.md`, 53 % of matches came from
   `Onion-Location` and `Content-Security-Policy` headers. The URL holds the
   address of a page read through a Tor web gateway (`<address>.onion.ly/…`).
+  A response in UTF-16, by its byte-order mark, HTTP charset or the first
+  bytes of an XML declaration (section 4), whatever its type, is searched
+  decoded as well: UTF-16 is the one charset
+  whose bytes hide the ASCII text they hold (`a\0b\0…`), as WET's text, decoded
+  by Common Crawl, shows. Its bytes are still searched, for its headers and
+  for a body declared UTF-16 but written in ASCII. Every other response is
+  searched as bytes alone, which show its addresses as they are.
 - WAT: the raw JSON bytes, which repeat the WARC headers (the page URL among
   them) and the HTTP headers, and hold the page's links, link texts and
   `<meta>` contents. An address is made of ASCII letters, digits and `.`,
@@ -326,8 +377,9 @@ DOM.
 
 **Which pages.**
 
-- WARC: `response` records whose HTTP `Content-Type` contains `text/html` or
-  `application/xhtml`. The body is scanned for tags.
+- WARC: `response` records that are HTML pages, identified so by Common Crawl
+  (else by their `Content-Type`, section 4). The body is scanned for tags, in
+  its charset.
 - WAT: records with an HTML `<head>` listed by ia-web-commons. Its list of
   `<link>` and `<meta>` tags is checked with the same rules; nothing is scanned.
 - WET: none; the text keeps no markup.
@@ -360,9 +412,11 @@ not a favicon.
 - a tag ends at the first `>` outside a quoted value, however long the tag (an
   inline image of any size). A tag still open at the end of the page is
   dropped, as a browser drops it;
-- entities are decoded in values: numeric ones, decimal (`&#38;`) or hex
-  (`&#x26;`), the closing `;` optional, and `&amp;`, `&lt;`, `&gt;`, `&quot;`,
-  `&apos;`. Any other named one (`&copy;`) is kept as written;
+- values are read in the page's charset (section 4), then their entities are
+  decoded: numeric ones, decimal (`&#38;`) or hex (`&#x26;`), the closing `;`
+  optional, and `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`. Any other named one
+  (`&copy;`) is kept as written. A byte not valid in the charset reads as `�`
+  (U+FFFD), as in a browser;
 - nothing is read inside HTML comments (`<!-- … -->`, closed by `--->` or
   `--!>` too), nor inside `<script>`, `<style>`, `<title>`, `<textarea>`,
   `<iframe>`, `<xmp>`, `<noembed>` and `<noframes>`, up to their end tag: a
@@ -396,7 +450,14 @@ that is no URL leaves the page URL, as in a browser.
   directory;
 - `?v=2` keeps the base's whole path;
 - backslashes read as `/`, spaces are percent-encoded, a default port
-  (`:443`) is dropped.
+  (`:443`) is dropped;
+- a path is percent-encoded from UTF-8, a query from the page's charset, as
+  browsers do for `http`, `https`, `ftp` and `file` URLs: `/café.png?q=café` on
+  a windows-1252 page is `/caf%C3%A9.png?q=caf%E9`. A character the charset
+  lacks, which only an entity can bring in (`&#20013;` on a windows-1252 page),
+  is written as that reference, percent-encoded: `%26%2320013%3B`. A UTF-16
+  page encodes its queries in UTF-8. WAT's values come decoded, their page's
+  charset unknown: their queries are encoded from UTF-8.
 
 A value that is no URL (`https://`) is dropped, an empty one skipped. URLs are
 recorded as `url` writes them, which is what a browser requests.
@@ -763,11 +824,11 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   4.7).
 - **Favicons differ slightly between WARC and WAT.** Over 99 Shards of
   CC-MAIN-2026-34 they share 99.9 % of WARC's Sightings; 3,880 are found only
-  in WARC, 1,109 only in WAT. What still differs, from a sample of the pages:
-  - WARC only scans responses whose `Content-Type` says HTML, as bytes:
-    ia-web-commons also reads pages sent without that header (none,
-    `charset=utf-8` alone, `text/plain`) and pages in UTF-16. A URL value that
-    isn't UTF-8 (on a Latin-1 page) is dropped in WARC.
+  in WARC, 1,109 only in WAT. Most of those 1,109 were on pages WARC didn't
+  read then: sent without an HTML `Content-Type`, in UTF-16, or holding a URL
+  in Latin-1. WARC reads them now, by Common Crawl's HTML check and in their
+  charset (section 4); these counts predate that. What still differs, from a
+  sample of the pages:
   - ia-web-commons' parser misreads comments HTML closes at `--->` or `--!>`,
     or written with runs of dashes (`<!-----`), and leaves out the tags after
     them; it fails on a few pages altogether, and keeps the *last* `<base>`
@@ -798,6 +859,9 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   - Of the named entities, only `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&apos;`
     are decoded, and numeric ones from 128 to 159 are not mapped to
     Windows-1252 characters as HTML maps them.
+  - A page sent as `application/xhtml+xml` is read as HTML, its charset
+    from a `<meta>` too: a browser reads it as XML, whose charset only an XML
+    declaration gives, UTF-8 by default.
 - **One bad record drops the Archive.** A read or decompression error aborts
   the Archive, dropping everything found in it; the kinds reading it are left
   undone, and after 3 runs failing on it the Archive is given up (section 9).

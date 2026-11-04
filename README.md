@@ -23,8 +23,8 @@ The project was built incrementally and now features the following:
 1. **Read paths files** — Parse a WARC, WAT or WET paths file (plain text or `.gz`); the other Formats' paths are derived from it
 2. **HTTP download** — Fetch each Shard's Archives from Common Crawl servers
 3. **Archive parsing** — Decompress gzip-compressed Archives and read their WARC, WAT or WET records with a custom parser
-4. **Onion extraction** — Find `.onion` addresses in HTTP responses (WARC), metadata JSON (WAT) or page text (WET)
-5. **Favicon extraction** — Find the favicons HTML pages declare, resolved against the page's `<base href>`; inline images are recorded by their SHA-256, with their SHA-1, MD5 and Shodan's `mmh3` favicon hash, and saved to disk on request (`--save-images`)
+4. **Onion extraction** — Find `.onion` addresses in HTTP responses (WARC, decoded too when in UTF-16), metadata JSON (WAT) or page text (WET)
+5. **Favicon extraction** — Find the favicons HTML pages declare (the pages Common Crawl identified as HTML, each read in its charset as a browser reads it, with `encoding_rs`), resolved against the page's `<base href>`; inline images are recorded by their SHA-256, with their SHA-1, MD5 and Shodan's `mmh3` favicon hash, and saved to disk on request (`--save-images`)
 6. **Deduplication & results store** — Deduplicate Sightings and write them, Shard by Shard, to a kvrocks store, over a Unix socket or TCP
 7. **Concurrent processing** — Download and parse several Shards in parallel with async/tokio
 8. **Ripgrep-style parsing** — Transport (`-t`) and onion search engine (`--onion-engine`) selectable at runtime
