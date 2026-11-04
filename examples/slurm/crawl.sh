@@ -79,9 +79,10 @@ PATHS_FILE="<path to wat.paths.gz>"
 # Its password, if it needs one: see the top of this file.
 KVROCKS="<redis://host:port of the kvrocks store>"
 
-# Artifact kinds to extract. The default, onion,favicon, reads WAT + WET on
-# CC-MAIN (~240 MB per Shard); adding inline-favicon makes every kind read
-# WARC instead (~1 GB per Shard).
+# Artifact kinds to extract. By default every kind reads WARC, the Format
+# finding the most (~1 GB per Shard); adding --formats wat,wet to the
+# command below reads onion,favicon from WAT + WET instead (~240 MB per
+# Shard), finding a little less.
 EXTRACT="onion,favicon"
 
 # Level 1: how many paths each array task is responsible for
@@ -103,10 +104,11 @@ if [ "${JOBS_PER_PROCESS}" -lt 1 ]; then
 fi
 
 # With --transport memory, each job holds its Shard's Archives in RAM
-# (~240 MB for WAT + WET, ~1 GB for WARC). Every process sees all of the
-# node's available RAM, so each one is given its share with --max-memory:
-# the node's RAM (MemTotal, in kB) divided by PROCESSES_PER_NODE, in GB of
-# 2^30 bytes. awk computes it with a fraction, which bash's arithmetic can't.
+# (~1 GB for WARC, the default; ~240 MB for WAT + WET). Every process sees
+# all of the node's available RAM, so each one is given its share with
+# --max-memory: the node's RAM (MemTotal, in kB) divided by
+# PROCESSES_PER_NODE, in GB of 2^30 bytes. awk computes it with a fraction,
+# which bash's arithmetic can't.
 MAX_MEMORY_PER_PROCESS=$(awk -v processes="${PROCESSES_PER_NODE}" \
     '/^MemTotal:/ { printf "%.2f", $2 / 1048576 / processes }' /proc/meminfo)
 
@@ -175,8 +177,9 @@ echo ""
 #         store write): they are not marked done in the store, and running
 #         the same command again retries them
 #   4     it ran to the end with nothing to retry, but some pairs given up:
-#         an Archive they read failed the same way on 3 runs (its log's
-#         summary lists them); running it again changes nothing
+#         each Format combination they may read reads an Archive that
+#         failed the same way on 3 runs (its log's summary lists them);
+#         running it again changes nothing
 #   other it stopped early, such as on an unreachable store or an
 #         --offset past the end of the paths file (1), on invalid arguments
 #         (2), or killed by a signal (128 + its number): fix the cause first
