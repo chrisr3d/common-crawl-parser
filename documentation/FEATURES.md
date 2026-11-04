@@ -88,12 +88,13 @@ is what the kinds read together, and only those Archives are downloaded.
 CC-MAIN publishes all three Formats and CC-NEWS WARC only, so by default every
 kind reads WARC on both (~1 GB per Shard).
 
-The order rests on what each combination found over 99 Shards of
-CC-MAIN-2026-34 (`RESEARCH-warc-wat-wet.md`, section 4.7). WARC finds every onion WAT +
-WET find, and more: about 2 % of live onions sit where only WARC keeps them
-(inline scripts, attribute values, comments). For favicon URLs, WARC and WAT
-share 99.9 % of WARC's Sightings, each finding a few the other misses (see
-Known limitations). The size of the Archives chooses nothing: WAT + WET is
+The order rests on what each combination found over 100 Shards of
+CC-MAIN-2026-34 (`RESEARCH-warc-wat-wet.md`, sections 4.7 and 4.8). WARC
+finds every onion WAT + WET find, and more: about 2 % of live onions sit
+where only WARC keeps them (inline scripts, attribute values, comments). For
+favicon URLs, WAT adds 309 Sightings to WARC's 5.08 million, nearly all its
+own misreadings, and misses 3,564 of WARC's (see Known limitations). The
+size of the Archives chooses nothing: WAT + WET is
 about a quarter of WARC's download (~240 MB per Shard), one option away
 (`--formats wat,wet`). The estimated sizes (WARC ~1 GB, WAT ~170 MB, WET
 ~70 MB) only budget RAM for `-t memory` (section 8).
@@ -348,9 +349,8 @@ lowercasing (`onion_search::checked_address`), so they count the same onions.
   which JSON never escapes, so it is found as in WARC.
 - WET: the page's text.
 
-Together, WAT and WET hold most places an onion is found: over 99 Shards they
-found 208 of the 215 distinct onions WARC found. The one they found alone was
-in a gateway page's URL, which the WARC search has read since.
+Together, WAT and WET hold most places an onion is found: over 100 Shards they
+found 209 of the 216 distinct onions WARC found, and none it missed.
 [Known limitations](#known-limitations) lists where the rest were.
 
 **What it records.** For each address, in lowercase, one Sighting per distinct
@@ -812,33 +812,39 @@ to retry, and leave the exit status at 0.
 Behaviour that is surprising or incomplete today, roughly in order of impact.
 
 - **WAT + WET (`--formats wat,wet`, or a given-up WARC) miss some onions
-  WARC finds.** Over 99 Shards of CC-MAIN-2026-34, they missed 7 of the 215
-  distinct onions WARC found (3.3 %) and 21 of its 1,470 Sightings (1.4 %). Every one sat where
+  WARC finds.** Over 100 Shards of CC-MAIN-2026-34, they missed 7 of the 216
+  distinct onions WARC found (3.2 %) and 21 of its 1,486 Sightings (1.4 %),
+  and found none WARC missed. Every one they missed sat where
   WAT and WET keep nothing: inline scripts, JSON inside `<script>`,
   attributes WAT doesn't keep (`<input value>`, `data-*`) and HTML comments.
   Several were a site's own Tor mirror. The bodies of non-HTML responses
   (JavaScript, JSON, CSS, PDF, plain text) are dropped too. In WAT, an address
   right after a JSON escape of a control character (`\n`, `\t`) is missed, the
   escape's last letter reading as part of it. WARC, the default, finds them
-  all, for about 4 times the download (`RESEARCH-warc-wat-wet.md`, section
-  4.7).
-- **Favicons differ slightly between WARC and WAT.** Over 99 Shards of
-  CC-MAIN-2026-34 they share 99.9 % of WARC's Sightings; 3,880 are found only
-  in WARC, 1,109 only in WAT. Most of those 1,109 were on pages WARC didn't
-  read then: sent without an HTML `Content-Type`, in UTF-16, or holding a URL
-  in Latin-1. WARC reads them now, by Common Crawl's HTML check and in their
-  charset (section 4); these counts predate that. What still differs, from a
-  sample of the pages:
+  all, for about 4 times the download (`RESEARCH-warc-wat-wet.md`, sections
+  4.7 and 4.8).
+- **Favicons differ slightly between WARC and WAT.** Over 100 Shards of
+  CC-MAIN-2026-34 they share 99.93 % of WARC's Sightings; 3,564 are found
+  only in WARC, 309 only in WAT. What differs, from a sample of the pages:
   - ia-web-commons' parser misreads comments HTML closes at `--->` or `--!>`,
     or written with runs of dashes (`<!-----`), and leaves out the tags after
-    them; it fails on a few pages altogether, and keeps the *last* `<base>`
-    of a page, where HTML (and the scanner) use the first. WARC finds those
-    favicons.
-  - It also lists a tag written right after a quoted value
-    (`href="…"<link rel="icon" …>`), which HTML reads as attributes of the
-    tag before.
+    them; it lists no `<link>` after a `<noscript>` in the head, decodes some
+    pages in the wrong charset (`×` written `Ã—`), and keeps the *last*
+    `<base>` of a page, where HTML (and the scanner) use the first. WARC
+    finds those favicons.
+  - It also lists tags HTML doesn't read: written right after a quoted value
+    or a tag left without its `>` (`href="…"<link rel="icon" …>`), which
+    HTML reads as attributes of the tag before, or inside a comment "closed"
+    by `-- >`, or inside a `<title>` or `<iframe>` not closed.
 
-  Details in `RESEARCH-warc-wat-wet.md`, section 4.7.
+  Details in `RESEARCH-warc-wat-wet.md`, sections 4.7 and 4.8.
+- **Pages Common Crawl types as something else are not scanned.** Its HTML
+  check goes by the type it detected from the bytes, not the server's
+  `Content-Type`, so a page sent as `text/html`, which a browser renders,
+  but detected as `application/xml` (opening with an XML declaration) or
+  `text/x-php` (opening with `<?php` text) is not scanned for favicons or
+  inline favicons. Over 100 Shards, 369 favicon Sightings on 121 pages; WAT
+  lists none of them either, being made by the same check.
 - **TCP to the store is not encrypted.** A Unix socket reaches a store on the
   same machine; over TCP (several nodes, section 10) the traffic, password
   included, goes in the clear: keep the store on a trusted network.

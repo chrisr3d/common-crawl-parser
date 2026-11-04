@@ -54,7 +54,9 @@ what exactly would be lost, and whether the size saving is worth it.
   (1.4 %), all in inline scripts, attributes WAT does not keep and HTML
   comments; for favicon URLs, WAT turned out more accurate than the WARC
   scanner, until the scanner was reworked: the two now share 99.9 % of WARC's
-  Sightings.
+  Sightings. **Re-measured with WARC as the default (section 4.8):** WARC
+  holds every onion Sighting WAT + WET found, and WAT alone finds 309 favicon
+  Sightings of about 5 million, nearly all its own misreadings.
 - **Blocking bug.** The current `WarcRecordIter` in `src/warc_parser.rs` crashes
   with a stack overflow on any WAT or WET file (it recurses once per skipped
   non-`response` record; WAT files contain 63,523 consecutive `metadata`
@@ -683,6 +685,153 @@ link is faster). Two points hold either way:
 - Keeping WAT + WET as the default stays sound for favicons; a run that wants
   every onion it can get passes `--formats warc`.
 
+### 4.8 Re-measured with WARC as the default
+
+Added 2026-11-04. WARC became the default Plan for every kind, finding the
+most. Since 4.7, the WARC onion search also reads the page URL, and WARC
+pages are scanned by Common Crawl's own HTML check and read in their charset
+(`documentation/FEATURES.md`, section 4). The question: what WAT, or WAT +
+WET, still finds that WARC doesn't, and whether reading favicon URLs from
+WARC alone holds, sparing WAT's download.
+
+**Method.**
+
+- **One run of `cc-extract`** over the same 100 Shards, same machine, `-t
+  memory`, default `-j` (16), `-e onion,favicon,inline-favicon`, default Plan
+  (WARC for every kind), into an empty store. 22 Shards failed their download
+  with HTTP 503 (Common Crawl's rate limiting) in the first run; running the
+  same command four more times did all 100.
+- **Comparison:** `(Artifact, page_url, shard)` Sightings, over the 100
+  Shards both runs finished, with the results of 4.7: onions with the WAT +
+  WET run, favicon URLs with the WAT run after the scanner rework, inline
+  favicons with the inline run. Against the WARC runs of 4.7 too, to see what
+  the changes did.
+- **Read back:** the 100 WARC Archives streamed a second time, keeping only
+  the Records of differing pages, and the WAT Archives of the 16 Shards
+  holding the sampled favicon pages. The run itself kept nothing on disk
+  (`-t memory`, as a production run), so a second download was the only way
+  back to the Records. Up to 15 pages per
+  group, picked at random within as few Shards as possible.
+- **Onions written with HTML entities** counted in the same second pass.
+
+**Time.**
+
+| Per Shard | 4.7 (`onion,favicon`) | Now (`onion,favicon,inline-favicon`) |
+|---|---|---|
+| Download, jobs side by side | 208.5 s | 100.0 s |
+| Parse, jobs side by side | 6.3 s | 8.3 s (median 6.8 s) |
+
+The charset work costs nothing measurable. One Archive (0.9 GB) parsed alone,
+the binaries before and after it run in alternation, three times each:
+
+| One Archive, `--formats warc -t memory` | Before | After |
+|---|---|---|
+| `onion,favicon` | 5.6 to 5.7 s | 5.5 to 5.6 s |
+| `onion,favicon,inline-favicon` | 6.3 s | 6.2 s |
+
+`inline-favicon` adds about 0.7 s to a parse that reads WARC anyway. The
+run's mean is higher than one Archive alone because parses overlapped: the
+downloads took half as long as in 4.7, so more of the 16 jobs parsed at once
+(one parse in ten took over 15 s).
+
+**Onions.**
+
+| 100 Shards | WARC | WAT + WET | Both | Only WARC | Only WAT + WET |
+|---|---|---|---|---|---|
+| Distinct onions | 216 | 209 | 209 | 7 | 0 |
+| of which v3 | 204 | 200 | 200 | 4 | 0 |
+| of which v2 | 12 | 9 | 9 | 3 | 0 |
+| Sightings | 1,486 | 1,465 | 1,465 | 21 | 0 |
+
+- WARC now holds every Sighting WAT + WET found. The one only WAT + WET found
+  in 4.7, an `.onion.ly` gateway page's own URL, WARC finds through its page
+  URL.
+- The 21 Sightings only WARC finds are the 21 of 4.7, on the same pages. 15
+  of their 20 pages read back again: inline scripts (12: nnmclub's footer
+  link, xhamster's list of its own domains), JSON in a `<script>` (2), a
+  `<button data-tor-url>` and a script (1).
+- Reading UTF-16 responses decoded added no onion on these Shards.
+
+**Onions written with HTML entities.** Every response Record of the 100
+Archives (2,140,801 of 6,422,503 Records), headers and body, raw bytes, was
+searched for `&(#0*46|#[xX]0*2[eE]|period);?[oO][nN][iI][oO][nN]` preceded by
+exactly 16 or 56 base32 characters: no match, and no run of base32
+characters of another length before such a dot either. The same search with
+a plain `.` finds the addresses of the pages above. Nothing is lost there.
+
+**Common Crawl's HTML check on real data.** Every one of the 2,140,801
+responses carries `WARC-Identified-Payload-Type`, so on CC-MAIN that type
+alone decides:
+
+| Responses, 100 Shards | `Content-Type` HTML | other | missing |
+|---|---|---|---|
+| Identified HTML | 2,103,337 | 348 | 286 |
+| Identified as another type | 351 | 35,967 | 512 |
+
+The 634 now scanned and the 351 no longer scanned changed the WARC favicon
+URLs, against the WARC run of 4.7:
+
+- **813 Sightings gained** on 336 pages, 805 of them also in WAT: the HTML
+  check (295 pages: `Content-Type` missing 173, `charset=utf-8` alone 67,
+  `application/octet-stream` 14, `application/pdf` 11,
+  `application/vnd.wap.xhtml+xml` 8, `text/plain` 7, others 15), UTF-16 (26),
+  a non-ASCII URL in a legacy charset (15, such as `köpa-guld.ico` in
+  ISO-8859-1).
+- **369 Sightings lost** on 121 pages, none of them in WAT: sent as
+  `text/html`, which a browser renders, but identified as `application/xml`
+  (92; the pages read back open with an XML declaration or a comment),
+  `text/x-php` (24, opening with `<?php` text), `text/x-robots` (4) or
+  `text/x-vcard` (1). WAT's generator applies the same check, so WAT lists no
+  favicon for them either.
+
+**Favicon URLs.**
+
+| 100 Shards | WARC | WAT | Both | Only WARC | Only WAT |
+|---|---|---|---|---|---|
+| Sightings | 5,080,524 | 5,077,269 | 5,076,960 (99.93 % of WARC's) | 3,564 | 309 |
+| Distinct favicons | 3,318,105 | 3,316,255 | 3,315,985 | 2,120 | 270 |
+| Pages with a favicon | 1,701,785 | 1,700,690 | 1,700,657 | 1,128 | 33 |
+
+WAT alone found 1,109 Sightings over 99 Shards in 4.7, 309 over 100 now: 80
+on 33 pages where WARC finds no favicon, 229 on 89 pages where it finds
+others. WARC alone finds 3,564: 3,044 on 1,128 pages where WAT finds none,
+520 on 208 pages where it finds others. 60 differing pages were read back,
+15 per group:
+
+| Group | Pages | Cause |
+|---|---|---|
+| Favicons only WAT found, on pages where WARC found none | 15 | Markup HTML doesn't read as a tag, which ia-web-commons lists: a `<meta>` or `<link>` left without its `>`, the icon `<link>` after it then read as its attributes (8); a comment "closed" by `-- >` (2); inside a `<title>` not yet closed (2); inside an `<iframe>` never closed (1). A Record truncated inside the icon tag (`WARC-Truncated: time`), WAT listing a cut URL (1). An `<iframe>` never closed inside a `<noscript>`, which the scanner reads as markup (1): a browser running scripts shows that favicon |
+| Favicons only WAT found, on pages where WARC found others | 15 | WAT's charset: UTF-8 pages decoded in a legacy charset, `×` becoming `Ã—` (8), Latin-1 pages decoded as UTF-8, `å` becoming `�` (2); WARC has the same favicons, rightly spelled. Markup HTML doesn't read as a tag: a tag left without its `>`, an ideographic space (U+3000) between attributes (4). WAT keeps the page's last `<base>`, HTML the first (1) |
+| Favicons only WARC found, on pages where WAT found none | 15 | ia-web-commons' parser: comments closed at `--!>` or `--->`, or written with runs of dashes (12); no `<link>` listed after a `<noscript>` in the head (3; two hold a tracking pixel `<img>`) |
+| Favicons only WARC found, on pages where WAT found others | 15 | ia-web-commons' comments, as above (7); WAT's charset, as above (5); after a `<noscript>` (1); the last `<base>` (1). The scanner reading a `<link>` written inside another tag's quoted value, opened with `"` and closed with `”` (1): a false positive |
+
+Of the 30 pages read back among the 122 behind WAT's 309 Sightings, one
+holds a favicon a browser loads and WARC misses. Reading favicon URLs from WARC alone holds: WAT's
+download would add about 0.006 % of the Sightings, mostly its own misreadings.
+
+**Inline favicons.** Counted again, the scanner reworked and pages read in
+their charset (the 8-byte PNG placeholder of 4.7 counted apart):
+
+| 100 Shards | 4.7 (scanner before its rework) | Now |
+|---|---|---|
+| Distinct images (SHA-256) | 545 | 826 |
+| Sightings / pages | 2,595 / 2,231 | 3,176 / 2,585 |
+| Placeholder: Sightings on sites | 1,076 on 862 | 1,075 on 861 |
+| Images seen on one site only | 496 | 758 |
+| Images seen on 10 or more sites | 12; the most widespread on 572 sites | 12; on 578 sites |
+| Pages with an inline favicon and no favicon URL | 1,260 | 1,406 |
+
+Media types now: PNG 465, ICO 166, SVG 149, GIF 17, JPEG 11, WebP 11, AVIF 1,
+none 4, malformed 2 (`img/png`, `text/html`). Of the 4.7 Sightings, 5 are no
+longer found, on 4 pages: tags inside a comment (3) or a script string (1),
+which the old scanner read.
+
+**Limits.** The WAT + WET onion results are those of 4.7, from before the
+onion search matched any case and checked v3 checksums; WARC's own results
+changed by one Sighting across those changes (the page URL above), so the
+comparison stands. One Crawl, 100 Shards, one machine, as before. The
+causes above come from samples of 15 pages per group.
+
 ## 5. Implementation implications
 
 **Fix the recursion first.** Replace the `return self.next();` at
@@ -761,7 +910,8 @@ archive kinds so a WAT and its WARC are not confused as "already processed".
   onions in inline scripts, comments and non-HTML payloads (JavaScript bundles,
   JSON APIs, PDFs) in the full crawl is unknown. A larger run over, say, 100
   WARC segments with the record-level attribution script would settle it.
-  Settled by section 4.7: 3.3 % of distinct onions lost over 99 Shards.
+  Settled by section 4.7: 3.3 % of distinct onions lost over 99 Shards
+  (3.2 % over 100 Shards in section 4.8).
 - **Anchor-text truncation.** WAT caps `Links[].text` at 128 characters. A v3
   address (62 characters) inside a long link text could be cut. Not observed
   in the sample, but not excluded.
