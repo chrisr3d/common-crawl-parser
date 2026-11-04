@@ -87,22 +87,28 @@ pub struct WarcResponse<'a> {
 impl<'a> WarcResponse<'a> {
     /// The HTTP body and its charset, if the response is an HTML page.
     ///
-    /// Which responses are HTML is Common Crawl's own check, the one that
-    /// picks the pages its WAT and WET Archives read as HTML: the type it
-    /// identified from the bytes is `text/html` or `application/xhtml+xml`.
-    /// A server's `Content-Type` is often missing or wrong (`text/plain`,
-    /// `charset=utf-8` alone, a first `application/octet-stream`), so it
-    /// decides only for records without an identified type: it must hold
-    /// `text/html` or `application/xhtml`.
+    /// A response is HTML when either type says so:
+    ///
+    /// - the type Common Crawl identified from the bytes is `text/html` or
+    ///   `application/xhtml+xml`. A server's `Content-Type` is often missing
+    ///   or wrong (`text/plain`, `charset=utf-8` alone, a first
+    ///   `application/octet-stream`), and this type still finds the page;
+    /// - or the server's first `Content-Type` holds `text/html` or
+    ///   `application/xhtml`. A browser renders such a page as HTML even
+    ///   when what precedes its HTML (an XML declaration, a comment,
+    ///   `<?php` text) makes Common Crawl identify another type.
+    ///   It alone decides for records without an identified type (CC-NEWS).
     ///
     /// `None` for other responses and for malformed ones with no blank line
     /// between headers and body.
     pub fn html_page(&self) -> Option<HtmlPage<'a>> {
         let (http_headers, http_body) = split_http_response(self.http_response)?;
-        let is_html = match self.identified_payload_type {
-            Some(identified) => is_html_type(identified),
-            None => is_html_content(http_headers),
-        };
+        // `is_some_and` is `false` for `None`, else the function's answer:
+        // the `Option` read without a `match`. `||` evaluates its right
+        // side only when the left is `false`, so a response identified as
+        // HTML never has its headers searched.
+        let is_html =
+            self.identified_payload_type.is_some_and(is_html_type) || is_html_content(http_headers);
         if !is_html {
             return None;
         }

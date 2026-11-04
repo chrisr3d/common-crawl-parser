@@ -2,13 +2,15 @@
 // are HTML pages, and in which charset.
 //
 // Common Crawl detects the type of each response from its bytes, and writes
-// it in the record's `WARC-Identified-Payload-Type` header. That, not the
-// HTTP `Content-Type` a server sent (missing, wrong, given twice), says
-// which responses its WAT and WET Archives read as HTML; the WARC scan
-// follows it. Each page is then read in its charset, as a browser decides
-// it: UTF-16 pages give their favicons and onions, pages in legacy charsets
-// their non-ASCII favicon URLs. These tests build Archives of such pages
-// and read them on every Transport, with both onion engines.
+// it in the record's `WARC-Identified-Payload-Type` header. A response is
+// an HTML page when that type or the HTTP `Content-Type` the server sent
+// says so: the first catches pages a server labels wrong or not at all,
+// the second pages a browser renders though what precedes their HTML (an
+// XML declaration, `<?php` text) makes Common Crawl identify another type.
+// Each page is then read in its charset, as a browser decides it: UTF-16
+// pages give their favicons and onions, pages in legacy charsets their
+// non-ASCII favicon URLs. These tests build Archives of such pages and read
+// them on every Transport, with both onion engines.
 
 // Each test crate compiles its own copy of `common` and uses only part of
 // it; `allow` silences the dead-code warnings for the rest.
@@ -105,10 +107,10 @@ fn pages(page_urls: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn the_identified_payload_type_says_which_responses_are_html() {
+fn a_response_is_html_when_either_type_says_so() {
     // Each case: the `WARC-Identified-Payload-Type`, if any, the HTTP
     // `Content-Type` headers, and whether the page is read as HTML.
-    let cases: [(Option<&str>, &[&str], bool); 10] = [
+    let cases: [(Option<&str>, &[&str], bool); 13] = [
         // Identified as HTML: read, whatever the server sent.
         (Some("text/html"), &[], true),
         (Some("text/html"), &["charset=utf-8"], true),
@@ -118,10 +120,14 @@ fn the_identified_payload_type_says_which_responses_are_html() {
             &["application/octet-stream", "text/html"],
             true,
         ),
-        // Identified as anything else: not read.
-        (Some("text/plain"), &["text/html"], false),
-        (Some("application/octet-stream"), &["text/html"], false),
-        (Some("application/xml"), &["application/xhtml+xml"], false),
+        // Identified as another type, but sent as HTML: read.
+        (Some("application/xml"), &["text/html; charset=utf-8"], true),
+        (Some("text/x-php"), &["text/html"], true),
+        (Some("text/plain"), &["application/xhtml+xml"], true),
+        // Neither says HTML: not read.
+        (Some("application/xml"), &[], false),
+        (Some("text/plain"), &["text/plain"], false),
+        (Some("application/octet-stream"), &["charset=utf-8"], false),
         // Not identified: the `Content-Type` decides.
         (None, &["text/html; charset=utf-8"], true),
         (None, &["application/xhtml+xml"], true),
@@ -152,7 +158,7 @@ fn the_identified_payload_type_says_which_responses_are_html() {
     }
 
     let found = found_in(
-        "the_identified_payload_type_says_which_responses_are_html",
+        "a_response_is_html_when_either_type_says_so",
         &archive.finish(),
     );
     let html_pages: Vec<&str> = html_pages.iter().map(String::as_str).collect();
