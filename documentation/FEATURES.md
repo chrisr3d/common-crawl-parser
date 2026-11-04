@@ -200,15 +200,25 @@ WAT was generated, so the crawl date comes from the JSON
 (`Envelope.WARC-Header-Metadata.WARC-Date`). A record whose JSON can't be read is
 skipped.
 
-**Which WARC responses are HTML pages.** Common Crawl's own check, the one that
-picks the pages its WAT and WET Archives read as HTML: the type it identified
-from the response's bytes, in the record's `WARC-Identified-Payload-Type`, is
-`text/html` or `application/xhtml+xml` (in any case). CC-MAIN writes that
-header, CC-NEWS doesn't: a record without one is an HTML page when its HTTP
-`Content-Type` contains `text/html` or `application/xhtml`. A server's
-`Content-Type` is often missing or wrong (`charset=utf-8` alone, `text/plain`,
-a first `application/octet-stream`), and a type identified as anything else
-(`text/plain`, `application/xml`) is no HTML page, whatever the server said.
+**Which WARC responses are HTML pages.** Those that either type calls HTML:
+
+- the type Common Crawl identified from the response's bytes, in the record's
+  `WARC-Identified-Payload-Type`, is `text/html` or `application/xhtml+xml`
+  (in any case). This is Common Crawl's own check, the one that picks the
+  pages its WAT and WET Archives read as HTML, and it finds pages whose
+  `Content-Type` is missing or wrong (`charset=utf-8` alone, `text/plain`, a
+  first `application/octet-stream`);
+- or the server's first HTTP `Content-Type` contains `text/html` or
+  `application/xhtml`. A browser renders such a page as HTML even when what
+  precedes its HTML (an XML declaration, a comment, `<?php` text, a vCard)
+  makes Common Crawl identify another type, such as `application/xml`,
+  `text/x-php`, `text/x-robots` or `text/x-vcard`. Common Crawl's WAT and
+  WET Archives don't read those pages as HTML; WARC does.
+
+CC-MAIN writes `WARC-Identified-Payload-Type` on every response, CC-NEWS on
+none: there `Content-Type` alone decides. A response neither type calls HTML
+is not scanned for favicon URLs or inline favicons, whatever its bytes; the
+onion search reads every response whatever its type.
 
 **Charsets.** Each WARC response is read in the charset a browser reads it in,
 by the HTML standard's encoding sniffing (`src/charset.rs`):
@@ -377,9 +387,9 @@ DOM.
 
 **Which pages.**
 
-- WARC: `response` records that are HTML pages, identified so by Common Crawl
-  (else by their `Content-Type`, section 4). The body is scanned for tags, in
-  its charset.
+- WARC: `response` records that are HTML pages, by the type Common Crawl
+  identified or by their `Content-Type` (section 4). The body is scanned for
+  tags, in its charset.
 - WAT: records with an HTML `<head>` listed by ia-web-commons. Its list of
   `<link>` and `<meta>` tags is checked with the same rules; nothing is scanned.
 - WET: none; the text keeps no markup.
@@ -825,7 +835,9 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
   4.7 and 4.8).
 - **Favicons differ slightly between WARC and WAT.** Over 100 Shards of
   CC-MAIN-2026-34 they share 99.93 % of WARC's Sightings; 3,564 are found
-  only in WARC, 309 only in WAT. What differs, from a sample of the pages:
+  only in WARC, 309 only in WAT (measured when Common Crawl's type alone
+  decided which pages are HTML: pages sent as HTML but identified as another
+  type now add Sightings WAT lacks). What differs, from a sample of the pages:
   - ia-web-commons' parser misreads comments HTML closes at `--->` or `--!>`,
     or written with runs of dashes (`<!-----`), and leaves out the tags after
     them; it lists no `<link>` after a `<noscript>` in the head, decodes some
@@ -838,13 +850,6 @@ Behaviour that is surprising or incomplete today, roughly in order of impact.
     by `-- >`, or inside a `<title>` or `<iframe>` not closed.
 
   Details in `RESEARCH-warc-wat-wet.md`, sections 4.7 and 4.8.
-- **Pages Common Crawl types as something else are not scanned.** Its HTML
-  check goes by the type it detected from the bytes, not the server's
-  `Content-Type`, so a page sent as `text/html`, which a browser renders,
-  but detected as `application/xml` (opening with an XML declaration) or
-  `text/x-php` (opening with `<?php` text) is not scanned for favicons or
-  inline favicons. Over 100 Shards, 369 favicon Sightings on 121 pages; WAT
-  lists none of them either, being made by the same check.
 - **TCP to the store is not encrypted.** A Unix socket reaches a store on the
   same machine; over TCP (several nodes, section 10) the traffic, password
   included, goes in the clear: keep the store on a trusted network.

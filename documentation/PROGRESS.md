@@ -785,7 +785,7 @@ take their constants from the real table
 
 ---
 
-## Steps 17, 25 and 34: WARC Pages Read as a Browser Reads Them
+## Steps 17, 25, 34 and 35: WARC Pages Read as a Browser Reads Them
 
 ### What we built
 
@@ -828,7 +828,7 @@ a first `application/octet-stream`), 5 were in UTF-16, 1 had its URL in Latin-1:
 - **Common Crawl's HTML check** (`WarcResponse::html_page`): both record parsers read
   `WARC-Identified-Payload-Type`, the type Common Crawl detected from the bytes; a response is HTML
   when it is `text/html` or `application/xhtml+xml`. Without it (CC-NEWS), `Content-Type` decides
-  as before.
+  as before. (Since Step 35 an HTML `Content-Type` is enough too.)
 - **Charsets** (the new `src/charset.rs`, with the `encoding_rs` crate): the HTML standard's
   encoding sniffing, byte-order mark, then HTTP `charset`, then a UTF-16 `<?x`, then a `<meta>` in
   the first 1024 bytes (the prescan, reading tags with the scanner's `Attributes`) or an XML
@@ -847,6 +847,16 @@ a first `application/octet-stream`), 5 were in UTF-16, 1 had its URL in Latin-1:
   default (`charset.rs`), queries in legacy charsets (`favicon_search.rs`). On a real 1 GB CC-NEWS
   Archive, results are unchanged, all six combinations agree, and parse time is within noise
   (7.83 s against 7.81 s, over five runs each).
+
+Step 35 reads as HTML a response either type calls HTML: the identified one, or the server's
+`Content-Type` as before (`WarcResponse::html_page`). Following Common Crawl's check alone had
+lost 369 favicon Sightings on 121 pages over 100 Shards, pages sent as `text/html`, which a
+browser renders, but identified as `application/xml`, `text/x-php`, `text/x-robots` or
+`text/x-vcard` (an XML declaration, a comment, `<?php` text or a vCard before the HTML). WAT
+lacks them too. `tests/warc_pages.rs` now has pages identified as another type but sent as HTML,
+and pages neither type calls HTML. On the CC-MAIN Shard holding the most of the 369 (`-t memory`), the new
+binary finds every Sighting the old one found plus exactly the 26 lost there; parse time is
+within noise (5.5 to 5.8 s against 5.5 to 5.6 s, four runs each).
 
 ### Rust concepts introduced
 
@@ -964,6 +974,18 @@ The test helper `http_response(headers, body: &(impl AsRef<[u8]> + ?Sized))` bor
 `&String`, a `&[u8]` or a `&Vec<u8>` alike. A generic parameter is `Sized` unless it says
 `?Sized`; `str` and `[u8]` are not (their length is in the reference), so without it `&str` and
 `&[u8]` wouldn't fit. Taking a reference keeps every caller's `&format!(..)` a needed borrow.
+
+**`Option::is_some_and`, given a function's name**
+`self.identified_payload_type.is_some_and(is_html_type)` is `false` for `None`, else what the
+function says of the value: an `Option` tested without a `match`. A function's name can stand
+where a closure is expected when its signature fits (`fn(&[u8]) -> bool` for an
+`Option<&[u8]>`), so `|t| is_html_type(t)` isn't needed.
+
+**`||` evaluates its right side only when needed**
+`a || b` evaluates `b` only when `a` is `false` (short-circuit evaluation), so in
+`self.identified_payload_type.is_some_and(is_html_type) || is_html_content(http_headers)` a
+response identified as HTML never has its headers searched. The order of the operands is the
+order of the work.
 
 ---
 

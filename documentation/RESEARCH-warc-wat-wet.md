@@ -784,6 +784,18 @@ URLs, against the WARC run of 4.7:
   `text/x-vcard` (1). WAT's generator applies the same check, so WAT lists no
   favicon for them either.
 
+**Those pages read again.** Added 2026-11-04, after the run above: a WARC
+response is now HTML when either type says so, the identified one or the
+server's `Content-Type` (read as before 4.8), so the 351 responses sent as
+HTML but identified as another type are scanned again. On
+`CC-MAIN-20260812135259-20260812165259-00000`, the Shard holding the most of
+the 369 (26), the binaries before and after ran in turn (`-e
+favicon,inline-favicon -t memory`, default Plan): the run after finds every
+Sighting the run before found, plus exactly those 26, nothing else. Parse
+time, four runs each: 5.5 to 5.6 s before, 5.5 to 5.8 s after. The favicon
+URL table below comes from the run with Common Crawl's check alone, so it
+counts the 369 on neither side; WAT lists none of them.
+
 **Favicon URLs.**
 
 | 100 Shards | WARC | WAT | Both | Only WARC | Only WAT |
