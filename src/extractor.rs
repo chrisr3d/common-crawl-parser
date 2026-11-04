@@ -67,8 +67,9 @@ pub enum OnionEngine {
     Regex,
 }
 
-/// Finds `.onion` addresses anywhere in a page: the whole HTTP response of
-/// a WARC record, the JSON of a WAT record, the text of a WET record.
+/// Finds `.onion` addresses anywhere in a page: the page URL and the whole
+/// HTTP response of a WARC record, the JSON of a WAT record, the text of a
+/// WET record.
 pub struct OnionExtractor {
     search: OnionSearch,
     sightings: Sightings,
@@ -112,27 +113,36 @@ impl Extractor for OnionExtractor {
     }
 
     fn extract(&mut self, record: &PageRecord<'_>, shard: &Shard) {
-        let haystack = match record {
-            // The whole response, HTTP headers included: about half of the
-            // onions found sit in headers such as `Onion-Location`.
-            PageRecord::Warc(response) => response.http_response,
+        // One closure runs the engine on any bytes: each arm below only
+        // names what it searches, the WARC one twice.
+        let search = |haystack: &[u8]| match &self.search {
+            OnionSearch::Memchr(finder) => onion_search::search_memchr(haystack, finder),
+            OnionSearch::Regex(re) => onion_search::search_regex_bytes(haystack, re),
+        };
+        let found = match record {
+            // The page URL, then the whole response, HTTP headers
+            // included: about half of the onions found sit in headers
+            // such as `Onion-Location`. The URL holds the address of a
+            // page read through a Tor gateway (`<address>.onion.ly`); an
+            // address in both the URL and the response is still one
+            // Sighting (`add_sightings`).
+            PageRecord::Warc(response) => {
+                let mut found = search(response.page_url.as_bytes());
+                found.extend(search(response.http_response));
+                found
+            }
             // The raw JSON, searched like the HTTP response: an address is
             // made of `[a-zA-Z2-7.]` only, which ia-web-commons doesn't
             // escape, and the bytes around it (`"`, `/`, `:`, space) are
             // word boundaries, so the addresses WAT kept are found as in
-            // the WARC record. Three differences: onions only in the
-            // page's plain text are gone (WET has them); one right after
-            // an escape such as `\n` or `\u2003` is missed, the escape's
-            // last character reading as part of the address; and one in
-            // the page URL itself is found, as the JSON repeats the WARC
-            // headers.
-            PageRecord::Wat(metadata) => metadata.json,
+            // the WARC record, the page URL's included (the JSON repeats
+            // the WARC headers). Two differences: onions only in the
+            // page's plain text are gone (WET has them), and one right
+            // after an escape such as `\n` or `\u2003` is missed, the
+            // escape's last character reading as part of the address.
+            PageRecord::Wat(metadata) => search(metadata.json),
             // Only the onions written out as text on the page.
-            PageRecord::Wet(conversion) => conversion.text,
-        };
-        let found = match &self.search {
-            OnionSearch::Memchr(finder) => onion_search::search_memchr(haystack, finder),
-            OnionSearch::Regex(re) => onion_search::search_regex_bytes(haystack, re),
+            PageRecord::Wet(conversion) => search(conversion.text),
         };
         add_sightings(&mut self.sightings, found, record, shard);
     }

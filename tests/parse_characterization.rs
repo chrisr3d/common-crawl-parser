@@ -51,6 +51,10 @@ const PLAIN_TEXT_V3: &str = "facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx
 /// space. `é`'s two UTF-8 bytes are not ASCII word characters, so both
 /// engines must see a word boundary before the address.
 const NON_ASCII_NEIGHBOUR_V2: &str = "msydqstlz2kzerdg.onion";
+/// v3, only in page D's URL.
+const URL_V3: &str = "protonmailrmez3lotccipshtkleegetolb73fuirgj7r4o4vfu7ozyd.onion";
+/// v3, in page E's URL and in its body.
+const URL_AND_BODY_V3: &str = "nytimesn7cgmftshazwhfgzm37qxb44r64ytbb2dj3x62d2lljsciiyd.onion";
 
 /// Page A: HTML with three favicon tags and most of the onions.
 const PAGE_A: &str = "https://example.com/blog/post.html";
@@ -61,9 +65,17 @@ const DATE_B: &str = "2025-01-01T00:00:02Z";
 /// Page C: plain text that merely *contains* favicon markup.
 const PAGE_C: &str = "https://example.net/notes.txt";
 const DATE_C: &str = "2025-01-01T00:00:03Z";
+/// Pages D and E: HTML read through a Tor gateway, which serves an onion
+/// service at `<address>.onion.ly`, so the page URL holds the address.
+const PAGE_D: &str = "https://protonmailrmez3lotccipshtkleegetolb73fuirgj7r4o4vfu7ozyd.onion.ly/";
+const DATE_D: &str = "2025-01-01T00:00:04Z";
+const PAGE_E: &str =
+    "https://nytimesn7cgmftshazwhfgzm37qxb44r64ytbb2dj3x62d2lljsciiyd.onion.ly/about";
+const DATE_E: &str = "2025-01-01T00:00:05Z";
 
 /// Build the fixture Archive: three pages, each preceded by its `request`
-/// and followed by its `metadata` record, the way Common Crawl orders them.
+/// and followed by its `metadata` record, the way Common Crawl orders them,
+/// then two pages as their `response` record alone.
 fn fixture_archive() -> Vec<u8> {
     let page_a = format!(
         r#"<!DOCTYPE html>
@@ -144,6 +156,19 @@ Contact: {PLAIN_TEXT_V3}
             &http_response(&[("Content-Type", "text/plain")], &page_c),
         )
         .metadata(PAGE_C, DATE_C, "fetchTimeMs: 95\r\n")
+        .response(
+            PAGE_D,
+            DATE_D,
+            &http_response(&[("Content-Type", "text/html")], "<p>Welcome</p>"),
+        )
+        .response(
+            PAGE_E,
+            DATE_E,
+            &http_response(
+                &[("Content-Type", "text/html")],
+                &format!("<p>Read us at {URL_AND_BODY_V3}</p>"),
+            ),
+        )
         .finish()
 }
 
@@ -157,6 +182,8 @@ fn expected_snapshot() -> Snapshot {
     let on_a = || vec![seen_on(PAGE_A, DATE_A)];
     let on_b = || vec![seen_on(PAGE_B, DATE_B)];
     let on_c = || vec![seen_on(PAGE_C, DATE_C)];
+    let on_d = || vec![seen_on(PAGE_D, DATE_D)];
+    let on_e = || vec![seen_on(PAGE_E, DATE_E)];
     let string_keys = |pairs: Vec<(&str, Vec<Sighting>)>| {
         pairs
             .into_iter()
@@ -179,6 +206,10 @@ fn expected_snapshot() -> Snapshot {
             (NON_ASCII_NEIGHBOUR_V2, on_b()),
             // Onion search ignores `Content-Type`.
             (PLAIN_TEXT_V3, on_c()),
+            // The page URL is searched too, as WAT's JSON repeats it.
+            (URL_V3, on_d()),
+            // In the URL and the body: one Sighting.
+            (URL_AND_BODY_V3, on_e()),
         ]),
         // Only favicons a page declares: no root `/favicon.ico` guess.
         // Nothing from page B: its inline `data:` favicon is
